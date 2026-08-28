@@ -1202,6 +1202,14 @@ test_spdk_nvme_transport_id_parse_trtype(void)
 	str = "tcp";
 	spdk_nvme_transport_id_parse_trtype(trtype, str);
 	CU_ASSERT((*trtype) == SPDK_NVME_TRANSPORT_TCP);
+
+	str = "URMA";
+	spdk_nvme_transport_id_parse_trtype(trtype, str);
+	CU_ASSERT((*trtype) == SPDK_NVME_TRANSPORT_URMA);
+
+	str = "urma";
+	spdk_nvme_transport_id_parse_trtype(trtype, str);
+	CU_ASSERT((*trtype) == SPDK_NVME_TRANSPORT_URMA);
 }
 
 static void
@@ -1289,6 +1297,10 @@ test_trid_trtype_str(void)
 	s = spdk_nvme_transport_id_trtype_str(SPDK_NVME_TRANSPORT_TCP);
 	SPDK_CU_ASSERT_FATAL(s != NULL);
 	CU_ASSERT(strcmp(s, "TCP") == 0);
+
+	s = spdk_nvme_transport_id_trtype_str(SPDK_NVME_TRANSPORT_URMA);
+	SPDK_CU_ASSERT_FATAL(s != NULL);
+	CU_ASSERT(strcmp(s, "URMA") == 0);
 }
 
 static void
