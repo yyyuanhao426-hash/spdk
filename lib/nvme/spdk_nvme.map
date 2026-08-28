@@ -8,6 +8,8 @@
 	spdk_nvme_transport_get_opts;
 	spdk_nvme_transport_set_opts;
 	spdk_nvme_transport_id_parse;
+	spdk_nvme_urma_*;
+	spdk_urma_*;
 	spdk_nvme_transport_id_populate_trstring;
 	spdk_nvme_transport_id_parse_trtype;
 	spdk_nvme_transport_id_trtype_str;
