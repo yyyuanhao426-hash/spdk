@@ -100,6 +100,11 @@ CONFIG_RDMA_SET_TOS=n
 CONFIG_RDMA_PROV=verbs
 CONFIG_RDMA_CM=cma
 
+# Enable the experimental independent NVMe/URMA transport.
+# Requires liburma and the URMA public headers.
+CONFIG_URMA=n
+CONFIG_URMA_DIR=
+
 # Enable NVMe Character Devices.
 CONFIG_NVME_CUSE=y
 

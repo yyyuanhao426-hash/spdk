@@ -92,6 +92,9 @@ function usage() {
 	echo "                           If no provider specified, \"verbs\" provider is used by default."
 	echo " --with-rdma-cm=CM         Use a custom connection manager library for RDMA transport."
 	echo "                           If not specified, librdmacm (cma) will be used."
+	echo " --with-urma[=DIR]         Build the independent URMA transport for NVMf target and initiator."
+	echo "                           DIR may point to an installed UMDK prefix."
+	echo " --without-urma            Disable the URMA transport."
 	echo " --with-fc[=DIR]           Build FC transport for NVMf target."
 	echo " --without-fc              If an argument is provided, it is considered a directory containing"
 	echo "                           libufc.a and fc_lld.h. Otherwise the regular system paths will"
@@ -491,6 +494,19 @@ for i in "$@"; do
 			;;
 		--with-rdma-cm=*)
 			CONFIG[RDMA_CM]="${i#*=}"
+			;;
+		--with-urma=*)
+			CONFIG[URMA]=y
+			check_dir "$i"
+			CONFIG[URMA_DIR]=$(readlink -f ${i#*=})
+			;;
+		--with-urma)
+			CONFIG[URMA]=y
+			CONFIG[URMA_DIR]=
+			;;
+		--without-urma)
+			CONFIG[URMA]=n
+			CONFIG[URMA_DIR]=
 			;;
 		--with-fc=*)
 			CONFIG[FC]=y
@@ -991,6 +1007,27 @@ than or equal to 4.14 will see significantly reduced performance.
 	fi
 
 	echo "Using '${CONFIG[RDMA_CM]}' RDMA connection manager"
+fi
+
+if [ "${CONFIG[URMA]}" = "y" ]; then
+	urma_cflags=()
+	urma_ldflags=()
+	if [ -n "${CONFIG[URMA_DIR]}" ]; then
+		urma_cflags+=("-I${CONFIG[URMA_DIR]}/include/ub/umdk/urma" "-I${CONFIG[URMA_DIR]}/include"
+			"-I${CONFIG[URMA_DIR]}/src/urma/lib/urma/core/include"
+			"-I${CONFIG[URMA_DIR]}/src/urma/lib/urma/bond/include")
+		urma_ldflags+=("-L${CONFIG[URMA_DIR]}/lib64" "-L${CONFIG[URMA_DIR]}/lib"
+			"-L${CONFIG[URMA_DIR]}/build/lib")
+	else
+		urma_cflags+=("-I/usr/include/ub/umdk/urma")
+	fi
+	if ! echo -e '#include <urma_api.h>\n#include <urma_ubagg.h>\nint main(void) { return (int)urma_init(NULL); }\n' \
+		| "${BUILD_CMD[@]}" "${urma_cflags[@]}" "${urma_ldflags[@]}" -lurma - 2> /dev/null; then
+		echo "--with-urma requires urma_api.h and liburma."
+		echo "Use --with-urma=/path/to/umdk-install if they are not installed system-wide."
+		exit 1
+	fi
+	echo "Using independent URMA transport"
 fi
 
 if [[ "${CONFIG[FC]}" = "y" ]]; then
