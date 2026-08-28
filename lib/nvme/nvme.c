@@ -1043,6 +1043,9 @@ spdk_nvme_trid_populate_transport(struct spdk_nvme_transport_id *trid,
 	case SPDK_NVME_TRANSPORT_CUSTOM:
 		trstring = SPDK_NVME_TRANSPORT_NAME_CUSTOM;
 		break;
+	case SPDK_NVME_TRANSPORT_URMA:
+		trstring = "URMA";
+		break;
 	default:
 		SPDK_ERRLOG("no available transports\n");
 		assert(0);
@@ -1095,6 +1098,8 @@ spdk_nvme_transport_id_parse_trtype(enum spdk_nvme_transport_type *trtype, const
 		*trtype = SPDK_NVME_TRANSPORT_TCP;
 	} else if (strcasecmp(str, "VFIOUSER") == 0) {
 		*trtype = SPDK_NVME_TRANSPORT_VFIOUSER;
+	} else if (strcasecmp(str, "URMA") == 0) {
+		*trtype = SPDK_NVME_TRANSPORT_URMA;
 	} else {
 		*trtype = SPDK_NVME_TRANSPORT_CUSTOM;
 	}
@@ -1117,6 +1122,8 @@ spdk_nvme_transport_id_trtype_str(enum spdk_nvme_transport_type trtype)
 		return "VFIOUSER";
 	case SPDK_NVME_TRANSPORT_CUSTOM:
 		return "CUSTOM";
+	case SPDK_NVME_TRANSPORT_URMA:
+		return "URMA";
 	default:
 		return NULL;
 	}
