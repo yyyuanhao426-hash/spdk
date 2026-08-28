@@ -474,6 +474,14 @@ enum spdk_nvme_transport_type {
 	 * Custom Fabric Transport (Not spec defined)
 	 */
 	SPDK_NVME_TRANSPORT_CUSTOM_FABRICS = 4097,
+
+	/**
+	 * Experimental URMA fabric transport.
+	 *
+	 * URMA is an independent fabric API and does not share the NVMe/RDMA
+	 * transport implementation or wire binding.
+	 */
+	SPDK_NVME_TRANSPORT_URMA = 4098,
 };
 
 static inline bool spdk_nvme_trtype_is_fabrics(enum spdk_nvme_transport_type trtype)
@@ -481,7 +489,8 @@ static inline bool spdk_nvme_trtype_is_fabrics(enum spdk_nvme_transport_type trt
 	/* We always define non-fabrics trtypes outside of the 8-bit range
 	 * of NVMe-oF trtype.
 	 */
-	return trtype <= UINT8_MAX || trtype == SPDK_NVME_TRANSPORT_CUSTOM_FABRICS;
+	return trtype <= UINT8_MAX || trtype == SPDK_NVME_TRANSPORT_CUSTOM_FABRICS ||
+	       trtype == SPDK_NVME_TRANSPORT_URMA;
 }
 
 /* typedef added for coding style reasons */
