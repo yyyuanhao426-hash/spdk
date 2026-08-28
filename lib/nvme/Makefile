@@ -18,6 +18,7 @@ C_SRCS = nvme_ctrlr_cmd.c nvme_ctrlr.c nvme_fabric.c nvme_ns_cmd.c \
 C_SRCS-$(CONFIG_NVME_CUSE) += nvme_cuse.c
 C_SRCS-$(CONFIG_VFIO_USER) += nvme_vfio_user.c
 C_SRCS-$(CONFIG_RDMA) += nvme_rdma.c
+C_SRCS-$(CONFIG_URMA) += nvme_urma.c nvme_urma_common.c
 
 LIBNAME = nvme
 LOCAL_SYS_LIBS =
@@ -38,6 +39,18 @@ ifneq ("$(wildcard /usr/lib/libcxgb4.*)","")
 LOCAL_SYS_LIBS += -lcxgb4
 endif
 endif
+endif
+
+ifeq ($(CONFIG_URMA),y)
+ifneq ($(strip $(CONFIG_URMA_DIR)),)
+CFLAGS += -I$(CONFIG_URMA_DIR)/include/ub/umdk/urma -I$(CONFIG_URMA_DIR)/include \
+	-I$(CONFIG_URMA_DIR)/src/urma/lib/urma/core/include \
+	-I$(CONFIG_URMA_DIR)/src/urma/lib/urma/bond/include
+LDFLAGS += -L$(CONFIG_URMA_DIR)/lib64 -L$(CONFIG_URMA_DIR)/lib -L$(CONFIG_URMA_DIR)/build/lib
+else
+CFLAGS += -I/usr/include/ub/umdk/urma
+endif
+LOCAL_SYS_LIBS += -lurma
 endif
 
 ifeq ($(CONFIG_NVME_CUSE),y)

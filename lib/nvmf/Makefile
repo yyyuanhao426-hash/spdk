@@ -14,6 +14,7 @@ C_SRCS = ctrlr.c ctrlr_discovery.c ctrlr_bdev.c \
 	 stubs.c mdns_server.c
 
 C_SRCS-$(CONFIG_RDMA) += rdma.c
+C_SRCS-$(CONFIG_URMA) += urma.c
 C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
 
 LIBNAME = nvmf
@@ -35,6 +36,18 @@ ifneq ("$(wildcard /usr/lib/libcxgb4.*)","")
 LOCAL_SYS_LIBS += -lcxgb4
 endif
 endif
+endif
+
+ifeq ($(CONFIG_URMA),y)
+ifneq ($(strip $(CONFIG_URMA_DIR)),)
+CFLAGS += -I$(CONFIG_URMA_DIR)/include/ub/umdk/urma -I$(CONFIG_URMA_DIR)/include \
+	-I$(CONFIG_URMA_DIR)/src/urma/lib/urma/core/include \
+	-I$(CONFIG_URMA_DIR)/src/urma/lib/urma/bond/include
+LDFLAGS += -L$(CONFIG_URMA_DIR)/lib64 -L$(CONFIG_URMA_DIR)/lib -L$(CONFIG_URMA_DIR)/build/lib
+else
+CFLAGS += -I/usr/include/ub/umdk/urma
+endif
+LOCAL_SYS_LIBS += -lurma
 endif
 
 ifeq ($(CONFIG_VFIO_USER), y)

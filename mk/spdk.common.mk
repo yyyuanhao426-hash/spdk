@@ -273,6 +273,14 @@ ifeq ($(CONFIG_UBLK),y)
 SYS_LIBS += -luring
 endif
 
+ifeq ($(CONFIG_URMA),y)
+ifneq ($(strip $(CONFIG_URMA_DIR)),)
+SYS_LIBS += -L$(CONFIG_URMA_DIR)/lib64 -L$(CONFIG_URMA_DIR)/lib \
+	-L$(CONFIG_URMA_DIR)/build/lib
+endif
+SYS_LIBS += -lurma
+endif
+
 ifeq ($(CONFIG_VTUNE),y)
 SYS_LIBS += -ldl
 COMMON_CFLAGS += -I$(CONFIG_VTUNE_DIR)/include -I$(CONFIG_VTUNE_DIR)/sdk/src/ittnotify
