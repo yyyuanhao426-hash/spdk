@@ -27,6 +27,8 @@ struct nvme_urma_qpair {
 	urma_target_jetty_t *target_jetty;
 	int fd;
 	uint32_t num_entries;
+	/* Modified by Yin: 新增 transport-level CID 计数器（submit 时分配唯一 cid） */
+	uint16_t next_cid;
 	TAILQ_HEAD(, nvme_urma_req) outstanding;
 };
 
@@ -113,7 +115,6 @@ static int
 nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 {
 	urma_jfs_cfg_t jfs = {};
-	urma_jfr_cfg_t jfr = {};
 	urma_jetty_cfg_t cfg = {};
 
 	jfs.depth = uqpair->device->opts.jetty_depth;
@@ -123,14 +124,11 @@ nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 	jfs.rnr_retry = SPDK_URMA_DEFAULT_RNR_RETRY;
 	jfs.err_timeout = SPDK_URMA_DEFAULT_ERR_TIMEOUT;
 	jfs.jfc = uqpair->device->jfcs[0];
-	jfr.depth = uqpair->device->opts.jetty_depth;
-	jfr.trans_mode = uqpair->device->opts.transport_mode;
-	jfr.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
-	jfr.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
-	jfr.token_value.token = SPDK_URMA_DEFAULT_TOKEN;
-	jfr.jfc = uqpair->device->jfcs[0];
+	/* Modified by Yin: UB transport 强制 share_jfr=1，改用 device 预建的共享 jfr */
 	cfg.jfs_cfg = jfs;
-	cfg.jfr_cfg = &jfr;
+	cfg.flag.bs.share_jfr = 1;
+	cfg.shared.jfr = uqpair->device->jfr;
+	cfg.shared.jfc = uqpair->device->jfcs[0];
 	uqpair->jetty = urma_create_jetty(uqpair->device->context, &cfg);
 	return uqpair->jetty == NULL ? -EIO : 0;
 }
@@ -244,6 +242,11 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		return -ENOMEM;
 	}
 	ureq->req = req;
+	/* Modified by Yin: submit 前分配唯一 cid，防 completion 匹配到错误 request */
+	req->cmd.cid = uqpair->next_cid++;
+	if (uqpair->next_cid >= uqpair->num_entries) {
+		uqpair->next_cid = 0;
+	}
 	capsule.cmd = req->cmd;
 	if (req->payload.size != 0) {
 		capsule.cmd.dptr.sgl1.address = 0;
@@ -327,6 +330,9 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 			}
 		}
 		if (ureq == NULL) {
+			/* Modified by Yin: 诊断用：completion 的 cid 无匹配 outstanding request */
+			SPDK_ERRLOG("process_completions: no matching ureq for cid=%u\n",
+				    rsp.cpl.cid);
 			return -EPROTO;
 		}
 		TAILQ_REMOVE(&uqpair->outstanding, ureq, link);
@@ -337,7 +343,13 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		completed++;
 	}
 	if (nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING) {
+		/* Modified by Yin: 加 in_connect_poll 守卫，切断 connect_poll 互递归 */
+		if (qpair->in_connect_poll) {
+			return completed;
+		}
+		qpair->in_connect_poll = true;
 		int rc = nvme_fabric_qpair_connect_poll(qpair);
+		qpair->in_connect_poll = false;
 		if (rc == 0) {
 			nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
 		} else if (rc != -EAGAIN) {
