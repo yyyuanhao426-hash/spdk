@@ -89,6 +89,8 @@ struct spdk_urma_device {
 	struct spdk_urma_transport_opts opts;
 	urma_jfc_t **jfcs;
 	uint32_t jfc_count;
+	/* Modified by Yin: 新增 device 级共享 jfr 字段（UB transport share_jfr 用） */
+	urma_jfr_t *jfr;
 	struct spdk_memory_domain *memory_domain;
 };
 

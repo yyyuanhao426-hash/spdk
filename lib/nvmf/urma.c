@@ -162,7 +162,6 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 {
 	struct spdk_urma_device *device = uqpair->device;
 	urma_jfs_cfg_t jfs = {};
-	urma_jfr_cfg_t jfr = {};
 	urma_jetty_cfg_t cfg = {};
 
 	jfs.depth = device->opts.jetty_depth;
@@ -172,14 +171,11 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 	jfs.rnr_retry = SPDK_URMA_DEFAULT_RNR_RETRY;
 	jfs.err_timeout = SPDK_URMA_DEFAULT_ERR_TIMEOUT;
 	jfs.jfc = device->jfcs[0];
-	jfr.depth = device->opts.jetty_depth;
-	jfr.trans_mode = device->opts.transport_mode;
-	jfr.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
-	jfr.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
-	jfr.token_value.token = SPDK_URMA_DEFAULT_TOKEN;
-	jfr.jfc = device->jfcs[0];
+	/* Modified by Yin: UB transport 强制 share_jfr=1，改用 device 预建的共享 jfr */
 	cfg.jfs_cfg = jfs;
-	cfg.jfr_cfg = &jfr;
+	cfg.flag.bs.share_jfr = 1;
+	cfg.shared.jfr = device->jfr;
+	cfg.shared.jfc = device->jfcs[0];
 	uqpair->jetty = urma_create_jetty(device->context, &cfg);
 	return uqpair->jetty == NULL ? -EIO : 0;
 }
@@ -288,9 +284,21 @@ nvmf_urma_accept(void *arg)
 			uqpair->qpair.state = SPDK_NVMF_QPAIR_UNINITIALIZED;
 			TAILQ_INIT(&uqpair->free_reqs);
 			TAILQ_INIT(&uqpair->working_reqs);
-			if (spdk_urma_device_open(&transport->urma_opts, &uqpair->device) != 0 ||
-			    nvmf_urma_get_socket_addresses(fd, uqpair) != 0 ||
-			    nvmf_urma_create_jetty(uqpair) != 0 || nvmf_urma_handshake(uqpair) != 0) {
+			/* Modified by Yin: 拆分 accept 复合条件为独立 rc，逐阶段打错误日志便于定位 */
+			int rc_dev = spdk_urma_device_open(&transport->urma_opts, &uqpair->device);
+			int rc_addr = rc_dev ? -1 : nvmf_urma_get_socket_addresses(fd, uqpair);
+			int rc_jetty = rc_addr ? -1 : nvmf_urma_create_jetty(uqpair);
+			int rc_hs = rc_jetty ? -1 : nvmf_urma_handshake(uqpair);
+			if (rc_dev != 0) {
+				SPDK_ERRLOG("accept: spdk_urma_device_open failed rc=%d\n", rc_dev);
+			} else if (rc_addr != 0) {
+				SPDK_ERRLOG("accept: get_socket_addresses failed rc=%d\n", rc_addr);
+			} else if (rc_jetty != 0) {
+				SPDK_ERRLOG("accept: create_jetty failed rc=%d\n", rc_jetty);
+			} else if (rc_hs != 0) {
+				SPDK_ERRLOG("accept: handshake failed rc=%d\n", rc_hs);
+			}
+			if (rc_dev != 0 || rc_addr != 0 || rc_jetty != 0 || rc_hs != 0) {
 				if (uqpair->target_jetty != NULL) {
 					urma_unimport_jetty(uqpair->target_jetty);
 				}
@@ -720,6 +728,11 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 					continue;
 				}
 				if (completions[i].status != URMA_CR_SUCCESS) {
+					/* Modified by Yin: 打印 JFC completion 错误（含 status=4 LOC_ACCESS_ERR），便于定位 */
+					SPDK_ERRLOG("poll_group: completion error status=%d, ureq->state=%d, opcode=%d, user_ctx=%p\n",
+						    completions[i].status, ureq->state,
+						    ureq->state == NVMF_URMA_REQ_PULLING ? 1 : 0,
+						    completions[i].user_ctx);
 					ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 					ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 					nvmf_urma_send_response(ureq);

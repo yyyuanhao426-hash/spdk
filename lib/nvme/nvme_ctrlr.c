@@ -2240,7 +2240,8 @@ nvme_ctrlr_get_zns_cmd_and_effects_log(struct spdk_nvme_ctrlr *ctrlr)
 	int rc;
 
 	assert(!ctrlr->tmp_ptr);
-	ctrlr->tmp_ptr = spdk_zmalloc(sizeof(struct spdk_nvme_cmds_and_effect_log_page), 64, NULL,
+	/* Modified by Yin: 4K 对齐（UMMU Table mode） */
+	ctrlr->tmp_ptr = spdk_zmalloc(sizeof(struct spdk_nvme_cmds_and_effect_log_page), 4096, NULL,
 				      SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_SHARE | SPDK_MALLOC_DMA);
 	if (!ctrlr->tmp_ptr) {
 		rc = -ENOMEM;
@@ -2316,7 +2317,8 @@ nvme_ctrlr_identify_iocs_zns_specific(struct spdk_nvme_ctrlr *ctrlr)
 	}
 
 	assert(!ctrlr->cdata_zns);
-	ctrlr->cdata_zns = spdk_zmalloc(sizeof(*ctrlr->cdata_zns), 64, NULL, SPDK_ENV_NUMA_ID_ANY,
+	/* Modified by Yin: 4K 对齐（UMMU Table mode） */
+	ctrlr->cdata_zns = spdk_zmalloc(sizeof(*ctrlr->cdata_zns), 4096, NULL, SPDK_ENV_NUMA_ID_ANY,
 					SPDK_MALLOC_SHARE | SPDK_MALLOC_DMA);
 	if (!ctrlr->cdata_zns) {
 		rc = -ENOMEM;
@@ -2353,7 +2355,8 @@ nvme_ctrlr_identify_iocs_kv_specific(struct spdk_nvme_ctrlr *ctrlr)
 	}
 
 	assert(!ctrlr->cdata_kv);
-	ctrlr->cdata_kv = spdk_zmalloc(sizeof(*ctrlr->cdata_kv), 64, NULL, SPDK_ENV_NUMA_ID_ANY,
+	/* Modified by Yin: 4K 对齐（UMMU Table mode） */
+	ctrlr->cdata_kv = spdk_zmalloc(sizeof(*ctrlr->cdata_kv), 4096, NULL, SPDK_ENV_NUMA_ID_ANY,
 				       SPDK_MALLOC_SHARE | SPDK_MALLOC_DMA);
 	if (!ctrlr->cdata_kv) {
 		rc = -ENOMEM;
@@ -2403,7 +2406,8 @@ nvme_ctrlr_identify_iocs_nvm_specific(struct spdk_nvme_ctrlr *ctrlr)
 	}
 
 	assert(!ctrlr->cdata_nvm);
-	ctrlr->cdata_nvm = spdk_zmalloc(sizeof(*ctrlr->cdata_nvm), 64, NULL, SPDK_ENV_NUMA_ID_ANY,
+	/* Modified by Yin: 4K 对齐（UMMU Table mode） */
+	ctrlr->cdata_nvm = spdk_zmalloc(sizeof(*ctrlr->cdata_nvm), 4096, NULL, SPDK_ENV_NUMA_ID_ANY,
 					SPDK_MALLOC_SHARE | SPDK_MALLOC_DMA);
 	if (!ctrlr->cdata_nvm) {
 		rc = -ENOMEM;
@@ -2882,7 +2886,8 @@ nvme_ctrlr_identify_ns_zns_specific_async(struct spdk_nvme_ns *ns)
 	int rc;
 
 	assert(!ns->nsdata_zns);
-	ns->nsdata_zns = spdk_zmalloc(sizeof(*ns->nsdata_zns), 64, NULL, SPDK_ENV_NUMA_ID_ANY,
+	/* Modified by Yin: 4K 对齐（UMMU Table mode） */
+	ns->nsdata_zns = spdk_zmalloc(sizeof(*ns->nsdata_zns), 4096, NULL, SPDK_ENV_NUMA_ID_ANY,
 				      SPDK_MALLOC_SHARE);
 	if (!ns->nsdata_zns) {
 		return -ENOMEM;
@@ -2922,7 +2927,8 @@ nvme_ctrlr_identify_ns_nvm_specific_async(struct spdk_nvme_ns *ns)
 	int rc;
 
 	assert(!ns->nsdata_nvm);
-	ns->nsdata_nvm = spdk_zmalloc(sizeof(*ns->nsdata_nvm), 64, NULL, SPDK_ENV_NUMA_ID_ANY,
+	/* Modified by Yin: 4K 对齐（UMMU Table mode） */
+	ns->nsdata_nvm = spdk_zmalloc(sizeof(*ns->nsdata_nvm), 4096, NULL, SPDK_ENV_NUMA_ID_ANY,
 				      SPDK_MALLOC_SHARE);
 	if (!ns->nsdata_nvm) {
 		return -ENOMEM;
@@ -2962,7 +2968,8 @@ nvme_ctrlr_identify_ns_kv_specific_async(struct spdk_nvme_ns *ns)
 	int rc;
 
 	assert(!ns->nsdata_kv);
-	ns->nsdata_kv = spdk_zmalloc(sizeof(*ns->nsdata_kv), 64, NULL, SPDK_ENV_NUMA_ID_ANY,
+	/* Modified by Yin: 4K 对齐（UMMU Table mode） */
+	ns->nsdata_kv = spdk_zmalloc(sizeof(*ns->nsdata_kv), 4096, NULL, SPDK_ENV_NUMA_ID_ANY,
 				     SPDK_MALLOC_SHARE);
 	if (!ns->nsdata_kv) {
 		return -ENOMEM;
