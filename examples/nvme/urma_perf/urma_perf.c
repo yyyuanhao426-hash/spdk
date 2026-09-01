@@ -4,6 +4,9 @@
 
 #include "spdk/stdinc.h"
 
+/* Modified by Yin: urma_perf 用了 C11 原子类型，需显式 include */
+#include <stdatomic.h>
+
 #include "spdk/dma.h"
 #include "spdk/env.h"
 #include "spdk/histogram_data.h"
@@ -911,7 +914,8 @@ prepare_workers(void)
 
 	domain_ctx.size = sizeof(domain_ctx);
 	domain_ctx.user_ctx = &g_cuda;
-	domain_ctx.user_ctx_size = sizeof(&g_cuda);
+	/* Modified by Yin: user_ctx_size 应为整个 struct 大小，而非指针大小 */
+	domain_ctx.user_ctx_size = sizeof(g_cuda);
 	rc = spdk_memory_domain_create(&g_cuda_domain, SPDK_DMA_DEVICE_VENDOR_SPECIFIC_TYPE_START,
 				       &domain_ctx, "cuda:spdk-urma-perf");
 	if (rc != 0) {
