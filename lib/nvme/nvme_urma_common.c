@@ -242,7 +242,8 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 	}
 
 	cfg.va = (uint64_t)addr;
-	cfg.len = length;
+	/* Modified by Yin: grant 长度向上取整到 4K，UMMU Table mode 页粒度 */
+	cfg.len = SPDK_ALIGN_CEIL(length, (size_t)4096);
 	cfg.token_value.token = SPDK_URMA_DEFAULT_TOKEN;
 	cfg.flag.bs.token_policy = URMA_TOKEN_NONE;
 	cfg.flag.bs.cacheable = URMA_NON_CACHEABLE;
@@ -284,6 +285,11 @@ fail_pin:
 	if (region->provider != NULL && region->pin_handle != NULL) {
 		region->provider->unpin(region->provider->provider_ctx, region->pin_handle);
 	}
+	/* Modified by Yin: 失败路径补 close 释放 dma-buf fd，防泄漏 */
+	if (region->dmabuf_fd >= 0) {
+		close(region->dmabuf_fd);
+		region->dmabuf_fd = -1;
+	}
 fail_provider:
 	if (region->provider != NULL) {
 		pthread_mutex_lock(&g_provider_mutex);
@@ -302,6 +308,11 @@ spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 	}
 	if (region->target_seg != NULL) {
 		urma_unregister_seg(region->target_seg);
+	}
+	/* Modified by Yin: 注销路径补 close 释放 dma-buf fd，防每 I/O 泄漏 */
+	if (region->dmabuf_fd >= 0) {
+		close(region->dmabuf_fd);
+		region->dmabuf_fd = -1;
 	}
 	if (region->provider != NULL) {
 		region->provider->unpin(region->provider->provider_ctx, region->pin_handle);
@@ -429,10 +440,11 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		rc = -EIO;
 		goto fail;
 	}
-	{
+	/* Modified by Yin: 仅 BALANCE/MULTIPATH 才调 SET_BONDING_MODE，STANDALONE 不调（防 jetty 野指针崩溃） */
+	if (opts->bonding_balance || opts->bonding_multipath) {
 		bondp_set_bonding_mode_in_t mode = {
-			.bonding_mode = opts->bonding_balance || opts->bonding_multipath ?
-					BONDP_BONDING_MODE_BALANCE : BONDP_BONDING_MODE_STANDALONE,
+			/* Modified by Yin: bonding_mode 直接固定为 BALANCE（与上面守卫一致） */
+			.bonding_mode = BONDP_BONDING_MODE_BALANCE,
 			.bonding_level = opts->bonding_multipath ?
 					BONDP_BONDING_LEVEL_IODIE : BONDP_BONDING_LEVEL_PORT,
 		};
@@ -484,10 +496,39 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			goto fail;
 		}
 	}
+	/* Modified by Yin: UB transport 强制 share_jfr=1，预建共享 jfr 供所有 jetty 复用 */
+	{
+		urma_jfr_cfg_t jfr_cfg = {};
+		uint32_t max_jfr_depth = device->attr.dev_cap.max_jfr_depth;
+		uint8_t max_jfr_sge = device->attr.dev_cap.max_jfr_sge;
+		if (max_jfr_depth == 0) {
+			max_jfr_depth = device->attr.dev_cap.max_jfs_depth ?
+					 device->attr.dev_cap.max_jfs_depth : opts->jetty_depth;
+		}
+		if (max_jfr_sge == 0) {
+			max_jfr_sge = SPDK_URMA_DEFAULT_MAX_SGE;
+		}
+		jfr_cfg.depth = spdk_min(opts->jetty_depth, max_jfr_depth);
+		if (jfr_cfg.depth == 0) {
+			jfr_cfg.depth = opts->jetty_depth;
+		}
+		jfr_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
+		jfr_cfg.trans_mode = opts->transport_mode;
+		jfr_cfg.max_sge = spdk_min(SPDK_URMA_DEFAULT_MAX_SGE, max_jfr_sge);
+		jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
+		jfr_cfg.token_value.token = SPDK_URMA_DEFAULT_TOKEN;
+		jfr_cfg.jfc = device->jfcs[0];
+		device->jfr = urma_create_jfr(device->context, &jfr_cfg);
+		if (device->jfr == NULL) {
+			rc = -EIO;
+			goto fail;
+		}
+	}
 	{
 		struct spdk_memory_domain_ctx domain_ctx = {
 			.size = sizeof(domain_ctx),
-			.user_ctx = device,
+			/* Modified by Yin: user_ctx 改指向指针本身，user_ctx_size 才能正确复制 */
+			.user_ctx = &device,
 			.user_ctx_size = sizeof(device),
 		};
 		char id[URMA_MAX_NAME + 32];
@@ -524,6 +565,11 @@ spdk_urma_device_close(struct spdk_urma_device *device)
 {
 	if (device == NULL) {
 		return;
+	}
+	/* Modified by Yin: 释放 1.5 预建的共享 jfr，与 open 对称 */
+	if (device->jfr != NULL) {
+		urma_delete_jfr(device->jfr);
+		device->jfr = NULL;
 	}
 	for (uint32_t i = 0; i < device->jfc_count; i++) {
 		if (device->jfcs != NULL && device->jfcs[i] != NULL) {

@@ -512,7 +512,8 @@ nvme_fabric_qpair_connect_async(struct spdk_nvme_qpair *qpair, uint32_t num_entr
 		return -EINVAL;
 	}
 
-	nvmf_data = spdk_zmalloc(sizeof(*nvmf_data), 0, NULL,
+	/* Modified by Yin: 4K 对齐以满足 UMMU Table mode，防止 register_seg 返回 EINVAL */
+	nvmf_data = spdk_zmalloc(sizeof(*nvmf_data), 4096, NULL,
 				 SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	if (!nvmf_data) {
 		NVME_QPAIR_ERRLOG(qpair, "nvmf_data allocation error\n");
