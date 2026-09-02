@@ -19,6 +19,16 @@
 #include <netdb.h>
 #include <sys/ioctl.h>
 
+/* Modified By Yida: Target-side memory registration cache */
+#define NVMF_URMA_REG_CACHE_SIZE 128
+
+struct nvmf_urma_reg_entry {
+	void *va;
+	size_t len;
+	struct spdk_nvme_urma_memory_region *region;
+	bool used;
+};
+
 enum nvmf_urma_req_state {
 	NVMF_URMA_REQ_FREE = 0,
 	NVMF_URMA_REQ_NEED_BUFFER,
@@ -37,6 +47,8 @@ struct nvmf_urma_req {
 	struct spdk_urma_data_desc remote_data;
 	urma_target_seg_t *remote_seg;
 	struct spdk_nvme_urma_memory_region *local_region;
+	/* Modified By Yida: cache entry when local_region is cached (NULL if uncached) */
+	struct nvmf_urma_reg_entry *cache_entry; /* NULL if uncached */
 	enum nvmf_urma_req_state state;
 	TAILQ_ENTRY(nvmf_urma_req) link;
 };
@@ -55,6 +67,8 @@ struct nvmf_urma_qpair {
 	uint32_t resource_count;
 	uint32_t max_io_size;
 	struct nvmf_urma_req *reqs;
+	/* Modified By Yida: target-side registration cache */
+	struct nvmf_urma_reg_entry reg_cache[NVMF_URMA_REG_CACHE_SIZE];
 	TAILQ_HEAD(, nvmf_urma_req) free_reqs;
 	TAILQ_HEAD(, nvmf_urma_req) working_reqs;
 	TAILQ_ENTRY(nvmf_urma_qpair) link;
@@ -600,10 +614,34 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	if (ureq->remote_seg == NULL) {
 		return -EIO;
 	}
-	rc = spdk_nvme_urma_register_memory(device->context, ureq->req.iov[0].iov_base,
-			ureq->req.length, SPDK_NVME_URMA_MEM_HOST, &ureq->local_region);
-	if (rc != 0) {
-		return rc;
+	/* Modified By Yida: check target-side registration cache before registering */
+	ureq->cache_entry = NULL;
+	for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
+		struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
+		if (e->used && e->va == ureq->req.iov[0].iov_base && e->len == ureq->req.length) {
+			ureq->local_region = e->region;
+			ureq->cache_entry = e;
+			break;
+		}
+	}
+	if (ureq->cache_entry == NULL) {
+		rc = spdk_nvme_urma_register_memory(device->context, ureq->req.iov[0].iov_base,
+				ureq->req.length, SPDK_NVME_URMA_MEM_HOST, &ureq->local_region);
+		if (rc != 0) {
+			return rc;
+		}
+		/* Insert into cache */
+		for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
+			struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
+			if (!e->used) {
+				e->va = ureq->req.iov[0].iov_base;
+				e->len = ureq->req.length;
+				e->region = ureq->local_region;
+				e->used = true;
+				ureq->cache_entry = e;
+				break;
+			}
+		}
 	}
 	local_sge.addr = (uint64_t)ureq->req.iov[0].iov_base;
 	local_sge.len = ureq->req.length;
@@ -759,10 +797,12 @@ static void
 nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 {
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
-	if (ureq->local_region != NULL) {
+	/* Modified By Yida: if local_region was cached, keep it cached for future I/O reuse */
+	if (ureq->local_region != NULL && ureq->cache_entry == NULL) {
 		spdk_nvme_urma_unregister_memory(ureq->local_region);
-		ureq->local_region = NULL;
 	}
+	ureq->local_region = NULL;
+	ureq->cache_entry = NULL;
 	if (ureq->remote_seg != NULL) {
 		urma_unimport_seg(ureq->remote_seg);
 		ureq->remote_seg = NULL;
@@ -824,6 +864,15 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 	}
 	if (uqpair->jetty != NULL) {
 		urma_delete_jetty(uqpair->jetty);
+	}
+	/* Modified By Yida: unregister all cached target-side memory regions before freeing qpair */
+	for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
+		struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
+		if (e->used) {
+			spdk_nvme_urma_unregister_memory(e->region);
+			e->used = false;
+			e->region = NULL;
+		}
 	}
 	spdk_urma_device_close(uqpair->device);
 	if (uqpair->fd >= 0) {
