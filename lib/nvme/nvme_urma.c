@@ -9,14 +9,92 @@
 #include "nvme_urma_internal.h"
 
 #include "spdk/dma.h"
+#include "spdk/env.h"
 #include "spdk/nvmf.h"
 
 #include <netdb.h>
 #include <sys/ioctl.h>
 
+/* Modified By Yida: rdtsc-style per-phase timing for performance diagnosis */
+struct nvme_urma_timing {
+	uint64_t reg_ticks;      /* register_memory (cache miss only) */
+	uint64_t reg_count;
+	uint64_t cache_hit_count;
+	uint64_t send_ticks;     /* nvme_urma_write_full (TCP send capsule) */
+	uint64_t send_count;
+	uint64_t compl_ticks;    /* recv MSG_PEEK + FIONREAD + read_full (wait for completion) */
+	uint64_t compl_count;
+	uint64_t release_ticks;  /* cache_release or unregister (cache release is near-zero) */
+	uint64_t release_count;
+	uint64_t total_ticks;    /* submit + completion round-trip */
+	uint64_t total_count;
+};
+
+static struct nvme_urma_timing g_timing;
+
+static void
+nvme_urma_timing_dump(void)
+{
+	uint64_t hz = spdk_get_ticks_hz();
+	uint64_t reg = __atomic_load_n(&g_timing.reg_ticks, __ATOMIC_RELAXED);
+	uint64_t reg_n = __atomic_load_n(&g_timing.reg_count, __ATOMIC_RELAXED);
+	uint64_t hit = __atomic_load_n(&g_timing.cache_hit_count, __ATOMIC_RELAXED);
+	uint64_t send = __atomic_load_n(&g_timing.send_ticks, __ATOMIC_RELAXED);
+	uint64_t send_n = __atomic_load_n(&g_timing.send_count, __ATOMIC_RELAXED);
+	uint64_t compl = __atomic_load_n(&g_timing.compl_ticks, __ATOMIC_RELAXED);
+	uint64_t compl_n = __atomic_load_n(&g_timing.compl_count, __ATOMIC_RELAXED);
+	uint64_t rel = __atomic_load_n(&g_timing.release_ticks, __ATOMIC_RELAXED);
+	uint64_t rel_n = __atomic_load_n(&g_timing.release_count, __ATOMIC_RELAXED);
+	uint64_t tot = __atomic_load_n(&g_timing.total_ticks, __ATOMIC_RELAXED);
+	uint64_t tot_n = __atomic_load_n(&g_timing.total_count, __ATOMIC_RELAXED);
+
+	/* Modified By Yida: use printf instead of SPDK_NOTICELOG — urma_perf's
+	 * default log level filters NOTICE, but results are printed via printf
+	 * which always shows on stdout. */
+	printf("==== URMA timing breakdown (hz=%lu) ====\n", hz);
+	printf("  register (cache miss): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       reg, reg_n, reg_n ? reg * 1000000000ULL / (hz * reg_n) : 0, reg * 1000 / hz);
+	printf("  cache_hit:             n=%lu\n", hit);
+	printf("  send (TCP capsule):    %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       send, send_n, send_n ? send * 1000000000ULL / (hz * send_n) : 0, send * 1000 / hz);
+	printf("  completion_wait:       %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       compl, compl_n, compl_n ? compl * 1000000000ULL / (hz * compl_n) : 0, compl * 1000 / hz);
+	printf("  release (cache/unreg): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       rel, rel_n, rel_n ? rel * 1000000000ULL / (hz * rel_n) : 0, rel * 1000 / hz);
+	printf("  TOTAL (submit+compl):  %lu ticks, n=%lu, avg=%lu us, total=%lu ms\n",
+	       tot, tot_n, tot_n ? tot * 1000000ULL / (hz * tot_n) : 0, tot * 1000 / hz);
+	if (tot > 0) {
+		printf("  breakdown: reg=%.1f%% send=%.1f%% compl=%.1f%% release=%.1f%%\n",
+		       100.0 * reg / tot, 100.0 * send / tot,
+		       100.0 * compl / tot, 100.0 * rel / tot);
+	}
+	fflush(stdout);
+}
+
+void
+spdk_nvme_urma_dump_timing(void)
+{
+	nvme_urma_timing_dump();
+}
+
+/* Modified By Yida: Memory registration cache (Initiator 侧) */
+#define NVME_URMA_REG_CACHE_SIZE 64
+
+struct nvme_urma_reg_entry {
+	void *va;
+	size_t len;
+	struct spdk_nvme_urma_memory_region *region;
+	int refcount;   /* 引用计数，>0 表示有在途 I/O 正在使用 */
+	bool used;
+};
+
 struct nvme_urma_req {
 	struct nvme_request *req;
 	struct spdk_nvme_urma_memory_region *region;
+	/* Modified By Yida: cache entry when region is cached (NULL if not cached) */
+	struct nvme_urma_reg_entry *cache_entry; /* NULL if not cached */
+	uint64_t submit_tick;   /* 总往返计时起点 */
+	uint64_t send_start;    /* send 阶段计时起点 */
 	TAILQ_ENTRY(nvme_urma_req) link;
 };
 
@@ -29,6 +107,8 @@ struct nvme_urma_qpair {
 	uint32_t num_entries;
 	/* Modified by Yin: 新增 transport-level CID 计数器（submit 时分配唯一 cid） */
 	uint16_t next_cid;
+	/* Modified By Yida: memory registration cache */
+	struct nvme_urma_reg_entry reg_cache[NVME_URMA_REG_CACHE_SIZE];
 	TAILQ_HEAD(, nvme_urma_req) outstanding;
 };
 
@@ -45,6 +125,50 @@ static inline struct nvme_urma_qpair *
 nvme_urma_qpair(struct spdk_nvme_qpair *qpair)
 {
 	return SPDK_CONTAINEROF(qpair, struct nvme_urma_qpair, qpair);
+}
+
+/* Modified By Yida: registration cache helpers */
+/* Look up registration cache by (va, len). Returns entry if found, NULL if miss. */
+static struct nvme_urma_reg_entry *
+nvme_urma_reg_cache_lookup(struct nvme_urma_qpair *uqpair, void *va, size_t len)
+{
+	for (int i = 0; i < NVME_URMA_REG_CACHE_SIZE; i++) {
+		struct nvme_urma_reg_entry *e = &uqpair->reg_cache[i];
+		if (e->used && e->va == va && e->len == len) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* Find a free slot in the registration cache and insert. Returns entry on
+ * success, NULL if cache is full (caller falls back to uncached register). */
+static struct nvme_urma_reg_entry *
+nvme_urma_reg_cache_insert(struct nvme_urma_qpair *uqpair, void *va, size_t len,
+			   struct spdk_nvme_urma_memory_region *region)
+{
+	for (int i = 0; i < NVME_URMA_REG_CACHE_SIZE; i++) {
+		struct nvme_urma_reg_entry *e = &uqpair->reg_cache[i];
+		if (!e->used) {
+			e->va = va;
+			e->len = len;
+			e->region = region;
+			e->refcount = 1;
+			e->used = true;
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* Release a cache entry's refcount. Does NOT unregister — the region stays
+ * cached for future I/O reuse. Actual unregister happens at qpair destroy. */
+static void
+nvme_urma_reg_cache_release(struct nvme_urma_reg_entry *entry)
+{
+	if (entry != NULL && entry->refcount > 0) {
+		entry->refcount--;
+	}
 }
 
 static int
@@ -242,6 +366,7 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		return -ENOMEM;
 	}
 	ureq->req = req;
+	ureq->submit_tick = spdk_get_ticks();  /* total round-trip start */
 	/* Modified by Yin: submit 前分配唯一 cid，防 completion 匹配到错误 request */
 	req->cmd.cid = uqpair->next_cid++;
 	if (uqpair->next_cid >= uqpair->num_entries) {
@@ -254,11 +379,29 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		capsule.cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK;
 		capsule.cmd.dptr.sgl1.unkeyed.subtype = SPDK_NVME_SGL_SUBTYPE_TRANSPORT;
 		addr = (void *)((uintptr_t)req->payload.contig_or_cb_arg + req->payload.offset);
-		rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr,
-				req->payload.size, nvme_urma_req_memory_type(req), &ureq->region);
-		if (rc != 0) {
-			free(ureq);
-			return rc;
+		/* Modified By Yida: check registration cache before doing a full register */
+		uint64_t t_reg0 = spdk_get_ticks();
+		struct nvme_urma_reg_entry *entry = nvme_urma_reg_cache_lookup(uqpair, addr,
+				req->payload.size);
+		if (entry != NULL) {
+			ureq->region = entry->region;
+			ureq->cache_entry = entry;
+			entry->refcount++;
+			__atomic_add_fetch(&g_timing.cache_hit_count, 1, __ATOMIC_RELAXED);
+		} else {
+			rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr,
+					req->payload.size, nvme_urma_req_memory_type(req), &ureq->region);
+			if (rc != 0) {
+				free(ureq);
+				return rc;
+			}
+			ureq->cache_entry = nvme_urma_reg_cache_insert(uqpair, addr,
+					req->payload.size, ureq->region);
+			/* If cache_entry is NULL (cache full), region stays uncached and
+			 * will be unregistered on completion (old behavior). */
+			uint64_t t_reg1 = spdk_get_ticks();
+			__atomic_add_fetch(&g_timing.reg_ticks, t_reg1 - t_reg0, __ATOMIC_RELAXED);
+			__atomic_add_fetch(&g_timing.reg_count, 1, __ATOMIC_RELAXED);
 		}
 		capsule.data.seg = spdk_urma_memory_region_get_tseg(ureq->region)->seg;
 		capsule.data.address = (uint64_t)addr;
@@ -269,12 +412,23 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	hdr.type = SPDK_URMA_MSG_CAPSULE_CMD;
 	hdr.length = sizeof(capsule);
 	hdr.qid = qpair->id;
+	ureq->send_start = spdk_get_ticks();  /* send-phase start */
 	rc = nvme_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
 	if (rc == 0) {
 		rc = nvme_urma_write_full(uqpair->fd, &capsule, sizeof(capsule));
 	}
+	{
+		uint64_t t_send1 = spdk_get_ticks();
+		__atomic_add_fetch(&g_timing.send_ticks, t_send1 - ureq->send_start, __ATOMIC_RELAXED);
+		__atomic_add_fetch(&g_timing.send_count, 1, __ATOMIC_RELAXED);
+	}
 	if (rc != 0) {
-		spdk_nvme_urma_unregister_memory(ureq->region);
+		/* Modified By Yida: on send failure, release cache refcount if cached */
+		if (ureq->cache_entry != NULL) {
+			nvme_urma_reg_cache_release(ureq->cache_entry);
+		} else {
+			spdk_nvme_urma_unregister_memory(ureq->region);
+		}
 		free(ureq);
 		return rc;
 	}
@@ -296,6 +450,7 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		struct spdk_urma_msg_hdr hdr;
 		struct spdk_urma_capsule_rsp rsp;
 		struct nvme_urma_req *ureq;
+		uint64_t t_compl0 = spdk_get_ticks();  /* completion-wait start */
 		ssize_t rc = recv(uqpair->fd, &hdr, sizeof(hdr), MSG_PEEK | MSG_DONTWAIT);
 		if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 			break;
@@ -324,6 +479,9 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		    hdr.length != sizeof(rsp) || nvme_urma_read_full(uqpair->fd, &rsp, sizeof(rsp)) != 0) {
 			return -EPROTO;
 		}
+		uint64_t t_compl1 = spdk_get_ticks();
+		__atomic_add_fetch(&g_timing.compl_ticks, t_compl1 - t_compl0, __ATOMIC_RELAXED);
+		__atomic_add_fetch(&g_timing.compl_count, 1, __ATOMIC_RELAXED);
 		TAILQ_FOREACH(ureq, &uqpair->outstanding, link) {
 			if (ureq->req->cmd.cid == rsp.cpl.cid) {
 				break;
@@ -337,7 +495,20 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		}
 		TAILQ_REMOVE(&uqpair->outstanding, ureq, link);
 		qpair->queue_depth--;
-		spdk_nvme_urma_unregister_memory(ureq->region);
+		/* Modified By Yida: release cache refcount instead of unregister */
+		uint64_t t_rel0 = spdk_get_ticks();
+		if (ureq->cache_entry != NULL) {
+			nvme_urma_reg_cache_release(ureq->cache_entry);
+		} else {
+			spdk_nvme_urma_unregister_memory(ureq->region);
+		}
+		uint64_t t_rel1 = spdk_get_ticks();
+		__atomic_add_fetch(&g_timing.release_ticks, t_rel1 - t_rel0, __ATOMIC_RELAXED);
+		__atomic_add_fetch(&g_timing.release_count, 1, __ATOMIC_RELAXED);
+		/* total round-trip: submit_tick → now */
+		uint64_t t_total1 = spdk_get_ticks();
+		__atomic_add_fetch(&g_timing.total_ticks, t_total1 - ureq->submit_tick, __ATOMIC_RELAXED);
+		__atomic_add_fetch(&g_timing.total_count, 1, __ATOMIC_RELAXED);
 		nvme_complete_request(ureq->req->cb_fn, ureq->req->cb_arg, qpair, ureq->req, &rsp.cpl);
 		free(ureq);
 		completed++;
@@ -372,7 +543,12 @@ nvme_urma_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
 	cpl.status.dnr = dnr;
 	TAILQ_FOREACH_SAFE(ureq, &uqpair->outstanding, link, tmp) {
 		TAILQ_REMOVE(&uqpair->outstanding, ureq, link);
-		spdk_nvme_urma_unregister_memory(ureq->region);
+		/* Modified By Yida: release cache refcount, unregister only uncached */
+		if (ureq->cache_entry != NULL) {
+			nvme_urma_reg_cache_release(ureq->cache_entry);
+		} else {
+			spdk_nvme_urma_unregister_memory(ureq->region);
+		}
 		nvme_complete_request(ureq->req->cb_fn, ureq->req->cb_arg, qpair, ureq->req, &cpl);
 		free(ureq);
 	}
@@ -424,6 +600,16 @@ nvme_urma_qpair_release_transport(struct nvme_urma_qpair *uqpair)
 		close(uqpair->fd);
 	}
 	uqpair->fd = -1;
+	/* Modified By Yida: unregister all cached memory regions before closing the device */
+	for (int i = 0; i < NVME_URMA_REG_CACHE_SIZE; i++) {
+		struct nvme_urma_reg_entry *e = &uqpair->reg_cache[i];
+		if (e->used) {
+			spdk_nvme_urma_unregister_memory(e->region);
+			e->used = false;
+			e->refcount = 0;
+			e->region = NULL;
+		}
+	}
 	spdk_urma_device_close(uqpair->device);
 	uqpair->device = NULL;
 }
