@@ -1030,6 +1030,8 @@ main(int argc, char **argv)
 	if (g_start_tsc != 0) {
 		print_results();
 	}
+	/* Modified By Yida: dump per-phase timing breakdown for diagnosis */
+	spdk_nvme_urma_dump_timing();
 	spdk_nvme_urma_get_memory_stats(&memory_stats);
 	if (g_require_dmabuf &&
 	    (memory_stats.dmabuf_registrations == 0 || memory_stats.peer_memory_registrations != 0)) {

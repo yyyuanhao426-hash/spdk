@@ -83,6 +83,9 @@ int spdk_nvme_urma_memory_region_export(
 void spdk_nvme_urma_get_memory_stats(struct spdk_nvme_urma_memory_stats *stats);
 void spdk_nvme_urma_reset_memory_stats(void);
 
+/** Modified By Yida: dump per-phase timing breakdown (register/send/completion/release/total) */
+void spdk_nvme_urma_dump_timing(void);
+
 #ifdef __cplusplus
 }
 #endif
