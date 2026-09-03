@@ -107,6 +107,8 @@ struct nvme_urma_qpair {
 	uint32_t num_entries;
 	/* Modified by Yin: 新增 transport-level CID 计数器（submit 时分配唯一 cid） */
 	uint16_t next_cid;
+	/* Modified By Yida (v3): CID 位图，保证 outstanding 的 cid 绝不重复 */
+	uint8_t *cid_bitmap;
 	/* Modified By Yida: memory registration cache */
 	struct nvme_urma_reg_entry reg_cache[NVME_URMA_REG_CACHE_SIZE];
 	TAILQ_HEAD(, nvme_urma_req) outstanding;
@@ -125,6 +127,45 @@ static inline struct nvme_urma_qpair *
 nvme_urma_qpair(struct spdk_nvme_qpair *qpair)
 {
 	return SPDK_CONTAINEROF(qpair, struct nvme_urma_qpair, qpair);
+}
+
+/* Modified By Yida (v3): CID 位图分配器。旧计数器在 fail_outstanding（重置
+ * queue_depth=0）或 send 失败路径上与实际在飞请求脱钩后，wrap 可能撞上仍在
+ * 飞（outstanding）的 cid，completion 按 cid 匹配会命中错误 request。位图
+ * 从 next_cid 起找第一个空闲位，保证任一时刻 outstanding 的 cid 唯一。
+ * 位图分配失败时退回旧计数器行为（不阻塞连接建立）。 */
+static uint16_t
+nvme_urma_cid_alloc(struct nvme_urma_qpair *uqpair)
+{
+	uint32_t count = uqpair->num_entries;
+	uint32_t i;
+
+	if (uqpair->cid_bitmap == NULL) {
+		uint16_t cid = uqpair->next_cid++;
+		if (uqpair->next_cid >= count) {
+			uqpair->next_cid = 0;
+		}
+		return cid;
+	}
+	for (i = 0; i < count; i++) {
+		uint32_t idx = (uqpair->next_cid + i) % count;
+		uint8_t mask = (uint8_t)(1u << (idx & 7));
+		if ((uqpair->cid_bitmap[idx >> 3] & mask) == 0) {
+			uqpair->cid_bitmap[idx >> 3] |= mask;
+			uqpair->next_cid = (uint16_t)((idx + 1) % count);
+			return (uint16_t)idx;
+		}
+	}
+	/* 位图满（理论上不会发生：submit 前已检查 queue_depth < num_entries） */
+	return (uint16_t)count;
+}
+
+static void
+nvme_urma_cid_free(struct nvme_urma_qpair *uqpair, uint16_t cid)
+{
+	if (uqpair->cid_bitmap != NULL && cid < uqpair->num_entries) {
+		uqpair->cid_bitmap[cid >> 3] &= (uint8_t)~(1u << (cid & 7));
+	}
 }
 
 /* Modified By Yida: registration cache helpers */
@@ -367,10 +408,12 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	}
 	ureq->req = req;
 	ureq->submit_tick = spdk_get_ticks();  /* total round-trip start */
-	/* Modified by Yin: submit 前分配唯一 cid，防 completion 匹配到错误 request */
-	req->cmd.cid = uqpair->next_cid++;
-	if (uqpair->next_cid >= uqpair->num_entries) {
-		uqpair->next_cid = 0;
+	/* Modified by Yin: submit 前分配唯一 cid，防 completion 匹配到错误 request。
+	 * Modified By Yida (v3): 改用位图分配器保证 outstanding 的 cid 唯一。 */
+	req->cmd.cid = nvme_urma_cid_alloc(uqpair);
+	if ((uint32_t)req->cmd.cid >= uqpair->num_entries) {
+		free(ureq);
+		return -EAGAIN;
 	}
 	capsule.cmd = req->cmd;
 	if (req->payload.size != 0) {
@@ -392,6 +435,7 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 			rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr,
 					req->payload.size, nvme_urma_req_memory_type(req), &ureq->region);
 			if (rc != 0) {
+				nvme_urma_cid_free(uqpair, req->cmd.cid);
 				free(ureq);
 				return rc;
 			}
@@ -429,6 +473,8 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		} else {
 			spdk_nvme_urma_unregister_memory(ureq->region);
 		}
+		/* Modified By Yida (v3): 归还 cid 位 */
+		nvme_urma_cid_free(uqpair, req->cmd.cid);
 		free(ureq);
 		return rc;
 	}
@@ -495,6 +541,8 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		}
 		TAILQ_REMOVE(&uqpair->outstanding, ureq, link);
 		qpair->queue_depth--;
+		/* Modified By Yida (v3): 归还 cid 位 */
+		nvme_urma_cid_free(uqpair, ureq->req->cmd.cid);
 		/* Modified By Yida: release cache refcount instead of unregister */
 		uint64_t t_rel0 = spdk_get_ticks();
 		if (ureq->cache_entry != NULL) {
@@ -543,6 +591,8 @@ nvme_urma_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
 	cpl.status.dnr = dnr;
 	TAILQ_FOREACH_SAFE(ureq, &uqpair->outstanding, link, tmp) {
 		TAILQ_REMOVE(&uqpair->outstanding, ureq, link);
+		/* Modified By Yida (v3): 归还 cid 位 */
+		nvme_urma_cid_free(uqpair, ureq->req->cmd.cid);
 		/* Modified By Yida: release cache refcount, unregister only uncached */
 		if (ureq->cache_entry != NULL) {
 			nvme_urma_reg_cache_release(ureq->cache_entry);
@@ -566,8 +616,18 @@ nvme_urma_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid, uint32
 	}
 	uqpair->fd = -1;
 	uqpair->num_entries = qsize - 1;
+	/* Modified By Yida (v3): CID 位图按创建时 num_entries 分配；connect 阶段
+	 * 只会向下收窄 num_entries，位图始终覆盖所有可能的 cid。 */
+	if (uqpair->num_entries > 0) {
+		uqpair->cid_bitmap = calloc((uqpair->num_entries + 7) / 8, 1);
+		if (uqpair->cid_bitmap == NULL) {
+			free(uqpair);
+			return NULL;
+		}
+	}
 	TAILQ_INIT(&uqpair->outstanding);
 	if (nvme_qpair_init(&uqpair->qpair, qid, ctrlr, qprio, requests, async) != 0) {
+		free(uqpair->cid_bitmap);
 		free(uqpair);
 		return NULL;
 	}
@@ -610,6 +670,9 @@ nvme_urma_qpair_release_transport(struct nvme_urma_qpair *uqpair)
 			e->region = NULL;
 		}
 	}
+	/* Modified By Yida (v3): 释放 CID 位图 */
+	free(uqpair->cid_bitmap);
+	uqpair->cid_bitmap = NULL;
 	spdk_urma_device_close(uqpair->device);
 	uqpair->device = NULL;
 }

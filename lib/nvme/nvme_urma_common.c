@@ -265,6 +265,20 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 	/* The current UMDK gds branch uses is_gpu_seg for peer-memory pinning.
 	 * dma-buf registration may return ENOTSUP until the kernel provider lands. */
 	if (region->target_seg == NULL) {
+		/* Modified By Yida (v3): UMMU Table mode 要求注册区间从 4K 对齐的
+		 * base 起始并覆盖完整页。应用 buffer 可能位于子页偏移（Mooncake
+		 * ClientBufferAllocator 仅保证 64B 对齐，torch tensor 是 caching
+		 * allocator 大块显存的子区间），因此对常规/peer-memory 注册路径把
+		 * base 向下对齐到 4K、grant 长度向上扩展覆盖 (offset + length) 的
+		 * 完整页区间。wire capsule 仍携带原始 I/O 地址（nvme_urma.c 的
+		 * capsule.data.address），远端访问的 [addr, addr+length) 完整落在
+		 * 注册区间内即可。
+		 * 注意：dma-buf 路径不走此对齐——cfg.va 与 export_dmabuf 返回的
+		 * offset 一一对应，移位 base 会错位映射，故保持 v2 行为（精确 va）。 */
+		uintptr_t base = SPDK_ALIGN_FLOOR((uintptr_t)addr, (uintptr_t)4096);
+		cfg.va = (uint64_t)base;
+		cfg.len = SPDK_ALIGN_CEIL(((uintptr_t)addr - base) + length,
+					  (size_t)4096);
 		region->target_seg = urma_register_seg(urma_context, &cfg);
 		if (region->target_seg != NULL && type != SPDK_NVME_URMA_MEM_HOST) {
 			SPDK_URMA_STAT_INC(peer_memory_registrations);
