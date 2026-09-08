@@ -155,6 +155,21 @@ nvmf_urma_timing_dump_poller(void *ctx)
 	return SPDK_POLLER_IDLE;
 }
 
+/* Modified By Yida(v3): target 是长驻进程，计数自启动起一直累加，多轮 urma_perf
+ * （不同 iosize）的数据会混在一起没法按轮分析。每接受一条新连接（新一轮
+ * urma_perf 开始）时，先把上一轮的最终累计 dump 出来再清零——日志里每轮独立成块。
+ * urma_perf 的一轮会连续建 1 admin + N IO 条连接，工作 I/O 在全部连接就绪后才开始，
+ * 所以 burst 内的多次 reset 都发生在测量之前，最后那次生效，setup 噪音也被清掉。 */
+static void
+nvmf_urma_timing_reset(void)
+{
+	if (__atomic_load_n(&g_tgt_timing.total_n, __ATOMIC_RELAXED) > 0) {
+		printf("---- 新连接进入：以下为上一轮（自上次清零以来）的最终计时 ----\n");
+		nvmf_urma_timing_dump();
+	}
+	memset(&g_tgt_timing, 0, sizeof(g_tgt_timing));
+}
+
 enum nvmf_urma_req_state {
 	NVMF_URMA_REQ_FREE = 0,
 	NVMF_URMA_REQ_NEED_BUFFER,
@@ -456,6 +471,8 @@ nvmf_urma_accept(void *arg)
 				free(uqpair);
 				continue;
 			}
+			/* Modified By Yida(v3): 每条新连接视作新一轮测量的开始 */
+			nvmf_urma_timing_reset();
 			spdk_nvmf_tgt_new_qpair(transport->transport.tgt, &uqpair->qpair);
 			accepted++;
 		}
