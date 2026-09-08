@@ -296,17 +296,21 @@ if [ -n "$DUMP_SEC" ]; then
     [ "$DUMP_SEC" -ge 1 ] || abort "-s 需要正整数秒"
 fi
 
-# SPDK 源码根：-w 优先；否则从脚本所在目录向上找 build/bin/nvmf_tgt（最多 3 层）
+# SPDK 源码根：-w 优先；否则从脚本所在目录、当前目录分别向上找 build/bin/nvmf_tgt
 if [ -z "$SPDK_DIR" ]; then
-    SPDK_DIR=$(cd "$(dirname "$0")" && pwd)
-    _d=$SPDK_DIR
-    for _ in 1 2 3; do
-        if [ -x "$_d/build/bin/nvmf_tgt" ]; then SPDK_DIR=$_d; break; fi
-        _d=$(dirname "$_d")
+    for _start in "$(cd "$(dirname "$0")" && pwd)" "$PWD"; do
+        _d=$_start
+        while [ "$_d" != "/" ]; do
+            if [ -x "$_d/build/bin/nvmf_tgt" ]; then
+                SPDK_DIR=$_d
+                break 2
+            fi
+            _d=$(dirname "$_d")
+        done
     done
 fi
 [ -x "$SPDK_DIR/build/bin/nvmf_tgt" ] \
-    || abort "在 $SPDK_DIR 下找不到 build/bin/nvmf_tgt（用 -w 指定 SPDK 源码根）"
+    || abort "自动探测不到 SPDK 源码根（脚本目录、当前目录及其上级都没有 build/bin/nvmf_tgt）。用 -w <SPDK源码根> 指定"
 [ -x "$SPDK_DIR/scripts/rpc.py" ] \
     || abort "在 $SPDK_DIR 下找不到 scripts/rpc.py"
 
