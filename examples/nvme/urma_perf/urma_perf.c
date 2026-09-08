@@ -16,6 +16,7 @@
 #include "spdk/string.h"
 
 #include <dlfcn.h>
+#include <strings.h>
 
 #define URMA_PERF_DEFAULT_IO_SIZE 4096
 #define URMA_PERF_DEFAULT_BATCH_SIZE 16
@@ -130,6 +131,18 @@ static uint64_t g_start_tsc;
 static uint64_t g_stop_tsc;
 static bool g_read_workload;
 static bool g_require_dmabuf;
+
+/* Modified By Yida: memory source selection
+ * - posix:   plain host (CPU) memory, no CUDA involvement at all
+ * - peermem: GPU memory via the nvidia_p2p peer-memory path (no dmabuf export)
+ * - dmabuf:  GPU memory via cuMemGetHandleForAddressRange (default, legacy behavior) */
+enum urma_perf_mem_type {
+	URMA_PERF_MEM_DMABUF = 0,
+	URMA_PERF_MEM_PEERMEM,
+	URMA_PERF_MEM_POSIX,
+};
+
+static enum urma_perf_mem_type g_mem_type;
 static bool g_core_mask_set;
 static char g_core_mask[32];
 static atomic_uint g_ready_workers;
@@ -366,13 +379,30 @@ cuda_provider_export_dmabuf(void *provider_ctx, void *pin_handle, int *fd, uint6
 	return 0;
 }
 
-static const struct spdk_nvme_urma_memory_provider g_cuda_provider = {
+static const struct spdk_nvme_urma_memory_provider g_cuda_provider_dmabuf = {
 	.name = "cuda-urma-perf",
 	.type = SPDK_NVME_URMA_MEM_CUDA,
 	.pin = cuda_provider_pin,
 	.unpin = cuda_provider_unpin,
 	.export_dmabuf = cuda_provider_export_dmabuf,
 };
+
+/* Modified By Yida: peermem 模式不导出 dmabuf —— nvme_urma_common.c 里
+ * export_dmabuf == NULL 会跳过 urma_register_seg_dmabuf 分支，直接走
+ * is_gpu_seg=1 的 urma_register_seg（nvidia_p2p peer-memory pin 路线）。 */
+static const struct spdk_nvme_urma_memory_provider g_cuda_provider_peermem = {
+	.name = "cuda-urma-perf",
+	.type = SPDK_NVME_URMA_MEM_CUDA,
+	.pin = cuda_provider_pin,
+	.unpin = cuda_provider_unpin,
+};
+
+static const struct spdk_nvme_urma_memory_provider *
+cuda_provider_for_mode(void)
+{
+	return g_mem_type == URMA_PERF_MEM_PEERMEM ? &g_cuda_provider_peermem :
+	       &g_cuda_provider_dmabuf;
+}
 
 static bool
 probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
@@ -474,16 +504,61 @@ wait_for_task(struct worker *worker, struct io_task *task)
 	return atomic_load_explicit(&g_failed, memory_order_acquire) ? -EIO : 0;
 }
 
+/* Modified By Yida: posix 模式的预检 —— 缓冲区就是 host 内存，直接在 CPU 上
+ * 填模式、比对，不需要 CUDA 拷贝。 */
+static int
+verify_posix_to_ssd_path(struct worker *worker)
+{
+	struct io_task *task = &worker->tasks[0];
+	uint8_t *expected = malloc(g_io_size);
+	int rc = -EIO;
+	uint32_t i;
+
+	if (expected == NULL) {
+		goto out;
+	}
+	for (i = 0; i < g_io_size; i++) {
+		expected[i] = (uint8_t)(i * 131U + 17U);
+	}
+	memcpy(task->buf, expected, g_io_size);
+	if (submit_io(worker, task, true, worker->range_start_lba) != 0 ||
+	    wait_for_task(worker, task) != 0) {
+		fprintf(stderr, "Verification WRITE failed\n");
+		goto out;
+	}
+	memset(task->buf, 0, g_io_size);
+	if (submit_io(worker, task, false, worker->range_start_lba) != 0 ||
+	    wait_for_task(worker, task) != 0) {
+		fprintf(stderr, "Verification READ failed\n");
+		goto out;
+	}
+	if (memcmp(expected, task->buf, g_io_size) != 0) {
+		fprintf(stderr, "Verification failed: SSD data does not match the host pattern\n");
+		goto out;
+	}
+	printf("Preflight host WRITE + READ verification passed at LBA %" PRIu64 "\n",
+	       worker->range_start_lba);
+	rc = 0;
+out:
+	free(expected);
+	return rc;
+}
+
 static int
 verify_gpu_to_ssd_path(struct worker *worker)
 {
 	struct io_task *task = &worker->tasks[0];
-	uint8_t *expected = malloc(g_io_size);
-	uint8_t *actual = calloc(1, g_io_size);
+	uint8_t *expected;
+	uint8_t *actual;
 	CUresult result;
 	int rc = -EIO;
 	uint32_t i;
 
+	if (g_mem_type == URMA_PERF_MEM_POSIX) {
+		return verify_posix_to_ssd_path(worker);
+	}
+	expected = malloc(g_io_size);
+	actual = calloc(1, g_io_size);
 	if (expected == NULL || actual == NULL) {
 		goto out;
 	}
@@ -675,7 +750,12 @@ print_results(void)
 	spdk_histogram_data_iterate(aggregate, collect_percentiles, &percentiles);
 	spdk_nvme_urma_get_memory_stats(&memory_stats);
 
-	printf("\nNVMe/URMA GPU -> remote SSD result\n");
+	/* Modified By Yida: 结果头部标明内存路线，便于对比 posix / peermem / dmabuf */
+	printf("\nNVMe/URMA %s -> remote SSD result\n",
+	       g_mem_type == URMA_PERF_MEM_POSIX ? "host" : "GPU");
+	printf("mem_type=%s\n",
+	       g_mem_type == URMA_PERF_MEM_POSIX ? "posix" :
+	       g_mem_type == URMA_PERF_MEM_PEERMEM ? "peermem" : "dmabuf");
 	printf("operation=%s io_size=%u threads=%u batch_size=%u elapsed=%.6f s\n",
 	       g_read_workload ? "read" : "write", g_io_size, g_num_workers,
 	       g_batch_size, seconds);
@@ -729,6 +809,11 @@ usage(const char *program)
 	printf("  -g, --gpu <id>          CUDA GPU ordinal (default: 0)\n");
 	printf("  -l, --start-lba <lba>   first destructive test LBA (default: 0)\n");
 	printf("  -m, --core-mask <mask>  SPDK core mask; default selects the first T cores\n");
+	/* Modified By Yida: mem-type 三选一（-m 已被 core-mask 占用，故用 -M） */
+	printf("  -M, --mem-type <type>   posix, peermem or dmabuf (default: dmabuf)\n");
+	printf("                          posix:   host memory, plain CPU path, no CUDA\n");
+	printf("                          peermem: GPU memory via nvidia_p2p peer-memory path\n");
+	printf("                          dmabuf:  GPU memory via CUDA dmabuf export\n");
 	printf("      --require-dmabuf    fail if any timed GPU registration uses peer-memory fallback\n");
 	printf("  -h, --help              show this help\n");
 }
@@ -747,6 +832,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		{"gpu", required_argument, NULL, 'g'},
 		{"start-lba", required_argument, NULL, 'l'},
 		{"core-mask", required_argument, NULL, 'm'},
+		{"mem-type", required_argument, NULL, 'M'},
 		{"require-dmabuf", no_argument, NULL, 256},
 		{"help", no_argument, NULL, 'h'},
 		{NULL, 0, NULL, 0},
@@ -756,7 +842,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 	uint64_t value;
 
 	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_URMA);
-	while ((option = getopt_long(argc, argv, "r:w:o:T:b:t:n:g:l:m:h", options, NULL)) != -1) {
+	while ((option = getopt_long(argc, argv, "r:w:o:T:b:t:n:g:l:m:M:h", options, NULL)) != -1) {
 		switch (option) {
 		case 'r':
 			if (spdk_nvme_transport_id_parse(&g_trid, optarg) != 0) {
@@ -818,6 +904,20 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			env_opts->core_mask = optarg;
 			g_core_mask_set = true;
 			break;
+		case 'M':
+			/* Modified By Yida: 内存路线三选一 */
+			if (strcasecmp(optarg, "posix") == 0) {
+				g_mem_type = URMA_PERF_MEM_POSIX;
+			} else if (strcasecmp(optarg, "peermem") == 0) {
+				g_mem_type = URMA_PERF_MEM_PEERMEM;
+			} else if (strcasecmp(optarg, "dmabuf") == 0) {
+				g_mem_type = URMA_PERF_MEM_DMABUF;
+			} else {
+				fprintf(stderr, "Unknown mem type \"%s\" (expected posix, peermem or dmabuf)\n",
+					optarg);
+				return -EINVAL;
+			}
+			break;
 		case 256:
 			g_require_dmabuf = true;
 			break;
@@ -827,6 +927,10 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		default:
 			return -EINVAL;
 		}
+	}
+	if (g_require_dmabuf && g_mem_type != URMA_PERF_MEM_DMABUF) {
+		fprintf(stderr, "--require-dmabuf is only valid with -M dmabuf\n");
+		return -EINVAL;
 	}
 	if (!trid_set || g_trid.trtype != SPDK_NVME_TRANSPORT_URMA || g_trid.subnqn[0] == '\0') {
 		fprintf(stderr, "A URMA transport ID including subnqn is required\n");
@@ -900,8 +1004,22 @@ prepare_workers(void)
 		worker->min_latency_tsc = UINT64_MAX;
 		worker->tasks = calloc(g_batch_size, sizeof(*worker->tasks));
 		worker->histogram = spdk_histogram_data_alloc();
-		if (worker->tasks == NULL || worker->histogram == NULL ||
-		    cuda_alloc_buffer(&worker->allocation, (size_t)g_io_size * g_batch_size) != 0) {
+		if (worker->tasks == NULL || worker->histogram == NULL) {
+			return -ENOMEM;
+		}
+		/* Modified By Yida: posix 模式用 host 大页内存（4K 对齐，满足 UMMU
+		 * Table mode 的注册对齐要求），完全不碰 CUDA；其余模式照旧 cuMemAlloc。 */
+		if (g_mem_type == URMA_PERF_MEM_POSIX) {
+			worker->allocation.dmabuf_fd = -1;
+			worker->allocation.used_size = (size_t)g_io_size * g_batch_size;
+			worker->allocation.alloc_size = (size_t)g_io_size * g_batch_size;
+			worker->allocation.addr = spdk_dma_zmalloc(worker->allocation.alloc_size,
+						   4096, NULL);
+			if (worker->allocation.addr == NULL) {
+				return -ENOMEM;
+			}
+		} else if (cuda_alloc_buffer(&worker->allocation,
+					     (size_t)g_io_size * g_batch_size) != 0) {
 			return -ENOMEM;
 		}
 		for (j = 0; j < g_batch_size; j++) {
@@ -912,6 +1030,12 @@ prepare_workers(void)
 		}
 	}
 
+	/* Modified By Yida: posix 模式既不建 cuda memory domain 也不注册 provider，
+	 * tasks 的 io_opts.memory_domain 保持 NULL → 传输层
+	 * nvme_urma_req_memory_type() 返回 MEM_HOST，走普通 host 注册路线。 */
+	if (g_mem_type == URMA_PERF_MEM_POSIX) {
+		return 0;
+	}
 	domain_ctx.size = sizeof(domain_ctx);
 	domain_ctx.user_ctx = &g_cuda;
 	/* Modified by Yin: user_ctx_size 应为整个 struct 大小，而非指针大小 */
@@ -926,7 +1050,7 @@ prepare_workers(void)
 			g_workers[i].tasks[j].io_opts.memory_domain = g_cuda_domain;
 		}
 	}
-	rc = spdk_nvme_urma_register_memory_provider(&g_cuda_provider);
+	rc = spdk_nvme_urma_register_memory_provider(cuda_provider_for_mode());
 	if (rc == 0) {
 		g_provider_registered = true;
 	}
@@ -950,7 +1074,12 @@ cleanup_workers(void)
 		return;
 	}
 	for (i = 0; i < g_num_workers; i++) {
-		cuda_free_buffer(&g_workers[i].allocation);
+		/* Modified By Yida: posix 模式的缓冲区是 spdk_dma 分配的，对应释放 */
+		if (g_mem_type == URMA_PERF_MEM_POSIX) {
+			spdk_dma_free(g_workers[i].allocation.addr);
+		} else {
+			cuda_free_buffer(&g_workers[i].allocation);
+		}
 		spdk_histogram_data_free(g_workers[i].histogram);
 		free(g_workers[i].tasks);
 	}
@@ -1008,7 +1137,8 @@ main(int argc, char **argv)
 		fprintf(stderr, "Unable to initialize the SPDK environment\n");
 		return EXIT_FAILURE;
 	}
-	if (cuda_driver_init(g_gpu_id) != 0) {
+	/* Modified By Yida: posix 模式完全不初始化 CUDA（无 GPU 的机器也能跑普通路径） */
+	if (g_mem_type != URMA_PERF_MEM_POSIX && cuda_driver_init(g_gpu_id) != 0) {
 		rc = EXIT_FAILURE;
 		goto out_env;
 	}
@@ -1045,7 +1175,9 @@ out_ctrlr:
 		spdk_nvme_detach_poll(detach_ctx);
 	}
 out_cuda:
-	cuda_driver_fini();
+	if (g_mem_type != URMA_PERF_MEM_POSIX) {
+		cuda_driver_fini();
+	}
 out_env:
 	spdk_env_fini();
 	return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
