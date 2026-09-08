@@ -21,6 +21,15 @@
 
 /* Modified By Yida: Target-side memory registration cache */
 #define NVMF_URMA_REG_CACHE_SIZE 128
+#define NVMF_URMA_IMPORT_BUCKETS 128
+#define NVMF_URMA_DEFAULT_BATCH_SIZE 32
+#define NVMF_URMA_MAX_WORKERS 8
+
+struct nvmf_urma_import_entry {
+	urma_seg_t key;
+	urma_target_seg_t *tseg;
+	struct nvmf_urma_import_entry *next;
+};
 
 struct nvmf_urma_reg_entry {
 	void *va;
@@ -32,6 +41,7 @@ struct nvmf_urma_reg_entry {
 enum nvmf_urma_req_state {
 	NVMF_URMA_REQ_FREE = 0,
 	NVMF_URMA_REQ_NEED_BUFFER,
+	NVMF_URMA_REQ_DATA_PENDING,
 	NVMF_URMA_REQ_PULLING,
 	NVMF_URMA_REQ_EXECUTING,
 	NVMF_URMA_REQ_PUSHING,
@@ -40,6 +50,12 @@ enum nvmf_urma_req_state {
 struct nvmf_urma_transport;
 struct nvmf_urma_poll_group;
 
+struct nvmf_urma_worker {
+	struct spdk_urma_device *device;
+	uint32_t jfc_index;
+	struct nvmf_urma_poll_group *group;
+};
+
 struct nvmf_urma_req {
 	struct spdk_nvmf_request req;
 	union nvmf_h2c_msg cmd;
@@ -47,10 +63,15 @@ struct nvmf_urma_req {
 	struct spdk_urma_data_desc remote_data;
 	urma_target_seg_t *remote_seg;
 	struct spdk_nvme_urma_memory_region *local_region;
+	bool local_region_borrowed;
+	urma_sge_t local_sge;
+	urma_sge_t remote_sge;
+	urma_jfs_wr_t wr;
 	/* Modified By Yida: cache entry when local_region is cached (NULL if uncached) */
 	struct nvmf_urma_reg_entry *cache_entry; /* NULL if uncached */
 	enum nvmf_urma_req_state state;
 	TAILQ_ENTRY(nvmf_urma_req) link;
+	STAILQ_ENTRY(nvmf_urma_req) pending_link;
 };
 
 struct nvmf_urma_qpair {
@@ -58,6 +79,7 @@ struct nvmf_urma_qpair {
 	struct nvmf_urma_poll_group *group;
 	struct nvmf_urma_transport *transport;
 	struct spdk_urma_device *device;
+	struct nvmf_urma_worker *worker;
 	urma_jetty_t *jetty;
 	urma_target_jetty_t *target_jetty;
 	int fd;
@@ -66,11 +88,16 @@ struct nvmf_urma_qpair {
 	char service[SPDK_NVMF_TRSVCID_MAX_LEN + 1];
 	uint32_t resource_count;
 	uint32_t max_io_size;
+	uint32_t jfc_index;
+	uint32_t worker_index;
+	uint32_t outstanding_wr;
+	uint32_t max_outstanding_wr;
 	struct nvmf_urma_req *reqs;
 	/* Modified By Yida: target-side registration cache */
 	struct nvmf_urma_reg_entry reg_cache[NVMF_URMA_REG_CACHE_SIZE];
 	TAILQ_HEAD(, nvmf_urma_req) free_reqs;
 	TAILQ_HEAD(, nvmf_urma_req) working_reqs;
+	STAILQ_HEAD(, nvmf_urma_req) pending_reqs;
 	TAILQ_ENTRY(nvmf_urma_qpair) link;
 	spdk_nvmf_transport_qpair_fini_cb fini_cb;
 	void *fini_arg;
@@ -92,9 +119,16 @@ struct nvmf_urma_transport {
 	struct spdk_nvmf_transport transport;
 	struct spdk_urma_transport_opts urma_opts;
 	struct spdk_urma_device *device;
+	struct nvmf_urma_worker *workers;
+	uint32_t active_worker_count;
 	struct spdk_poller *accept_poller;
 	TAILQ_HEAD(, nvmf_urma_port) ports;
 	TAILQ_HEAD(, nvmf_urma_poll_group) poll_groups;
+	uint32_t batch_size;
+	uint32_t worker_count;
+	uint32_t next_connection;
+	pthread_rwlock_t import_lock;
+	struct nvmf_urma_import_entry *import_cache[NVMF_URMA_IMPORT_BUCKETS];
 };
 
 struct nvmf_urma_json_opts {
@@ -108,6 +142,8 @@ struct nvmf_urma_json_opts {
 	uint32_t jetty_depth;
 	bool bonding_balance;
 	bool bonding_multipath;
+	uint32_t batch_size;
+	uint32_t worker_count;
 };
 
 static const struct spdk_json_object_decoder g_urma_opts_decoder[] = {
@@ -121,6 +157,8 @@ static const struct spdk_json_object_decoder g_urma_opts_decoder[] = {
 	{"jetty_depth", offsetof(struct nvmf_urma_json_opts, jetty_depth), spdk_json_decode_uint32, true},
 	{"bonding_balance", offsetof(struct nvmf_urma_json_opts, bonding_balance), spdk_json_decode_bool, true},
 	{"bonding_multipath", offsetof(struct nvmf_urma_json_opts, bonding_multipath), spdk_json_decode_bool, true},
+	{"batch_size", offsetof(struct nvmf_urma_json_opts, batch_size), spdk_json_decode_uint32, true},
+	{"worker_count", offsetof(struct nvmf_urma_json_opts, worker_count), spdk_json_decode_uint32, true},
 };
 
 static inline struct nvmf_urma_qpair *
@@ -133,6 +171,31 @@ static inline struct nvmf_urma_req *
 nvmf_urma_req(struct spdk_nvmf_request *req)
 {
 	return SPDK_CONTAINEROF(req, struct nvmf_urma_req, req);
+}
+
+static void nvmf_urma_clear_import_cache(struct nvmf_urma_transport *transport);
+
+static uint32_t
+nvmf_urma_env_u32(const char *name, const char *compat_name, uint32_t default_value)
+{
+	const char *value = getenv(name);
+	char *end = NULL;
+	unsigned long parsed;
+
+	if ((value == NULL || value[0] == '\0') && compat_name != NULL) {
+		value = getenv(compat_name);
+		name = compat_name;
+	}
+	if (value == NULL || value[0] == '\0') {
+		return default_value;
+	}
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0' || parsed == 0 || parsed > UINT32_MAX) {
+		SPDK_WARNLOG("Ignoring invalid %s=%s\n", name, value);
+		return default_value;
+	}
+	return (uint32_t)parsed;
 }
 
 static int
@@ -178,18 +241,22 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 	urma_jfs_cfg_t jfs = {};
 	urma_jetty_cfg_t cfg = {};
 
-	jfs.depth = device->opts.jetty_depth;
+	jfs.depth = spdk_min(device->opts.jetty_depth,
+			     (uint32_t)device->attr.dev_cap.max_jfs_depth);
+	if (jfs.depth == 0) {
+		jfs.depth = device->opts.jetty_depth;
+	}
 	jfs.trans_mode = device->opts.transport_mode;
 	jfs.priority = SPDK_URMA_DEFAULT_PRIORITY;
 	jfs.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
 	jfs.rnr_retry = SPDK_URMA_DEFAULT_RNR_RETRY;
 	jfs.err_timeout = SPDK_URMA_DEFAULT_ERR_TIMEOUT;
-	jfs.jfc = device->jfcs[0];
+	jfs.jfc = device->jfcs[uqpair->jfc_index];
 	/* Modified by Yin: UB transport 强制 share_jfr=1，改用 device 预建的共享 jfr */
 	cfg.jfs_cfg = jfs;
 	cfg.flag.bs.share_jfr = 1;
-	cfg.shared.jfr = device->jfr;
-	cfg.shared.jfc = device->jfcs[0];
+	cfg.shared.jfr = device->jfrs[uqpair->jfc_index];
+	cfg.shared.jfc = device->jfcs[uqpair->jfc_index];
 	uqpair->jetty = urma_create_jetty(device->context, &cfg);
 	return uqpair->jetty == NULL ? -EIO : 0;
 }
@@ -298,28 +365,37 @@ nvmf_urma_accept(void *arg)
 			uqpair->qpair.state = SPDK_NVMF_QPAIR_UNINITIALIZED;
 			TAILQ_INIT(&uqpair->free_reqs);
 			TAILQ_INIT(&uqpair->working_reqs);
+			STAILQ_INIT(&uqpair->pending_reqs);
 			/* Modified by Yin: 拆分 accept 复合条件为独立 rc，逐阶段打错误日志便于定位 */
-			int rc_dev = spdk_urma_device_open(&transport->urma_opts, &uqpair->device);
-			int rc_addr = rc_dev ? -1 : nvmf_urma_get_socket_addresses(fd, uqpair);
+			uqpair->worker_index = transport->next_connection++ % transport->active_worker_count;
+			uqpair->worker = &transport->workers[uqpair->worker_index];
+			uqpair->device = uqpair->worker->device;
+			uqpair->jfc_index = uqpair->worker->jfc_index;
+			uqpair->max_outstanding_wr = spdk_min(
+				spdk_min(transport->urma_opts.jetty_depth,
+					 (uint32_t)uqpair->device->attr.dev_cap.max_jfs_depth),
+				uqpair->device->jfc_depth);
+			if (uqpair->max_outstanding_wr == 0) {
+				uqpair->max_outstanding_wr = spdk_min(transport->urma_opts.jetty_depth,
+							     uqpair->device->jfc_depth);
+			}
+			int rc_addr = nvmf_urma_get_socket_addresses(fd, uqpair);
 			int rc_jetty = rc_addr ? -1 : nvmf_urma_create_jetty(uqpair);
 			int rc_hs = rc_jetty ? -1 : nvmf_urma_handshake(uqpair);
-			if (rc_dev != 0) {
-				SPDK_ERRLOG("accept: spdk_urma_device_open failed rc=%d\n", rc_dev);
-			} else if (rc_addr != 0) {
+			if (rc_addr != 0) {
 				SPDK_ERRLOG("accept: get_socket_addresses failed rc=%d\n", rc_addr);
 			} else if (rc_jetty != 0) {
 				SPDK_ERRLOG("accept: create_jetty failed rc=%d\n", rc_jetty);
 			} else if (rc_hs != 0) {
 				SPDK_ERRLOG("accept: handshake failed rc=%d\n", rc_hs);
 			}
-			if (rc_dev != 0 || rc_addr != 0 || rc_jetty != 0 || rc_hs != 0) {
+			if (rc_addr != 0 || rc_jetty != 0 || rc_hs != 0) {
 				if (uqpair->target_jetty != NULL) {
 					urma_unimport_jetty(uqpair->target_jetty);
 				}
 				if (uqpair->jetty != NULL) {
 					urma_delete_jetty(uqpair->jetty);
 				}
-				spdk_urma_device_close(uqpair->device);
 				close(fd);
 				free(uqpair);
 				continue;
@@ -365,6 +441,10 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	json_opts.jetty_depth = transport->urma_opts.jetty_depth;
 	json_opts.bonding_balance = transport->urma_opts.bonding_balance;
 	json_opts.bonding_multipath = transport->urma_opts.bonding_multipath;
+	json_opts.batch_size = nvmf_urma_env_u32("SPDK_URMA_BATCH_SIZE", NULL,
+						NVMF_URMA_DEFAULT_BATCH_SIZE);
+	json_opts.worker_count = nvmf_urma_env_u32("SPDK_URMA_WORKERS_PER_CTX",
+						  "MC_WORKERS_PER_CTX", 1);
 	if (opts->transport_specific != NULL &&
 	    spdk_json_decode_object_relaxed(opts->transport_specific, g_urma_opts_decoder,
 					    SPDK_COUNTOF(g_urma_opts_decoder), &json_opts) != 0) {
@@ -399,13 +479,37 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	transport->urma_opts.jetty_depth = json_opts.jetty_depth;
 	transport->urma_opts.bonding_balance = json_opts.bonding_balance;
 	transport->urma_opts.bonding_multipath = json_opts.bonding_multipath;
+	transport->batch_size = spdk_min(spdk_max(json_opts.batch_size, 1u),
+					 spdk_max(opts->max_queue_depth, 1u));
+	transport->worker_count = spdk_min(spdk_max(json_opts.worker_count, 1u),
+					   NVMF_URMA_MAX_WORKERS);
 	free(json_opts.dev_name);
 	free(json_opts.trans_mode);
 	transport->urma_opts.max_io_size = opts->max_io_size;
-	if (spdk_urma_device_open(&transport->urma_opts, &transport->device) != 0) {
+	if (pthread_rwlock_init(&transport->import_lock, NULL) != 0) {
 		free(transport);
 		return NULL;
 	}
+	if (spdk_urma_device_open(&transport->urma_opts, &transport->device) != 0 ||
+	    spdk_urma_device_enable_host_memory_map(transport->device) != 0) {
+		spdk_urma_device_close(transport->device);
+		pthread_rwlock_destroy(&transport->import_lock);
+		free(transport);
+		return NULL;
+	}
+	transport->worker_count = spdk_min(transport->worker_count, transport->device->jfc_count);
+	transport->workers = calloc(transport->worker_count, sizeof(*transport->workers));
+	if (transport->workers == NULL) {
+		spdk_urma_device_close(transport->device);
+		pthread_rwlock_destroy(&transport->import_lock);
+		free(transport);
+		return NULL;
+	}
+	for (uint32_t i = 0; i < transport->worker_count; i++) {
+		transport->workers[i].device = transport->device;
+		transport->workers[i].jfc_index = i;
+	}
+	transport->active_worker_count = transport->worker_count;
 	TAILQ_INIT(&transport->ports);
 	TAILQ_INIT(&transport->poll_groups);
 	transport->accept_poller = SPDK_POLLER_REGISTER(nvmf_urma_accept, transport, 1000);
@@ -427,6 +531,8 @@ nvmf_urma_dump_opts(struct spdk_nvmf_transport *base, struct spdk_json_write_ctx
 	spdk_json_write_named_uint32(w, "jetty_count", transport->urma_opts.jetty_count);
 	spdk_json_write_named_bool(w, "bonding_balance", transport->urma_opts.bonding_balance);
 	spdk_json_write_named_bool(w, "bonding_multipath", transport->urma_opts.bonding_multipath);
+	spdk_json_write_named_uint32(w, "batch_size", transport->batch_size);
+	spdk_json_write_named_uint32(w, "worker_count", transport->worker_count);
 }
 
 static void
@@ -442,7 +548,10 @@ nvmf_urma_destroy(struct spdk_nvmf_transport *base,
 		close(port->fd);
 		free(port);
 	}
+	nvmf_urma_clear_import_cache(transport);
+	free(transport->workers);
 	spdk_urma_device_close(transport->device);
+	pthread_rwlock_destroy(&transport->import_lock);
 	free(transport);
 	if (cb_fn != NULL) {
 		cb_fn(cb_arg);
@@ -531,6 +640,11 @@ nvmf_urma_poll_group_destroy(struct spdk_nvmf_transport_poll_group *base)
 	struct nvmf_urma_poll_group *group = SPDK_CONTAINEROF(base, struct nvmf_urma_poll_group, group);
 	struct nvmf_urma_transport *transport = SPDK_CONTAINEROF(base->transport,
 							 struct nvmf_urma_transport, transport);
+	for (uint32_t i = 0; i < transport->active_worker_count; i++) {
+		if (transport->workers[i].group == group) {
+			transport->workers[i].group = NULL;
+		}
+	}
 	TAILQ_REMOVE(&transport->poll_groups, group, link);
 	free(group);
 }
@@ -593,30 +707,137 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 }
 
 static int
+nvmf_urma_import_remote_seg(struct nvmf_urma_qpair *uqpair, const urma_seg_t *seg,
+			    urma_target_seg_t **tseg)
+{
+	urma_seg_t key;
+	struct nvmf_urma_import_entry *entry;
+	urma_import_seg_flag_t flag = {};
+	urma_token_t token = {.token = SPDK_URMA_DEFAULT_TOKEN};
+	uint32_t hash = 2166136261u;
+	const unsigned char *bytes = (const unsigned char *)&key;
+	struct nvmf_urma_transport *transport = uqpair->transport;
+
+	/* Normalize padding before hashing; addresses alone do not identify a registration. */
+	memset(&key, 0, sizeof(key));
+	memcpy(&key.ubva.eid, &seg->ubva.eid, sizeof(key.ubva.eid));
+	key.ubva.uasid = seg->ubva.uasid;
+	key.ubva.va = seg->ubva.va;
+	key.len = seg->len;
+	key.attr.value = seg->attr.value;
+	key.token_id = seg->token_id;
+	for (size_t i = 0; i < sizeof(key); i++) {
+		hash = (hash ^ bytes[i]) * 16777619u;
+	}
+	hash %= NVMF_URMA_IMPORT_BUCKETS;
+	pthread_rwlock_rdlock(&transport->import_lock);
+	for (entry = transport->import_cache[hash]; entry != NULL; entry = entry->next) {
+		if (memcmp(&entry->key, &key, sizeof(key)) == 0) {
+			*tseg = entry->tseg;
+			pthread_rwlock_unlock(&transport->import_lock);
+			return 0;
+		}
+	}
+	pthread_rwlock_unlock(&transport->import_lock);
+	pthread_rwlock_wrlock(&transport->import_lock);
+	for (entry = transport->import_cache[hash]; entry != NULL; entry = entry->next) {
+		if (memcmp(&entry->key, &key, sizeof(key)) == 0) {
+			*tseg = entry->tseg;
+			pthread_rwlock_unlock(&transport->import_lock);
+			return 0;
+		}
+	}
+	entry = calloc(1, sizeof(*entry));
+	if (entry == NULL) {
+		pthread_rwlock_unlock(&transport->import_lock);
+		return -ENOMEM;
+	}
+	memcpy(&entry->key, &key, sizeof(key));
+	flag.bs.cacheable = URMA_NON_CACHEABLE;
+	flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+	flag.bs.mapping = URMA_SEG_NOMAP;
+	entry->tseg = urma_import_seg(uqpair->device->context, &entry->key, &token, 0, flag);
+	if (entry->tseg == NULL) {
+		free(entry);
+		pthread_rwlock_unlock(&transport->import_lock);
+		return -EIO;
+	}
+	entry->next = transport->import_cache[hash];
+	transport->import_cache[hash] = entry;
+	*tseg = entry->tseg;
+	pthread_rwlock_unlock(&transport->import_lock);
+	return 0;
+}
+
+static struct spdk_nvmf_transport_poll_group *
+nvmf_urma_get_optimal_poll_group(struct spdk_nvmf_qpair *qpair)
+{
+	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(qpair);
+	struct nvmf_urma_transport *transport = uqpair->transport;
+	struct nvmf_urma_poll_group *group;
+	uint32_t available = 0, selected;
+	struct nvmf_urma_worker *worker = uqpair->worker;
+
+	if (worker->group != NULL) {
+		return &worker->group->group;
+	}
+
+	TAILQ_FOREACH(group, &transport->poll_groups, link) {
+		if (transport->worker_count != 0 && available == transport->worker_count) {
+			break;
+		}
+		available++;
+	}
+	if (available == 0) {
+		return NULL;
+	}
+	selected = uqpair->worker_index % available;
+	TAILQ_FOREACH(group, &transport->poll_groups, link) {
+		if (selected-- == 0) {
+			worker->group = group;
+			return &group->group;
+		}
+	}
+	return NULL;
+}
+
+static void
+nvmf_urma_clear_import_cache(struct nvmf_urma_transport *transport)
+{
+	struct nvmf_urma_import_entry *entry;
+
+	for (size_t i = 0; i < NVMF_URMA_IMPORT_BUCKETS; i++) {
+		while ((entry = transport->import_cache[i]) != NULL) {
+			transport->import_cache[i] = entry->next;
+			urma_unimport_seg(entry->tseg);
+			free(entry);
+		}
+	}
+}
+
+static int
 nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 {
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
 	struct spdk_urma_device *device = uqpair->device;
-	urma_import_seg_flag_t import_flag = {};
-	urma_token_t token = {.token = SPDK_URMA_DEFAULT_TOKEN};
-	urma_sge_t local_sge = {}, remote_sge = {};
-	urma_jfs_wr_t wr = {}, *bad_wr = NULL;
 	int rc;
 
 	if (ureq->req.iovcnt != 1) {
 		return -ENOTSUP;
 	}
-	import_flag.bs.cacheable = URMA_NON_CACHEABLE;
-	import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
-	import_flag.bs.mapping = URMA_SEG_NOMAP;
-	ureq->remote_seg = urma_import_seg(device->context, &ureq->remote_data.seg,
-					    &token, 0, import_flag);
-	if (ureq->remote_seg == NULL) {
-		return -EIO;
+	rc = nvmf_urma_import_remote_seg(uqpair, &ureq->remote_data.seg, &ureq->remote_seg);
+	if (rc != 0) {
+		return rc;
 	}
 	/* Modified By Yida: check target-side registration cache before registering */
 	ureq->cache_entry = NULL;
-	for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
+	ureq->local_region_borrowed = false;
+	ureq->local_region = spdk_urma_device_lookup_host_memory(device,
+				     ureq->req.iov[0].iov_base, ureq->req.length);
+	if (ureq->local_region != NULL) {
+		ureq->local_region_borrowed = true;
+	}
+	for (int i = 0; ureq->local_region == NULL && i < NVMF_URMA_REG_CACHE_SIZE; i++) {
 		struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
 		if (e->used && e->va == ureq->req.iov[0].iov_base && e->len == ureq->req.length) {
 			ureq->local_region = e->region;
@@ -624,7 +845,7 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 			break;
 		}
 	}
-	if (ureq->cache_entry == NULL) {
+	if (ureq->local_region == NULL) {
 		rc = spdk_nvme_urma_register_memory(device->context, ureq->req.iov[0].iov_base,
 				ureq->req.length, SPDK_NVME_URMA_MEM_HOST, &ureq->local_region);
 		if (rc != 0) {
@@ -643,22 +864,86 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 			}
 		}
 	}
-	local_sge.addr = (uint64_t)ureq->req.iov[0].iov_base;
-	local_sge.len = ureq->req.length;
-	local_sge.tseg = spdk_urma_memory_region_get_tseg(ureq->local_region);
-	remote_sge.addr = ureq->remote_data.address;
-	remote_sge.len = ureq->req.length;
-	remote_sge.tseg = ureq->remote_seg;
-	wr.user_ctx = (uint64_t)ureq;
-	wr.opcode = push ? URMA_OPC_WRITE : URMA_OPC_READ;
-	wr.rw.src.sge = push ? &local_sge : &remote_sge;
-	wr.rw.src.num_sge = 1;
-	wr.rw.dst.sge = push ? &remote_sge : &local_sge;
-	wr.rw.dst.num_sge = 1;
-	wr.flag.bs.complete_enable = 1;
-	wr.tjetty = uqpair->target_jetty;
-	ureq->state = push ? NVMF_URMA_REQ_PUSHING : NVMF_URMA_REQ_PULLING;
-	return urma_post_jetty_send_wr(uqpair->jetty, &wr, &bad_wr) == URMA_SUCCESS ? 0 : -EIO;
+	memset(&ureq->wr, 0, sizeof(ureq->wr));
+	ureq->local_sge.addr = (uint64_t)ureq->req.iov[0].iov_base;
+	ureq->local_sge.len = ureq->req.length;
+	ureq->local_sge.tseg = spdk_urma_memory_region_get_tseg(ureq->local_region);
+	ureq->remote_sge.addr = ureq->remote_data.address;
+	ureq->remote_sge.len = ureq->req.length;
+	ureq->remote_sge.tseg = ureq->remote_seg;
+	ureq->wr.user_ctx = (uint64_t)ureq;
+	ureq->wr.opcode = push ? URMA_OPC_WRITE : URMA_OPC_READ;
+	ureq->wr.rw.src.sge = push ? &ureq->local_sge : &ureq->remote_sge;
+	ureq->wr.rw.src.num_sge = 1;
+	ureq->wr.rw.dst.sge = push ? &ureq->remote_sge : &ureq->local_sge;
+	ureq->wr.rw.dst.num_sge = 1;
+	ureq->wr.flag.bs.complete_enable = 1;
+	ureq->wr.tjetty = uqpair->target_jetty;
+	ureq->state = NVMF_URMA_REQ_DATA_PENDING;
+	STAILQ_INSERT_TAIL(&uqpair->pending_reqs, ureq, pending_link);
+	return 0;
+}
+
+static int
+nvmf_urma_flush_pending(struct nvmf_urma_qpair *uqpair)
+{
+	struct nvmf_urma_req *ureq, *first = NULL, *last = NULL;
+	urma_jfs_wr_t *bad_wr = NULL, *failed;
+	uint32_t available, count = 0, posted;
+	uint32_t jfc_outstanding;
+	urma_status_t rc;
+
+	if (uqpair->outstanding_wr >= uqpair->max_outstanding_wr) {
+		return 0;
+	}
+	available = uqpair->max_outstanding_wr - uqpair->outstanding_wr;
+	jfc_outstanding = __atomic_load_n(&uqpair->device->jfc_outstanding[uqpair->jfc_index],
+					  __ATOMIC_RELAXED);
+	if (jfc_outstanding >= uqpair->device->jfc_depth) {
+		return 0;
+	}
+	available = spdk_min(available, uqpair->device->jfc_depth - jfc_outstanding);
+	available = spdk_min(available, uqpair->transport->batch_size);
+	while (count < available && !STAILQ_EMPTY(&uqpair->pending_reqs)) {
+		ureq = STAILQ_FIRST(&uqpair->pending_reqs);
+		STAILQ_REMOVE_HEAD(&uqpair->pending_reqs, pending_link);
+		if (first == NULL) {
+			first = ureq;
+		}
+		if (last != NULL) {
+			last->wr.next = &ureq->wr;
+		}
+		ureq->wr.next = NULL;
+		ureq->state = ureq->wr.opcode == URMA_OPC_WRITE ?
+			      NVMF_URMA_REQ_PUSHING : NVMF_URMA_REQ_PULLING;
+		last = ureq;
+		count++;
+	}
+	if (count == 0) {
+		return 0;
+	}
+	failed = &first->wr;
+	rc = urma_post_jetty_send_wr(uqpair->jetty, &first->wr, &bad_wr);
+	posted = rc == URMA_SUCCESS ? count : 0;
+	if (rc != URMA_SUCCESS && bad_wr != NULL) {
+		posted = 0;
+		for (urma_jfs_wr_t *it = failed; it != bad_wr; it = (urma_jfs_wr_t *)it->next) {
+			posted++;
+		}
+	}
+	uqpair->outstanding_wr += posted;
+	__atomic_add_fetch(&uqpair->device->jfc_outstanding[uqpair->jfc_index], posted,
+			   __ATOMIC_RELAXED);
+	for (urma_jfs_wr_t *it = bad_wr != NULL ? bad_wr : (rc == URMA_SUCCESS ? NULL : failed);
+	     it != NULL;) {
+		urma_jfs_wr_t *next = (urma_jfs_wr_t *)it->next;
+		ureq = (void *)it->user_ctx;
+		ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+		ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		nvmf_urma_send_response(ureq);
+		it = next;
+	}
+	return count;
 }
 
 static void
@@ -752,18 +1037,31 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 	struct nvmf_urma_poll_group *group = SPDK_CONTAINEROF(base, struct nvmf_urma_poll_group, group);
 	struct nvmf_urma_qpair *uqpair;
 	urma_cr_t completions[64];
+	bool worker_polled[NVMF_URMA_MAX_WORKERS] = {};
 	int total = 0;
 
 	TAILQ_FOREACH(uqpair, &group->qpairs, link) {
-		for (uint32_t j = 0; j < uqpair->device->jfc_count; j++) {
-			int count = urma_poll_jfc(uqpair->device->jfcs[j], SPDK_COUNTOF(completions), completions);
+		if (!worker_polled[uqpair->worker_index]) {
+			worker_polled[uqpair->worker_index] = true;
+			int count = urma_poll_jfc(uqpair->device->jfcs[uqpair->jfc_index],
+						  SPDK_COUNTOF(completions), completions);
 			if (count < 0) {
 				return -EIO;
 			}
 			for (int i = 0; i < count; i++) {
 				struct nvmf_urma_req *ureq = (void *)completions[i].user_ctx;
+				struct nvmf_urma_qpair *owner;
 				if (ureq == NULL) {
 					continue;
+				}
+				owner = nvmf_urma_qpair(ureq->req.qpair);
+				if (owner->outstanding_wr > 0) {
+					owner->outstanding_wr--;
+				}
+				if (__atomic_load_n(&owner->device->jfc_outstanding[owner->jfc_index],
+						    __ATOMIC_RELAXED) > 0) {
+					__atomic_sub_fetch(&owner->device->jfc_outstanding[owner->jfc_index], 1,
+							   __ATOMIC_RELAXED);
 				}
 				if (completions[i].status != URMA_CR_SUCCESS) {
 					/* Modified by Yin: 打印 JFC completion 错误（含 status=4 LOC_ACCESS_ERR），便于定位 */
@@ -783,12 +1081,18 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 				total++;
 			}
 		}
-		int rc = nvmf_urma_receive_capsule(uqpair);
-		if (rc < 0) {
-			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
-			continue;
+		for (uint32_t i = 0; i < uqpair->transport->batch_size; i++) {
+			int rc = nvmf_urma_receive_capsule(uqpair);
+			if (rc == 0 || rc == -ENOBUFS) {
+				break;
+			}
+			if (rc < 0) {
+				uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+				break;
+			}
+			total += rc;
 		}
-		total += rc;
+		total += nvmf_urma_flush_pending(uqpair);
 	}
 	return total;
 }
@@ -797,16 +1101,18 @@ static void
 nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 {
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
+	if (ureq->state == NVMF_URMA_REQ_DATA_PENDING) {
+		STAILQ_REMOVE(&uqpair->pending_reqs, ureq, nvmf_urma_req, pending_link);
+	}
 	/* Modified By Yida: if local_region was cached, keep it cached for future I/O reuse */
-	if (ureq->local_region != NULL && ureq->cache_entry == NULL) {
+	if (ureq->local_region != NULL && ureq->cache_entry == NULL && !ureq->local_region_borrowed) {
 		spdk_nvme_urma_unregister_memory(ureq->local_region);
 	}
 	ureq->local_region = NULL;
 	ureq->cache_entry = NULL;
-	if (ureq->remote_seg != NULL) {
-		urma_unimport_seg(ureq->remote_seg);
-		ureq->remote_seg = NULL;
-	}
+	ureq->local_region_borrowed = false;
+	/* The transport/context cache owns the imported segment. */
+	ureq->remote_seg = NULL;
 	if (ureq->req.data_from_pool) {
 		spdk_nvmf_request_free_buffers(&ureq->req, &uqpair->group->group,
 					       &uqpair->transport->transport);
@@ -865,6 +1171,13 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 	if (uqpair->jetty != NULL) {
 		urma_delete_jetty(uqpair->jetty);
 	}
+	if (uqpair->outstanding_wr != 0) {
+		uint32_t shared = __atomic_load_n(
+			&uqpair->device->jfc_outstanding[uqpair->jfc_index], __ATOMIC_RELAXED);
+		__atomic_sub_fetch(&uqpair->device->jfc_outstanding[uqpair->jfc_index],
+				   spdk_min(shared, uqpair->outstanding_wr), __ATOMIC_RELAXED);
+		uqpair->outstanding_wr = 0;
+	}
 	/* Modified By Yida: unregister all cached target-side memory regions before freeing qpair */
 	for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
 		struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
@@ -874,7 +1187,6 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 			e->region = NULL;
 		}
 	}
-	spdk_urma_device_close(uqpair->device);
 	if (uqpair->fd >= 0) {
 		close(uqpair->fd);
 	}
@@ -946,6 +1258,7 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_urma = {
 	.stop_listen = nvmf_urma_stop_listen,
 	.listener_discover = nvmf_urma_discover,
 	.poll_group_create = nvmf_urma_poll_group_create,
+	.get_optimal_poll_group = nvmf_urma_get_optimal_poll_group,
 	.poll_group_destroy = nvmf_urma_poll_group_destroy,
 	.poll_group_add = nvmf_urma_poll_group_add,
 	.poll_group_remove = nvmf_urma_poll_group_remove,
