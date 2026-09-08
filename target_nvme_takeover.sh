@@ -90,16 +90,6 @@ shift $((OPTIND - 1))
 
 [ "$(id -u)" -eq 0 ] || abort "必须以 root 运行（sysfs 绑定 + hugepages + 启动 nvmf_tgt）"
 
-# -r 还原模式：只做残留清理（上次运行失败后的补救），不做接管
-if [ "$RESTORE_ONLY" = 1 ]; then
-    echo "=== 还原模式：把 vfio-pci 占用/游离的 NVMe 盘还原回 nvme ==="
-    lsmod | grep -q '^vfio_pci' || modprobe vfio-pci 2>/dev/null || true
-    restore_vfio_nvme
-    check_root_rw
-    info "还原完成"
-    exit 0
-fi
-
 # 由盘名解析 BDF：readlink -f /sys/block/<盘> 的完整路径里取最后一个 PCI 地址
 # （嵌套 PCIe 桥时最后一个才是端点）
 get_bdf() {
@@ -221,6 +211,21 @@ restore_vfio_nvme() {
     done
 }
 
+# -r 还原模式：只做残留清理（上次运行失败后的补救），不做接管
+# （必须放在函数定义之后，bash 函数先定义后调用）
+if [ "$RESTORE_ONLY" = 1 ]; then
+    echo "=== 还原模式：把 vfio-pci 占用/游离的 NVMe 盘还原回 nvme ==="
+    _pids="$(pgrep -x nvmf_tgt) $(pgrep -x spdk_tgt) $(pgrep -f 'bin/nvmf_tgt')"
+    if [ -n "${_pids// /}" ]; then
+        abort "已有 SPDK 应用在运行 (PID: $_pids)，先 kill 再还原（否则残留盘被占用，unbind 会失败）"
+    fi
+    lsmod | grep -q '^vfio_pci' || modprobe vfio-pci 2>/dev/null || true
+    restore_vfio_nvme
+    check_root_rw
+    info "还原完成"
+    exit 0
+fi
+
 #===============================================================================
 echo "=== 1) 系统盘分布（这些盘/BDF 绝对不能碰）==="
 lsblk
@@ -317,9 +322,11 @@ else
 fi
 
 # 上次运行失败会把盘留在 vfio-pci/游离状态：nvmf_tgt 必须先停（可能占着残留盘），
-# 再把残留盘还原回 nvme，确保本次是全新的 unbind + bind
-if pgrep -x nvmf_tgt >/dev/null 2>&1; then
-    abort "nvmf_tgt 已在运行 (PID $(pgrep -x nvmf_tgt | tr '\n' ' '))，先 kill 再来（RPC 配置不持久化，需重做）"
+# 再把残留盘还原回 nvme，确保本次是全新的 unbind + bind。
+# 注意旧实例不一定叫 nvmf_tgt（改名/别的 SPDK 应用也会占 core mask），多查几种
+_pids="$(pgrep -x nvmf_tgt) $(pgrep -x spdk_tgt) $(pgrep -f 'bin/nvmf_tgt')"
+if [ -n "${_pids// /}" ]; then
+    abort "已有 SPDK 应用在运行 (PID: $_pids)，先 kill 再来（占着 core mask，且 RPC 配置不持久化）"
 fi
 restore_vfio_nvme
 check_root_rw
@@ -435,16 +442,23 @@ RPC="$SPDK_DIR/scripts/rpc.py"
 info "等待 RPC 就绪..."
 READY=0
 for _ in $(seq 1 60); do
-    if "$RPC" rpc_get_methods >/dev/null 2>&1; then READY=1; break; fi
+    # 必须先确认"我们自己启动的"进程还活着，再测 RPC——否则新进程秒退时，
+    # 机器上旧实例的 /var/tmp/spdk.sock 会替它应答，RPC 配置会打到旧实例上
     if ! kill -0 "$TGT_PID" 2>/dev/null; then
         echo "---- nvmf_tgt 日志尾部 ----" >&2
         tail -n 30 "$TGT_LOG" >&2
+        # SPDK 抢不到 core mask 时日志里有 "probably process <pid> has claimed it"
+        _holder=$(grep -oE 'probably process [0-9]+' "$TGT_LOG" 2>/dev/null | grep -oE '[0-9]+' | tail -n1)
+        if [ -n "$_holder" ]; then
+            abort "nvmf_tgt 退出：core mask 被旧 SPDK 实例 PID $_holder 占用。先看是谁（ps -p $_holder -o pid,comm,args,etime），确认后 kill $_holder 再重跑"
+        fi
         abort "nvmf_tgt 进程退出，启动失败"
     fi
+    if "$RPC" rpc_get_methods >/dev/null 2>&1; then READY=1; break; fi
     sleep 0.5
 done
 [ "$READY" = 1 ] || { tail -n 30 "$TGT_LOG" >&2; abort "30s 内 RPC 未就绪"; }
-ok "RPC 就绪"
+ok "RPC 就绪（PID $TGT_PID）"
 
 echo "=== 7) 配置 RPC ==="
 run_rpc() {
