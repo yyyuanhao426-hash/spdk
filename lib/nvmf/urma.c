@@ -17,6 +17,8 @@
 #include "../nvme/nvme_urma_internal.h"
 
 #include <netdb.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <sys/ioctl.h>
 
 /* Modified By Yida: Target-side memory registration cache */
@@ -28,6 +30,130 @@ struct nvmf_urma_reg_entry {
 	struct spdk_nvme_urma_memory_region *region;
 	bool used;
 };
+
+/* Modified By Yida(v3): target-side staged latency instrumentation, mirrors
+ * lib/nvme/nvme_urma.c g_timing (tick accumulators + printf dump). Stages:
+ * W4a parse capsule / W4b iobuf alloc / W5 import_seg / W6 register_memory /
+ * W7 post WR / W8 JFC wait (pull) / W9 exec->completion (bdev/SSD) /
+ * C2H push JFC wait / W10 send_response / release (unreg+unimport). */
+struct nvmf_urma_tgt_timing {
+	uint64_t capsule_ticks;  /* W4a: read_full hdr+capsule */
+	uint64_t capsule_n;
+	uint64_t buffer_ticks;   /* W4b: capsule parsed -> buffers ready */
+	uint64_t buffer_n;
+	uint64_t import_ticks;   /* W5: urma_import_seg (every I/O) */
+	uint64_t import_n;
+	uint64_t reg_ticks;      /* W6: register_memory (cache miss only) */
+	uint64_t reg_misses;
+	uint64_t reg_hits;
+	uint64_t post_ticks;     /* W7: urma_post_jetty_send_wr */
+	uint64_t post_n;
+	uint64_t jfc_ticks;      /* W8: WR posted -> JFC completion (incl. poller latency) */
+	uint64_t jfc_n;
+	uint64_t exec_ticks;     /* W9: spdk_nvmf_request_exec -> req_complete */
+	uint64_t exec_n;
+	uint64_t push_ticks;     /* C2H: push WR posted -> JFC completion */
+	uint64_t push_n;
+	uint64_t rsp_ticks;      /* W10: send_response write_full hdr+rsp */
+	uint64_t rsp_n;
+	uint64_t release_ticks;  /* unregister (uncached) + urma_unimport_seg */
+	uint64_t release_n;
+	uint64_t total_ticks;    /* capsule parsed -> rsp written (target service time) */
+	uint64_t total_n;
+};
+
+static struct nvmf_urma_tgt_timing g_tgt_timing;
+
+#define NVMF_URMA_TGT_ADD(field, val) \
+	__atomic_add_fetch(&g_tgt_timing.field, (uint64_t)(val), __ATOMIC_RELAXED)
+#define NVMF_URMA_TGT_INC(field) \
+	__atomic_add_fetch(&g_tgt_timing.field, 1, __ATOMIC_RELAXED)
+#define NVMF_URMA_TGT_STAGE(field, ticks) do { \
+	NVMF_URMA_TGT_ADD(field ## _ticks, (ticks)); \
+	NVMF_URMA_TGT_INC(field ## _n); \
+} while (0)
+
+static void
+nvmf_urma_timing_dump(void)
+{
+	uint64_t hz = spdk_get_ticks_hz();
+	uint64_t capsule = __atomic_load_n(&g_tgt_timing.capsule_ticks, __ATOMIC_RELAXED);
+	uint64_t cap_n = __atomic_load_n(&g_tgt_timing.capsule_n, __ATOMIC_RELAXED);
+	uint64_t buffer = __atomic_load_n(&g_tgt_timing.buffer_ticks, __ATOMIC_RELAXED);
+	uint64_t buf_n = __atomic_load_n(&g_tgt_timing.buffer_n, __ATOMIC_RELAXED);
+	uint64_t imp = __atomic_load_n(&g_tgt_timing.import_ticks, __ATOMIC_RELAXED);
+	uint64_t imp_n = __atomic_load_n(&g_tgt_timing.import_n, __ATOMIC_RELAXED);
+	uint64_t reg = __atomic_load_n(&g_tgt_timing.reg_ticks, __ATOMIC_RELAXED);
+	uint64_t miss = __atomic_load_n(&g_tgt_timing.reg_misses, __ATOMIC_RELAXED);
+	uint64_t hit = __atomic_load_n(&g_tgt_timing.reg_hits, __ATOMIC_RELAXED);
+	uint64_t post = __atomic_load_n(&g_tgt_timing.post_ticks, __ATOMIC_RELAXED);
+	uint64_t post_n = __atomic_load_n(&g_tgt_timing.post_n, __ATOMIC_RELAXED);
+	uint64_t jfc = __atomic_load_n(&g_tgt_timing.jfc_ticks, __ATOMIC_RELAXED);
+	uint64_t jfc_n = __atomic_load_n(&g_tgt_timing.jfc_n, __ATOMIC_RELAXED);
+	uint64_t exec = __atomic_load_n(&g_tgt_timing.exec_ticks, __ATOMIC_RELAXED);
+	uint64_t exec_n = __atomic_load_n(&g_tgt_timing.exec_n, __ATOMIC_RELAXED);
+	uint64_t push = __atomic_load_n(&g_tgt_timing.push_ticks, __ATOMIC_RELAXED);
+	uint64_t push_n = __atomic_load_n(&g_tgt_timing.push_n, __ATOMIC_RELAXED);
+	uint64_t rsp = __atomic_load_n(&g_tgt_timing.rsp_ticks, __ATOMIC_RELAXED);
+	uint64_t rsp_n = __atomic_load_n(&g_tgt_timing.rsp_n, __ATOMIC_RELAXED);
+	uint64_t rel = __atomic_load_n(&g_tgt_timing.release_ticks, __ATOMIC_RELAXED);
+	uint64_t rel_n = __atomic_load_n(&g_tgt_timing.release_n, __ATOMIC_RELAXED);
+	uint64_t tot = __atomic_load_n(&g_tgt_timing.total_ticks, __ATOMIC_RELAXED);
+	uint64_t tot_n = __atomic_load_n(&g_tgt_timing.total_n, __ATOMIC_RELAXED);
+
+	/* printf instead of SPDK_NOTICELOG, same reason as the initiator dump:
+	 * nvmf_tgt's default log level filters NOTICE, printf always shows. */
+	printf("==== URMA target timing breakdown (hz=%lu) ====\n", hz);
+	printf("  W4a parse capsule:   %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       capsule, cap_n, cap_n ? capsule * 1000000000ULL / (hz * cap_n) : 0,
+	       capsule * 1000 / hz);
+	printf("  W4b iobuf alloc:     %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       buffer, buf_n, buf_n ? buffer * 1000000000ULL / (hz * buf_n) : 0,
+	       buffer * 1000 / hz);
+	printf("  W5 import_seg:       %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       imp, imp_n, imp_n ? imp * 1000000000ULL / (hz * imp_n) : 0,
+	       imp * 1000 / hz);
+	printf("  W6 register (miss):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       reg, miss, miss ? reg * 1000000000ULL / (hz * miss) : 0,
+	       reg * 1000 / hz);
+	printf("  W6 cache_hit:        n=%lu, miss=%lu\n", hit, miss);
+	printf("  W7 post WR:          %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       post, post_n, post_n ? post * 1000000000ULL / (hz * post_n) : 0,
+	       post * 1000 / hz);
+	printf("  W8 JFC wait (pull):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       jfc, jfc_n, jfc_n ? jfc * 1000000000ULL / (hz * jfc_n) : 0,
+	       jfc * 1000 / hz);
+	printf("  W9 exec->cpl (SSD):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       exec, exec_n, exec_n ? exec * 1000000000ULL / (hz * exec_n) : 0,
+	       exec * 1000 / hz);
+	printf("  push JFC wait (C2H): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       push, push_n, push_n ? push * 1000000000ULL / (hz * push_n) : 0,
+	       push * 1000 / hz);
+	printf("  W10 send rsp:        %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       rsp, rsp_n, rsp_n ? rsp * 1000000000ULL / (hz * rsp_n) : 0,
+	       rsp * 1000 / hz);
+	printf("  release (unreg+unimport): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       rel, rel_n, rel_n ? rel * 1000000000ULL / (hz * rel_n) : 0,
+	       rel * 1000 / hz);
+	printf("  TOTAL (parse->rsp):  %lu ticks, n=%lu, avg=%lu us, total=%lu ms\n",
+	       tot, tot_n, tot_n ? tot * 1000000ULL / (hz * tot_n) : 0,
+	       tot * 1000 / hz);
+	if (tot > 0) {
+		printf("  breakdown: parse=%.1f%% buf=%.1f%% import=%.1f%% reg=%.1f%% post=%.1f%% jfc=%.1f%% exec=%.1f%% push=%.1f%% rsp=%.1f%% release=%.1f%%\n",
+		       100.0 * capsule / tot, 100.0 * buffer / tot, 100.0 * imp / tot,
+		       100.0 * reg / tot, 100.0 * post / tot, 100.0 * jfc / tot,
+		       100.0 * exec / tot, 100.0 * push / tot, 100.0 * rsp / tot,
+		       100.0 * rel / tot);
+	}
+	fflush(stdout);
+}
+
+static int
+nvmf_urma_timing_dump_poller(void *ctx)
+{
+	nvmf_urma_timing_dump();
+	return SPDK_POLLER_IDLE;
+}
 
 enum nvmf_urma_req_state {
 	NVMF_URMA_REQ_FREE = 0,
@@ -50,6 +176,10 @@ struct nvmf_urma_req {
 	/* Modified By Yida: cache entry when local_region is cached (NULL if uncached) */
 	struct nvmf_urma_reg_entry *cache_entry; /* NULL if uncached */
 	enum nvmf_urma_req_state state;
+	/* Modified By Yida(v3): staged latency instrumentation */
+	uint64_t start_tick;   /* capsule parsed; 0 = not a timed data request */
+	uint64_t post_tick;    /* data WR posted (JFC wait start) */
+	uint64_t exec_tick;    /* spdk_nvmf_request_exec called; 0 = not timed */
 	TAILQ_ENTRY(nvmf_urma_req) link;
 };
 
@@ -93,6 +223,8 @@ struct nvmf_urma_transport {
 	struct spdk_urma_transport_opts urma_opts;
 	struct spdk_urma_device *device;
 	struct spdk_poller *accept_poller;
+	/* Modified By Yida(v3): optional periodic staged-latency dump */
+	struct spdk_poller *dump_poller;
 	TAILQ_HEAD(, nvmf_urma_port) ports;
 	TAILQ_HEAD(, nvmf_urma_poll_group) poll_groups;
 };
@@ -409,6 +541,18 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	TAILQ_INIT(&transport->ports);
 	TAILQ_INIT(&transport->poll_groups);
 	transport->accept_poller = SPDK_POLLER_REGISTER(nvmf_urma_accept, transport, 1000);
+	/* Modified By Yida(v3): optional periodic staged-latency dump, e.g.
+	 * SPDK_URMA_TARGET_DUMP_SEC=10 ./build/bin/nvmf_tgt ... */
+	const char *dump_sec = getenv("SPDK_URMA_TARGET_DUMP_SEC");
+
+	if (dump_sec != NULL) {
+		uint64_t period_us = (uint64_t)atoi(dump_sec) * 1000000ULL;
+
+		if (period_us > 0) {
+			transport->dump_poller = SPDK_POLLER_REGISTER(nvmf_urma_timing_dump_poller,
+							transport, period_us);
+		}
+	}
 	return &transport->transport;
 }
 
@@ -437,6 +581,9 @@ nvmf_urma_destroy(struct spdk_nvmf_transport *base,
 	struct nvmf_urma_port *port, *tmp;
 
 	spdk_poller_unregister(&transport->accept_poller);
+	/* Modified By Yida(v3): stop periodic dump and print final staged latencies */
+	spdk_poller_unregister(&transport->dump_poller);
+	nvmf_urma_timing_dump();
 	TAILQ_FOREACH_SAFE(port, &transport->ports, link, tmp) {
 		TAILQ_REMOVE(&transport->ports, port, link);
 		close(port->fd);
@@ -578,6 +725,7 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 	struct spdk_urma_msg_hdr hdr = {};
 	struct spdk_urma_capsule_rsp rsp = {.cpl = ureq->rsp.nvme_cpl};
 	int rc;
+	uint64_t t_rsp0 = spdk_get_ticks(); /* Modified By Yida(v3): W10 start */
 
 	hdr.magic = SPDK_URMA_WIRE_MAGIC;
 	hdr.version = SPDK_URMA_WIRE_VERSION;
@@ -587,6 +735,14 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 	rc = nvmf_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
 	if (rc == 0) {
 		rc = nvmf_urma_write_full(uqpair->fd, &rsp, sizeof(rsp));
+	}
+	/* Modified By Yida(v3): W10 send rsp + target service total (parse -> rsp written) */
+	if (ureq->start_tick != 0) {
+		uint64_t t_rsp1 = spdk_get_ticks();
+
+		NVMF_URMA_TGT_STAGE(rsp, t_rsp1 - t_rsp0);
+		NVMF_URMA_TGT_STAGE(total, t_rsp1 - ureq->start_tick);
+		ureq->start_tick = 0;
 	}
 	nvmf_urma_release_req(ureq);
 	return rc;
@@ -609,10 +765,16 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	import_flag.bs.cacheable = URMA_NON_CACHEABLE;
 	import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
 	import_flag.bs.mapping = URMA_SEG_NOMAP;
-	ureq->remote_seg = urma_import_seg(device->context, &ureq->remote_data.seg,
-					    &token, 0, import_flag);
-	if (ureq->remote_seg == NULL) {
-		return -EIO;
+	{
+		/* Modified By Yida(v3): W5 — urma_import_seg (every I/O) */
+		uint64_t t_import0 = spdk_get_ticks();
+
+		ureq->remote_seg = urma_import_seg(device->context, &ureq->remote_data.seg,
+						   &token, 0, import_flag);
+		if (ureq->remote_seg == NULL) {
+			return -EIO;
+		}
+		NVMF_URMA_TGT_STAGE(import, spdk_get_ticks() - t_import0);
 	}
 	/* Modified By Yida: check target-side registration cache before registering */
 	ureq->cache_entry = NULL;
@@ -625,11 +787,16 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 		}
 	}
 	if (ureq->cache_entry == NULL) {
+		/* Modified By Yida(v3): W6 — register_memory (cache miss only) */
+		uint64_t t_reg0 = spdk_get_ticks();
+
 		rc = spdk_nvme_urma_register_memory(device->context, ureq->req.iov[0].iov_base,
 				ureq->req.length, SPDK_NVME_URMA_MEM_HOST, &ureq->local_region);
 		if (rc != 0) {
 			return rc;
 		}
+		NVMF_URMA_TGT_ADD(reg_ticks, spdk_get_ticks() - t_reg0);
+		NVMF_URMA_TGT_INC(reg_misses);
 		/* Insert into cache */
 		for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
 			struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
@@ -642,6 +809,8 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 				break;
 			}
 		}
+	} else {
+		NVMF_URMA_TGT_INC(reg_hits);
 	}
 	local_sge.addr = (uint64_t)ureq->req.iov[0].iov_base;
 	local_sge.len = ureq->req.length;
@@ -658,12 +827,25 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	wr.flag.bs.complete_enable = 1;
 	wr.tjetty = uqpair->target_jetty;
 	ureq->state = push ? NVMF_URMA_REQ_PUSHING : NVMF_URMA_REQ_PULLING;
-	return urma_post_jetty_send_wr(uqpair->jetty, &wr, &bad_wr) == URMA_SUCCESS ? 0 : -EIO;
+	/* Modified By Yida(v3): W7 post WR; tick doubles as JFC wait start */
+	ureq->post_tick = spdk_get_ticks();
+	if (urma_post_jetty_send_wr(uqpair->jetty, &wr, &bad_wr) == URMA_SUCCESS) {
+		uint64_t t_post1 = spdk_get_ticks();
+
+		NVMF_URMA_TGT_STAGE(post, t_post1 - ureq->post_tick);
+		ureq->post_tick = t_post1;
+		return 0;
+	}
+	return -EIO;
 }
 
 static void
 nvmf_urma_buffers_ready(struct nvmf_urma_req *ureq)
 {
+	/* Modified By Yida(v3): W4b — capsule parsed -> buffers ready */
+	if (ureq->start_tick != 0) {
+		NVMF_URMA_TGT_STAGE(buffer, spdk_get_ticks() - ureq->start_tick);
+	}
 	if (ureq->req.xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
 		if (nvmf_urma_post_data(ureq, false) != 0) {
 			ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
@@ -672,6 +854,7 @@ nvmf_urma_buffers_ready(struct nvmf_urma_req *ureq)
 		}
 	} else {
 		ureq->state = NVMF_URMA_REQ_EXECUTING;
+		ureq->exec_tick = spdk_get_ticks(); /* Modified By Yida(v3): W9 start (C2H, no pull) */
 		spdk_nvmf_request_exec(&ureq->req);
 	}
 }
@@ -710,12 +893,14 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 			return 0;
 		}
 	}
+	uint64_t t_parse0 = spdk_get_ticks(); /* Modified By Yida(v3): W4a parse start */
 	if (nvmf_urma_read_full(uqpair->fd, &hdr, sizeof(hdr)) != 0 ||
 	    hdr.magic != SPDK_URMA_WIRE_MAGIC || hdr.version != SPDK_URMA_WIRE_VERSION ||
 	    hdr.type != SPDK_URMA_MSG_CAPSULE_CMD || hdr.length != sizeof(capsule) ||
 	    nvmf_urma_read_full(uqpair->fd, &capsule, sizeof(capsule)) != 0) {
 		return -EPROTO;
 	}
+	NVMF_URMA_TGT_STAGE(capsule, spdk_get_ticks() - t_parse0);
 	if (capsule.data.length > uqpair->max_io_size) {
 		return -EMSGSIZE;
 	}
@@ -726,6 +911,9 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 	TAILQ_REMOVE(&uqpair->free_reqs, ureq, link);
 	TAILQ_INSERT_TAIL(&uqpair->working_reqs, ureq, link);
 	memset(&ureq->rsp, 0, sizeof(ureq->rsp));
+	/* Modified By Yida(v3): reset instrumentation ticks from previous request life */
+	ureq->start_tick = 0;
+	ureq->exec_tick = 0;
 	ureq->cmd.nvme_cmd = capsule.cmd;
 	ureq->remote_data = capsule.data;
 	ureq->req.raw = 0;
@@ -739,6 +927,7 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 		return 1;
 	}
 	ureq->state = NVMF_URMA_REQ_NEED_BUFFER;
+	ureq->start_tick = spdk_get_ticks(); /* Modified By Yida(v3): target service time start */
 	if (spdk_nvmf_request_get_buffers(&ureq->req, &uqpair->group->group,
 					  &uqpair->transport->transport, ureq->req.length) == 0) {
 		nvmf_urma_buffers_ready(ureq);
@@ -775,9 +964,15 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 					ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 					nvmf_urma_send_response(ureq);
 				} else if (ureq->state == NVMF_URMA_REQ_PULLING) {
+					/* Modified By Yida(v3): W8 — WR posted -> JFC completion
+					 * (includes poller scheduling latency) */
+					NVMF_URMA_TGT_STAGE(jfc, spdk_get_ticks() - ureq->post_tick);
+					ureq->exec_tick = spdk_get_ticks();
 					ureq->state = NVMF_URMA_REQ_EXECUTING;
 					spdk_nvmf_request_exec(&ureq->req);
 				} else if (ureq->state == NVMF_URMA_REQ_PUSHING) {
+					/* Modified By Yida(v3): C2H push — WR posted -> JFC completion */
+					NVMF_URMA_TGT_STAGE(push, spdk_get_ticks() - ureq->post_tick);
 					nvmf_urma_send_response(ureq);
 				}
 				total++;
@@ -797,6 +992,7 @@ static void
 nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 {
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
+	uint64_t t_rel0 = spdk_get_ticks(); /* Modified By Yida(v3): release start */
 	/* Modified By Yida: if local_region was cached, keep it cached for future I/O reuse */
 	if (ureq->local_region != NULL && ureq->cache_entry == NULL) {
 		spdk_nvme_urma_unregister_memory(ureq->local_region);
@@ -807,6 +1003,8 @@ nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 		urma_unimport_seg(ureq->remote_seg);
 		ureq->remote_seg = NULL;
 	}
+	/* Modified By Yida(v3): release — unregister (uncached) + urma_unimport_seg */
+	NVMF_URMA_TGT_STAGE(release, spdk_get_ticks() - t_rel0);
 	if (ureq->req.data_from_pool) {
 		spdk_nvmf_request_free_buffers(&ureq->req, &uqpair->group->group,
 					       &uqpair->transport->transport);
@@ -829,6 +1027,12 @@ nvmf_urma_req_complete(struct spdk_nvmf_request *req)
 {
 	struct nvmf_urma_req *ureq = nvmf_urma_req(req);
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+
+	/* Modified By Yida(v3): W9 — spdk_nvmf_request_exec -> completion (bdev/SSD) */
+	if (ureq->exec_tick != 0) {
+		NVMF_URMA_TGT_STAGE(exec, spdk_get_ticks() - ureq->exec_tick);
+		ureq->exec_tick = 0;
+	}
 
 	ureq->rsp.nvme_cpl.cid = ureq->cmd.nvme_cmd.cid;
 	ureq->rsp.nvme_cpl.sqid = qpair->qid;
