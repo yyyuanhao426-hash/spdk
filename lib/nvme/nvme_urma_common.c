@@ -3,6 +3,7 @@
  */
 
 #include "nvme_urma_internal.h"
+#include "spdk/env.h"
 
 #define SPDK_URMA_PROVIDER_COUNT (SPDK_NVME_URMA_MEM_XDS + 1)
 
@@ -23,6 +24,50 @@ static pthread_mutex_t g_runtime_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_runtime_refs;
 static bool g_runtime_owned;
 static struct spdk_nvme_urma_memory_stats g_memory_stats;
+
+static int
+spdk_urma_host_mem_notify(void *cb_ctx, struct spdk_mem_map *map,
+			  enum spdk_mem_map_notify_action action, void *vaddr, size_t size)
+{
+	struct spdk_urma_device *device = cb_ctx;
+	struct spdk_nvme_urma_memory_region *region;
+	uint64_t translated_size = size;
+	int rc;
+
+	if (action == SPDK_MEM_MAP_NOTIFY_REGISTER) {
+		rc = spdk_nvme_urma_register_memory(device->context, vaddr, size,
+						    SPDK_NVME_URMA_MEM_HOST, &region);
+		if (rc != 0) {
+			return rc;
+		}
+		rc = spdk_mem_map_set_translation(map, (uint64_t)vaddr, size, (uint64_t)region);
+		if (rc != 0) {
+			spdk_nvme_urma_unregister_memory(region);
+		}
+		return rc;
+	}
+
+	region = (void *)spdk_mem_map_translate(map, (uint64_t)vaddr, &translated_size);
+	if (region == NULL) {
+		return 0;
+	}
+	rc = spdk_mem_map_clear_translation(map, (uint64_t)vaddr, size);
+	if (rc == 0) {
+		spdk_nvme_urma_unregister_memory(region);
+	}
+	return rc;
+}
+
+static int
+spdk_urma_host_mem_contiguous(uint64_t addr_1, uint64_t addr_2)
+{
+	return addr_1 == addr_2;
+}
+
+static const struct spdk_mem_map_ops g_spdk_urma_host_mem_map_ops = {
+	.notify_cb = spdk_urma_host_mem_notify,
+	.are_contiguous = spdk_urma_host_mem_contiguous,
+};
 
 #define SPDK_URMA_STAT_INC(member) \
 	__atomic_fetch_add(&g_memory_stats.member, 1, __ATOMIC_RELAXED)
@@ -91,6 +136,17 @@ spdk_urma_env_u32(const char *name, uint32_t default_value)
 	return (uint32_t)parsed;
 }
 
+static uint32_t
+spdk_urma_env_u32_compat(const char *name, const char *compat_name, uint32_t default_value)
+{
+	const char *value = getenv(name);
+
+	if ((value == NULL || value[0] == '\0') && compat_name != NULL) {
+		name = compat_name;
+	}
+	return spdk_urma_env_u32(name, default_value);
+}
+
 static bool
 spdk_urma_env_bool(const char *name, const char *compat_name, bool default_value)
 {
@@ -127,12 +183,13 @@ spdk_urma_opts_init(struct spdk_urma_transport_opts *opts)
 	}
 	opts->transport_mode = spdk_urma_parse_mode(value);
 	opts->eid_index = spdk_urma_env_u32("SPDK_URMA_EID_INDEX", 0);
-	opts->jfc_count = spdk_urma_env_u32("SPDK_URMA_JFC_COUNT", SPDK_URMA_DEFAULT_JFC_COUNT);
+	opts->jfc_count = spdk_urma_env_u32_compat("SPDK_URMA_JFC_COUNT", "MC_NUM_CQ_PER_CTX",
+						SPDK_URMA_DEFAULT_JFC_COUNT);
 	opts->jfc_depth = spdk_urma_env_u32("SPDK_URMA_JFC_DEPTH", SPDK_URMA_DEFAULT_JFC_DEPTH);
 	opts->jetty_count = spdk_urma_env_u32("SPDK_URMA_JETTY_COUNT",
 			    SPDK_URMA_DEFAULT_JETTY_COUNT);
-	opts->jetty_depth = spdk_urma_env_u32("SPDK_URMA_JETTY_DEPTH",
-			    SPDK_URMA_DEFAULT_JETTY_DEPTH);
+	opts->jetty_depth = spdk_urma_env_u32_compat("SPDK_URMA_JETTY_DEPTH", "MC_MAX_WR",
+						   SPDK_URMA_DEFAULT_JETTY_DEPTH);
 	opts->max_io_size = spdk_urma_env_u32("SPDK_URMA_MAX_IO_SIZE", 131072);
 	opts->bonding_balance = spdk_urma_env_bool("SPDK_URMA_BONDING_BALANCE",
 				"MC_URMA_BONDING_BALANCE", false);
@@ -323,6 +380,37 @@ spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 	free(region);
 }
 
+int
+spdk_urma_device_enable_host_memory_map(struct spdk_urma_device *device)
+{
+	if (device == NULL) {
+		return -EINVAL;
+	}
+	if (device->host_mem_map != NULL) {
+		return 0;
+	}
+	device->host_mem_map = spdk_mem_map_alloc(0, &g_spdk_urma_host_mem_map_ops, device);
+	return device->host_mem_map == NULL ? -ENOMEM : 0;
+}
+
+struct spdk_nvme_urma_memory_region *
+spdk_urma_device_lookup_host_memory(struct spdk_urma_device *device, void *addr, size_t length)
+{
+	struct spdk_nvme_urma_memory_region *region;
+	uint64_t contiguous = length;
+	uintptr_t start = (uintptr_t)addr;
+
+	if (device == NULL || device->host_mem_map == NULL || addr == NULL || length == 0) {
+		return NULL;
+	}
+	region = (void *)spdk_mem_map_translate(device->host_mem_map, start, &contiguous);
+	if (region == NULL || contiguous < length || start < (uintptr_t)region->addr ||
+	    length > region->length || start - (uintptr_t)region->addr > region->length - length) {
+		return NULL;
+	}
+	return region;
+}
+
 void *
 spdk_nvme_urma_memory_region_get_addr(const struct spdk_nvme_urma_memory_region *region)
 {
@@ -482,7 +570,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		device->jfc_count = 1;
 	}
 	device->jfcs = calloc(device->jfc_count, sizeof(*device->jfcs));
-	if (device->jfcs == NULL) {
+	device->jfc_outstanding = calloc(device->jfc_count, sizeof(*device->jfc_outstanding));
+	if (device->jfcs == NULL || device->jfc_outstanding == NULL) {
 		rc = -ENOMEM;
 		goto fail;
 	}
@@ -490,6 +579,10 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		urma_jfc_cfg_t cfg = {};
 		cfg.depth = spdk_min(opts->jfc_depth,
 				     (uint32_t)device->attr.dev_cap.max_jfc_depth);
+		if (cfg.depth == 0) {
+			cfg.depth = opts->jfc_depth;
+		}
+		device->jfc_depth = cfg.depth;
 		device->jfcs[i] = urma_create_jfc(device->context, &cfg);
 		if (device->jfcs[i] == NULL) {
 			rc = -EIO;
@@ -497,7 +590,12 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		}
 	}
 	/* Modified by Yin: UB transport 强制 share_jfr=1，预建共享 jfr 供所有 jetty 复用 */
-	{
+	device->jfrs = calloc(device->jfc_count, sizeof(*device->jfrs));
+	if (device->jfrs == NULL) {
+		rc = -ENOMEM;
+		goto fail;
+	}
+	for (uint32_t i = 0; i < device->jfc_count; i++) {
 		urma_jfr_cfg_t jfr_cfg = {};
 		uint32_t max_jfr_depth = device->attr.dev_cap.max_jfr_depth;
 		uint8_t max_jfr_sge = device->attr.dev_cap.max_jfr_sge;
@@ -517,13 +615,14 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		jfr_cfg.max_sge = spdk_min(SPDK_URMA_DEFAULT_MAX_SGE, max_jfr_sge);
 		jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
 		jfr_cfg.token_value.token = SPDK_URMA_DEFAULT_TOKEN;
-		jfr_cfg.jfc = device->jfcs[0];
-		device->jfr = urma_create_jfr(device->context, &jfr_cfg);
-		if (device->jfr == NULL) {
+		jfr_cfg.jfc = device->jfcs[i];
+		device->jfrs[i] = urma_create_jfr(device->context, &jfr_cfg);
+		if (device->jfrs[i] == NULL) {
 			rc = -EIO;
 			goto fail;
 		}
 	}
+	device->jfr = device->jfrs[0];
 	{
 		struct spdk_memory_domain_ctx domain_ctx = {
 			.size = sizeof(domain_ctx),
@@ -566,17 +665,24 @@ spdk_urma_device_close(struct spdk_urma_device *device)
 	if (device == NULL) {
 		return;
 	}
-	/* Modified by Yin: 释放 1.5 预建的共享 jfr，与 open 对称 */
-	if (device->jfr != NULL) {
-		urma_delete_jfr(device->jfr);
-		device->jfr = NULL;
+	if (device->host_mem_map != NULL) {
+		spdk_mem_map_free(&device->host_mem_map);
 	}
+	/* Modified by Yin: 释放 1.5 预建的共享 jfr，与 open 对称 */
+	for (uint32_t i = 0; i < device->jfc_count; i++) {
+		if (device->jfrs != NULL && device->jfrs[i] != NULL) {
+			urma_delete_jfr(device->jfrs[i]);
+		}
+	}
+	free(device->jfrs);
+	device->jfr = NULL;
 	for (uint32_t i = 0; i < device->jfc_count; i++) {
 		if (device->jfcs != NULL && device->jfcs[i] != NULL) {
 			urma_delete_jfc(device->jfcs[i]);
 		}
 	}
 	free(device->jfcs);
+	free(device->jfc_outstanding);
 	if (device->memory_domain != NULL) {
 		spdk_memory_domain_destroy(device->memory_domain);
 	}

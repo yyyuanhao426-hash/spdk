@@ -89,15 +89,23 @@ struct spdk_urma_device {
 	struct spdk_urma_transport_opts opts;
 	urma_jfc_t **jfcs;
 	uint32_t jfc_count;
+	uint32_t jfc_depth;
+	uint32_t *jfc_outstanding;
 	/* Modified by Yin: 新增 device 级共享 jfr 字段（UB transport share_jfr 用） */
 	urma_jfr_t *jfr;
+	urma_jfr_t **jfrs;
 	struct spdk_memory_domain *memory_domain;
+	/* Host hugepage registrations populated from SPDK's memory notifications. */
+	struct spdk_mem_map *host_mem_map;
 };
 
 void spdk_urma_opts_init(struct spdk_urma_transport_opts *opts);
 int spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			  struct spdk_urma_device **device);
 void spdk_urma_device_close(struct spdk_urma_device *device);
+int spdk_urma_device_enable_host_memory_map(struct spdk_urma_device *device);
+struct spdk_nvme_urma_memory_region *spdk_urma_device_lookup_host_memory(
+	struct spdk_urma_device *device, void *addr, size_t length);
 urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 	struct spdk_nvme_urma_memory_region *region);
 
