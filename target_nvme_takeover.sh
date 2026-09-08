@@ -26,7 +26,12 @@
 #   -L <目录>    URMA 库目录（默认 /home/yin/gdr/UMDK_netlab/lib，
 #                必须同时含 liburma.so* 与 liburma_common.so*，缺一不可）
 #   -N <设备名>  URMA 设备名（默认 udmac0d1e2）
+#   -r           还原模式：把 vfio-pci 占用/游离的 NVMe 盘还原回 nvme 驱动后退出
+#                （上次运行失败/中断后的补救）
 #   -y           跳过交互确认（配合 -d 用于自动化）
+#
+# 接管前会自动检测上一次运行残留（vfio-pci 占用或游离的 NVMe 盘）并还原回
+# nvme 驱动，确保本次是全新的 unbind + bind。
 #
 # 运行时产物：日志 /tmp/nvmf_tgt.log，PID /var/tmp/nvmf_tgt.pid
 #             （停止：kill $(cat /var/tmp/nvmf_tgt.pid)；RPC 配置不持久化，重启后重跑本脚本）
@@ -43,6 +48,7 @@ SPDK_DIR=""
 LIBDIR="/home/yin/gdr/UMDK_netlab/lib"
 DEVNAME="udmac0d1e2"
 LISTEN_IP=""
+RESTORE_ONLY=0
 ASSUME_YES=0
 
 NQN="nqn.2026-01.io.spdk:urma-gpu-test"
@@ -65,7 +71,7 @@ confirm() {
     [ "$a" = "yes" ]
 }
 
-while getopts "d:s:i:m:w:L:N:yh" opt; do
+while getopts "d:s:i:m:w:L:N:ryh" opt; do
     case $opt in
         d) DISK=$OPTARG ;;
         s) DUMP_SEC=$OPTARG ;;
@@ -74,6 +80,7 @@ while getopts "d:s:i:m:w:L:N:yh" opt; do
         w) SPDK_DIR=$OPTARG ;;
         L) LIBDIR=$OPTARG ;;
         N) DEVNAME=$OPTARG ;;
+        r) RESTORE_ONLY=1 ;;
         y) ASSUME_YES=1 ;;
         h) usage ;;
         *) usage ;;
@@ -82,6 +89,16 @@ done
 shift $((OPTIND - 1))
 
 [ "$(id -u)" -eq 0 ] || abort "必须以 root 运行（sysfs 绑定 + hugepages + 启动 nvmf_tgt）"
+
+# -r 还原模式：只做残留清理（上次运行失败后的补救），不做接管
+if [ "$RESTORE_ONLY" = 1 ]; then
+    echo "=== 还原模式：把 vfio-pci 占用/游离的 NVMe 盘还原回 nvme ==="
+    lsmod | grep -q '^vfio_pci' || modprobe vfio-pci 2>/dev/null || true
+    restore_vfio_nvme
+    check_root_rw
+    info "还原完成"
+    exit 0
+fi
 
 # 由盘名解析 BDF：readlink -f /sys/block/<盘> 的完整路径里取最后一个 PCI 地址
 # （嵌套 PCIe 桥时最后一个才是端点）
@@ -140,6 +157,68 @@ protected_bdfs() {
 
 driver_of() {
     readlink -f "/sys/bus/pci/devices/$1/driver" 2>/dev/null || true
+}
+
+# 根分区必须仍是 rw（bind/unbind 错盘的实测事故，附录 F-1）
+check_root_rw() {
+    local opts
+    opts=$(findmnt -no OPTIONS / 2>/dev/null || true)
+    case ",${opts}," in
+        *,rw,*)
+            ok "根分区仍为 rw"
+            ;;
+        *)
+            echo "[ABORT] 根分区变只读！很可能误碰了系统盘。" >&2
+            echo "恢复：把误接管的盘从 vfio-pci unbind 回 nvme 驱动，然后重启（journal replay 才能回 rw），见部署文档附录 F-1" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# 还原残留：把被 vfio-pci 占用、或游离（无驱动）的 NVMe 控制器全部绑回 nvme 驱动。
+# 上一次运行失败/中断会把盘留在 vfio-pci 或无驱动状态，接管前必须先还原，
+# 保证本次是全新的 unbind + bind。
+restore_vfio_nvme() {
+    local devpath bdf cls drv vid_did st
+    local -a restore_list=()
+    for devpath in /sys/bus/pci/devices/*; do
+        bdf=$(basename "$devpath")
+        cls=$(cat "$devpath/class" 2>/dev/null || true)
+        case "$cls" in 0x0108*) ;; *) continue ;; esac
+        drv=$(driver_of "$bdf")
+        if [ "$drv" = "/sys/bus/pci/drivers/vfio-pci" ] || [ -z "$drv" ]; then
+            restore_list+=("$bdf")
+        fi
+    done
+    if [ "${#restore_list[@]}" -eq 0 ]; then
+        info "没有 vfio-pci 残留/游离的 NVMe 盘，跳过还原"
+        return 0
+    fi
+    echo "发现上次运行残留的 NVMe 盘，将还原回 nvme 驱动："
+    for bdf in "${restore_list[@]}"; do
+        drv=$(driver_of "$bdf")
+        if [ "$drv" = "/sys/bus/pci/drivers/vfio-pci" ]; then st="vfio-pci 占用"; else st="游离(无驱动)"; fi
+        echo "  $bdf  $(lspci -nns "$bdf" 2>/dev/null | cut -d' ' -f2-)  [$st]"
+    done
+    confirm "还原以上盘?" || abort "用户取消"
+    lsmod | grep -q '^nvme' || modprobe nvme 2>/dev/null || true
+    # 先从 vfio-pci 的 ID 表摘掉，防止解绑后被自动 probe 抢回去
+    if [ -e /sys/bus/pci/drivers/vfio-pci/remove_id ]; then
+        for bdf in "${restore_list[@]}"; do
+            vid_did=$(lspci -nns "$bdf" 2>/dev/null \
+                      | grep -oE '\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]' | head -n1 | tr -d '[]')
+            [ -n "$vid_did" ] && echo "$vid_did" \
+                > /sys/bus/pci/drivers/vfio-pci/remove_id 2>/dev/null
+        done
+    fi
+    for bdf in "${restore_list[@]}"; do
+        echo "$bdf" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null
+        if echo "$bdf" > /sys/bus/pci/drivers/nvme/bind 2>/dev/null; then
+            ok "$bdf 已还原到 nvme 驱动"
+        else
+            warn "$bdf 绑回 nvme 失败，请人工检查（modprobe nvme 后重试）"
+        fi
+    done
 }
 
 #===============================================================================
@@ -237,6 +316,14 @@ else
     info "noiommu 模式已是 1（$NOIOMMU）"
 fi
 
+# 上次运行失败会把盘留在 vfio-pci/游离状态：nvmf_tgt 必须先停（可能占着残留盘），
+# 再把残留盘还原回 nvme，确保本次是全新的 unbind + bind
+if pgrep -x nvmf_tgt >/dev/null 2>&1; then
+    abort "nvmf_tgt 已在运行 (PID $(pgrep -x nvmf_tgt | tr '\n' ' '))，先 kill 再来（RPC 配置不持久化，需重做）"
+fi
+restore_vfio_nvme
+check_root_rw
+
 if ! echo "$VENDOR $DEVID" > /sys/bus/pci/drivers/vfio-pci/new_id 2>/tmp/.newid.err; then
     if grep -q "File exists" /tmp/.newid.err 2>/dev/null; then
         info "new_id $VID_DID 已注册过，跳过"
@@ -274,18 +361,7 @@ GRP_CNT=$(find /dev/vfio -maxdepth 1 -type c ! -name vfio 2>/dev/null | wc -l)
 [ "$GRP_CNT" -ge 1 ] || warn "/dev/vfio/ 下没有组设备，SPDK 可能打不开该盘"
 
 # bind 错盘 = 根文件系统变 ro 的实测事故（附录 F-1），必须立刻检查
-ROOT_OPTS=$(findmnt -no OPTIONS / 2>/dev/null || true)
-case ",${ROOT_OPTS}," in
-    *,rw,*)
-        ok "根分区仍为 rw"
-        ;;
-    *)
-        echo "[ABORT] 根分区变只读！很可能误碰了系统盘。" >&2
-        echo "恢复：echo \"$BDF\" > /sys/bus/pci/drivers/vfio-pci/unbind && \\" >&2
-        echo "      echo \"$BDF\" > /sys/bus/pci/drivers/nvme/bind，然后重启（journal replay 才能回 rw）" >&2
-        exit 1
-        ;;
-esac
+check_root_rw
 echo
 
 echo "=== 5) 环境与前置检查 ==="
@@ -319,10 +395,6 @@ if ! ls "$LIBDIR"/liburma_common.so* >/dev/null 2>&1; then
     warn "$LIBDIR 缺 liburma_common.so*！liburma.so.0 依赖它，缺了会回落 /usr/lib64 旧版"
     warn "→ urma_init() 返回 4096 → nvmf_create_transport 静默失败（部署文档附录 F-3）"
     confirm "仍要继续?" || abort "换用成套库目录重跑：-L <同时含 liburma* 与 liburma_common* 的目录>"
-fi
-
-if pgrep -x nvmf_tgt >/dev/null 2>&1; then
-    abort "nvmf_tgt 已在运行 (PID $(pgrep -x nvmf_tgt | tr '\n' ' '))，先 kill 再来（RPC 配置不持久化，需重做）"
 fi
 
 TOTAL_HP=$(awk '/^HugePages_Total/{print $2}' /proc/meminfo)
