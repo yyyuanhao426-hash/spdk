@@ -915,6 +915,14 @@ nvmf_urma_import_remote_seg(struct nvmf_urma_qpair *uqpair, const urma_seg_t *se
 	flag.bs.mapping = URMA_SEG_NOMAP;
 	entry->tseg = urma_import_seg(uqpair->device->context, &entry->key, &token, 0, flag);
 	if (entry->tseg == NULL) {
+		int saved_errno = errno;
+
+		SPDK_ERRLOG("URMA import remote segment failed: qid=%u va=0x%llx len=%llu "
+			    "uasid=%u attr=0x%x token_id=%u token=0x%x errno=%d (%s)\n",
+			    uqpair->qpair.qid, (unsigned long long)entry->key.ubva.va,
+			    (unsigned long long)entry->key.len, entry->key.ubva.uasid,
+			    entry->key.attr.value, entry->key.token_id, token.token,
+			    saved_errno, spdk_strerror(saved_errno));
 		free(entry);
 		pthread_rwlock_unlock(&transport->import_lock);
 		return -EIO;
@@ -981,11 +989,18 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	int rc;
 
 	if (ureq->req.iovcnt != 1) {
+		SPDK_ERRLOG("URMA data request requires one iovec: qid=%u cid=%u iovcnt=%d len=%u\n",
+			    uqpair->qpair.qid, ureq->cmd.nvme_cmd.cid, ureq->req.iovcnt,
+			    ureq->req.length);
 		return -ENOTSUP;
 	}
 	t_import0 = spdk_get_ticks();
 	rc = nvmf_urma_import_remote_seg(uqpair, &ureq->remote_data.seg, &ureq->remote_seg);
 	if (rc != 0) {
+		SPDK_ERRLOG("URMA prepare data failed while importing remote segment: "
+			    "qid=%u cid=%u push=%d remote_addr=0x%llx len=%u rc=%d\n",
+			    uqpair->qpair.qid, ureq->cmd.nvme_cmd.cid, push,
+			    (unsigned long long)ureq->remote_data.address, ureq->req.length, rc);
 		return rc;
 	}
 	NVMF_URMA_TGT_STAGE(import, spdk_get_ticks() - t_import0);
@@ -1011,6 +1026,10 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 		rc = spdk_nvme_urma_register_memory(device->context, ureq->req.iov[0].iov_base,
 				ureq->req.length, SPDK_NVME_URMA_MEM_HOST, &ureq->local_region);
 		if (rc != 0) {
+			SPDK_ERRLOG("URMA prepare data failed while registering local buffer: "
+				    "qid=%u cid=%u push=%d addr=%p len=%u rc=%d\n",
+				    uqpair->qpair.qid, ureq->cmd.nvme_cmd.cid, push,
+				    ureq->req.iov[0].iov_base, ureq->req.length, rc);
 			return rc;
 		}
 		NVMF_URMA_TGT_ADD(reg_ticks, spdk_get_ticks() - t_reg0);
@@ -1059,6 +1078,7 @@ nvmf_urma_flush_pending(struct nvmf_urma_qpair *uqpair)
 	uint32_t available, count = 0, posted;
 	uint32_t jfc_outstanding;
 	urma_status_t rc;
+	int saved_errno;
 
 	if (uqpair->outstanding_wr >= uqpair->max_outstanding_wr) {
 		return 0;
@@ -1092,8 +1112,16 @@ nvmf_urma_flush_pending(struct nvmf_urma_qpair *uqpair)
 	failed = &first->wr;
 	t_post0 = spdk_get_ticks();
 	rc = urma_post_jetty_send_wr(uqpair->jetty, &first->wr, &bad_wr);
+	saved_errno = errno;
 	t_post1 = spdk_get_ticks();
 	NVMF_URMA_TGT_STAGE(post, t_post1 - t_post0);
+	if (rc != URMA_SUCCESS) {
+		SPDK_ERRLOG("URMA batch post failed: qid=%u batch=%u outstanding=%u "
+			    "jfc_index=%u jfc_outstanding=%u rc=%d bad_wr=%p errno=%d (%s)\n",
+			    uqpair->qpair.qid, count, uqpair->outstanding_wr,
+			    uqpair->jfc_index, jfc_outstanding, rc, bad_wr, saved_errno,
+			    spdk_strerror(saved_errno));
+	}
 	posted = rc == URMA_SUCCESS ? count : 0;
 	if (rc != URMA_SUCCESS && bad_wr != NULL) {
 		posted = 0;
@@ -1127,12 +1155,19 @@ nvmf_urma_flush_pending(struct nvmf_urma_qpair *uqpair)
 static void
 nvmf_urma_buffers_ready(struct nvmf_urma_req *ureq)
 {
+	int rc;
+
 	/* Modified By Yida(v3): W4b — capsule parsed -> buffers ready */
 	if (ureq->start_tick != 0) {
 		NVMF_URMA_TGT_STAGE(buffer, spdk_get_ticks() - ureq->start_tick);
 	}
 	if (ureq->req.xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
-		if (nvmf_urma_post_data(ureq, false) != 0) {
+		rc = nvmf_urma_post_data(ureq, false);
+		if (rc != 0) {
+			SPDK_ERRLOG("URMA CONNECT/data pull preparation failed: qid=%u cid=%u "
+				    "opcode=0x%x len=%u rc=%d\n",
+				    ureq->req.qpair->qid, ureq->cmd.nvme_cmd.cid,
+				    ureq->cmd.nvme_cmd.opc, ureq->req.length, rc);
 			ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 			ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 			nvmf_urma_send_response(ureq);
@@ -1255,9 +1290,15 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 				}
 				if (completions[i].status != URMA_CR_SUCCESS) {
 					/* Modified by Yin: 打印 JFC completion 错误（含 status=4 LOC_ACCESS_ERR），便于定位 */
-					SPDK_ERRLOG("poll_group: completion error status=%d, ureq->state=%d, opcode=%d, user_ctx=%p\n",
+					SPDK_ERRLOG("URMA completion error: qid=%u cid=%u status=%d "
+						    "state=%d opcode=%d local_addr=%p remote_addr=0x%llx "
+						    "len=%u user_ctx=%p\n",
+						    owner->qpair.qid, ureq->cmd.nvme_cmd.cid,
 						    completions[i].status, ureq->state,
 						    ureq->state == NVMF_URMA_REQ_PULLING ? 1 : 0,
+						    ureq->req.iovcnt == 1 ? ureq->req.iov[0].iov_base : NULL,
+						    (unsigned long long)ureq->remote_data.address,
+						    ureq->req.length,
 						    completions[i].user_ctx);
 					ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 					ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
