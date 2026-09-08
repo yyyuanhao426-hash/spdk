@@ -25,6 +25,7 @@
 #define NVMF_URMA_REG_CACHE_SIZE 128
 #define NVMF_URMA_IMPORT_BUCKETS 128
 #define NVMF_URMA_DEFAULT_BATCH_SIZE 32
+#define NVMF_URMA_DEFAULT_WORKER_COUNT 2
 #define NVMF_URMA_MAX_WORKERS 8
 
 struct nvmf_urma_import_entry {
@@ -577,7 +578,8 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	json_opts.batch_size = nvmf_urma_env_u32("SPDK_URMA_BATCH_SIZE", NULL,
 						NVMF_URMA_DEFAULT_BATCH_SIZE);
 	json_opts.worker_count = nvmf_urma_env_u32("SPDK_URMA_WORKERS_PER_CTX",
-						  "MC_WORKERS_PER_CTX", 1);
+						  "MC_WORKERS_PER_CTX",
+						  NVMF_URMA_DEFAULT_WORKER_COUNT);
 	if (opts->transport_specific != NULL &&
 	    spdk_json_decode_object_relaxed(opts->transport_specific, g_urma_opts_decoder,
 					    SPDK_COUNTOF(g_urma_opts_decoder), &json_opts) != 0) {
