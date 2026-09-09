@@ -103,40 +103,42 @@ nvmf_urma_timing_dump(void)
 
 	/* printf instead of SPDK_NOTICELOG, same reason as the initiator dump:
 	 * nvmf_tgt's default log level filters NOTICE, printf always shows. */
+	/* Modified By Yida: avg 一律先除 n 再乘系数，避免 ticks×1e9 溢出 uint64
+	 * （64K/128K 的 W9 累计 2.3e10~1.1e11 ticks，旧式先乘后除打印出错的 avg） */
 	printf("==== URMA target timing breakdown (hz=%lu) ====\n", hz);
 	printf("  W4a parse capsule:   %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       capsule, cap_n, cap_n ? capsule * 1000000000ULL / (hz * cap_n) : 0,
+	       capsule, cap_n, cap_n ? capsule / cap_n * 1000000000ULL / hz : 0,
 	       capsule * 1000 / hz);
 	printf("  W4b iobuf alloc:     %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       buffer, buf_n, buf_n ? buffer * 1000000000ULL / (hz * buf_n) : 0,
+	       buffer, buf_n, buf_n ? buffer / buf_n * 1000000000ULL / hz : 0,
 	       buffer * 1000 / hz);
 	printf("  W5 import_seg:       %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       imp, imp_n, imp_n ? imp * 1000000000ULL / (hz * imp_n) : 0,
+	       imp, imp_n, imp_n ? imp / imp_n * 1000000000ULL / hz : 0,
 	       imp * 1000 / hz);
 	printf("  W6 register (miss):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       reg, miss, miss ? reg * 1000000000ULL / (hz * miss) : 0,
+	       reg, miss, miss ? reg / miss * 1000000000ULL / hz : 0,
 	       reg * 1000 / hz);
 	printf("  W6 cache_hit:        n=%lu, miss=%lu\n", hit, miss);
 	printf("  W7 post WR:          %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       post, post_n, post_n ? post * 1000000000ULL / (hz * post_n) : 0,
+	       post, post_n, post_n ? post / post_n * 1000000000ULL / hz : 0,
 	       post * 1000 / hz);
 	printf("  W8 JFC wait (pull):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       jfc, jfc_n, jfc_n ? jfc * 1000000000ULL / (hz * jfc_n) : 0,
+	       jfc, jfc_n, jfc_n ? jfc / jfc_n * 1000000000ULL / hz : 0,
 	       jfc * 1000 / hz);
 	printf("  W9 exec->cpl (SSD):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       exec, exec_n, exec_n ? exec * 1000000000ULL / (hz * exec_n) : 0,
+	       exec, exec_n, exec_n ? exec / exec_n * 1000000000ULL / hz : 0,
 	       exec * 1000 / hz);
 	printf("  push JFC wait (C2H): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       push, push_n, push_n ? push * 1000000000ULL / (hz * push_n) : 0,
+	       push, push_n, push_n ? push / push_n * 1000000000ULL / hz : 0,
 	       push * 1000 / hz);
 	printf("  W10 send rsp:        %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       rsp, rsp_n, rsp_n ? rsp * 1000000000ULL / (hz * rsp_n) : 0,
+	       rsp, rsp_n, rsp_n ? rsp / rsp_n * 1000000000ULL / hz : 0,
 	       rsp * 1000 / hz);
 	printf("  release (unreg+unimport): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       rel, rel_n, rel_n ? rel * 1000000000ULL / (hz * rel_n) : 0,
+	       rel, rel_n, rel_n ? rel / rel_n * 1000000000ULL / hz : 0,
 	       rel * 1000 / hz);
 	printf("  TOTAL (parse->rsp):  %lu ticks, n=%lu, avg=%lu us, total=%lu ms\n",
-	       tot, tot_n, tot_n ? tot * 1000000ULL / (hz * tot_n) : 0,
+	       tot, tot_n, tot_n ? tot / tot_n * 1000000ULL / hz : 0,
 	       tot * 1000 / hz);
 	if (tot > 0) {
 		printf("  breakdown: parse=%.1f%% buf=%.1f%% import=%.1f%% reg=%.1f%% post=%.1f%% jfc=%.1f%% exec=%.1f%% push=%.1f%% rsp=%.1f%% release=%.1f%%\n",

@@ -51,18 +51,20 @@ nvme_urma_timing_dump(void)
 	/* Modified By Yida: use printf instead of SPDK_NOTICELOG — urma_perf's
 	 * default log level filters NOTICE, but results are printed via printf
 	 * which always shows on stdout. */
+	/* Modified By Yida: avg 一律先除 n 再乘系数——ticks×1e9 在累计超过 ~1.8e10
+	 * ticks（约 184ms·万次）时会溢出 uint64，长跑打印出错的 avg */
 	printf("==== URMA timing breakdown (hz=%lu) ====\n", hz);
 	printf("  register (cache miss): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       reg, reg_n, reg_n ? reg * 1000000000ULL / (hz * reg_n) : 0, reg * 1000 / hz);
+	       reg, reg_n, reg_n ? reg / reg_n * 1000000000ULL / hz : 0, reg * 1000 / hz);
 	printf("  cache_hit:             n=%lu\n", hit);
 	printf("  send (TCP capsule):    %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       send, send_n, send_n ? send * 1000000000ULL / (hz * send_n) : 0, send * 1000 / hz);
+	       send, send_n, send_n ? send / send_n * 1000000000ULL / hz : 0, send * 1000 / hz);
 	printf("  completion_wait:       %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       compl, compl_n, compl_n ? compl * 1000000000ULL / (hz * compl_n) : 0, compl * 1000 / hz);
+	       compl, compl_n, compl_n ? compl / compl_n * 1000000000ULL / hz : 0, compl * 1000 / hz);
 	printf("  release (cache/unreg): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
-	       rel, rel_n, rel_n ? rel * 1000000000ULL / (hz * rel_n) : 0, rel * 1000 / hz);
+	       rel, rel_n, rel_n ? rel / rel_n * 1000000000ULL / hz : 0, rel * 1000 / hz);
 	printf("  TOTAL (submit+compl):  %lu ticks, n=%lu, avg=%lu us, total=%lu ms\n",
-	       tot, tot_n, tot_n ? tot * 1000000ULL / (hz * tot_n) : 0, tot * 1000 / hz);
+	       tot, tot_n, tot_n ? tot / tot_n * 1000000ULL / hz : 0, tot * 1000 / hz);
 	if (tot > 0) {
 		printf("  breakdown: reg=%.1f%% send=%.1f%% compl=%.1f%% release=%.1f%%\n",
 		       100.0 * reg / tot, 100.0 * send / tot,
