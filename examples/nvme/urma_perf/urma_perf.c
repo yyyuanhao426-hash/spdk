@@ -87,6 +87,10 @@ struct worker {
 	uint32_t core;
 	struct spdk_nvme_qpair *qpair;
 	struct gpu_allocation allocation;
+	/* Modified By Yida: posix(新语义) 的 HBM 影子缓冲 + 分级拷贝耗时统计 */
+	struct gpu_allocation gpu_alloc;
+	uint64_t copy_ticks;
+	uint64_t copy_ios;
 	struct io_task *tasks;
 	struct spdk_histogram_data *histogram;
 	uint64_t range_start_lba;
@@ -133,13 +137,17 @@ static bool g_read_workload;
 static bool g_require_dmabuf;
 
 /* Modified By Yida: memory source selection
- * - posix:   plain host (CPU) memory, no CUDA involvement at all
+ * - cpu:     plain host (CPU) memory, no CUDA involvement at all (原 posix 行为)
+ * - posix:   staged path —— 数据在 HBM（cuMemAlloc），每个 I/O 先 cuMemcpy 到
+ *            host 暂存缓冲，host 暂存缓冲注册为 URMA segment。模拟无 GDR 时的
+ *            "HBM → CPU 拷贝 → NIC DMA" 路线，拷贝耗时单独统计
  * - peermem: GPU memory via the nvidia_p2p peer-memory path (no dmabuf export)
  * - dmabuf:  GPU memory via cuMemGetHandleForAddressRange (default, legacy behavior) */
 enum urma_perf_mem_type {
 	URMA_PERF_MEM_DMABUF = 0,
 	URMA_PERF_MEM_PEERMEM,
 	URMA_PERF_MEM_POSIX,
+	URMA_PERF_MEM_CPU,
 };
 
 static enum urma_perf_mem_type g_mem_type;
@@ -442,6 +450,35 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	g_ns = ns;
 }
 
+/* Modified By Yida: posix(新语义) 的分级拷贝 —— write 在提交前 HBM→host，
+ * read 在完成后 host→HBM。同步 cuMemcpy；耗时**不计入** NVMe 延迟，单独
+ * 累计到 worker->copy_ticks，结果里单独打印，端到端成本 = 延迟 + 拷贝。 */
+static int
+staged_copy(struct worker *worker, struct io_task *task, bool to_host)
+{
+	size_t offset = (uintptr_t)task->buf - (uintptr_t)worker->allocation.addr;
+	CUdeviceptr gpu = (CUdeviceptr)((uintptr_t)worker->gpu_alloc.addr + offset);
+	CUresult result;
+	uint64_t start;
+
+	if (g_mem_type != URMA_PERF_MEM_POSIX) {
+		return 0;
+	}
+	start = spdk_get_ticks();
+	if (to_host) {
+		result = g_cuda.memcpy_d2h(task->buf, gpu, g_io_size);
+	} else {
+		result = g_cuda.memcpy_h2d(gpu, task->buf, g_io_size);
+	}
+	if (result != URMA_PERF_CUDA_SUCCESS) {
+		cuda_print_error(to_host ? "cuMemcpyDtoH" : "cuMemcpyHtoD", result);
+		return -EIO;
+	}
+	worker->copy_ticks += spdk_get_ticks() - start;
+	worker->copy_ios++;
+	return 0;
+}
+
 static void
 io_complete(void *arg, const struct spdk_nvme_cpl *completion)
 {
@@ -454,12 +491,18 @@ io_complete(void *arg, const struct spdk_nvme_cpl *completion)
 				task->write ? SPDK_NVME_OPC_WRITE : SPDK_NVME_OPC_READ);
 		worker->errors++;
 		atomic_store_explicit(&g_failed, true, memory_order_release);
-	} else if (worker->measuring) {
-		worker->completed++;
-		worker->latency_tsc += latency;
-		worker->min_latency_tsc = spdk_min(worker->min_latency_tsc, latency);
-		worker->max_latency_tsc = spdk_max(worker->max_latency_tsc, latency);
-		spdk_histogram_data_tally(worker->histogram, latency);
+	} else {
+		/* Modified By Yida: posix 模式读方向把落到 host 暂存缓冲的数据搬回 HBM */
+		if (staged_copy(worker, task, false) != 0) {
+			atomic_store_explicit(&g_failed, true, memory_order_release);
+		}
+		if (worker->measuring) {
+			worker->completed++;
+			worker->latency_tsc += latency;
+			worker->min_latency_tsc = spdk_min(worker->min_latency_tsc, latency);
+			worker->max_latency_tsc = spdk_max(worker->max_latency_tsc, latency);
+			spdk_histogram_data_tally(worker->histogram, latency);
+		}
 	}
 	task->in_flight = false;
 	worker->outstanding--;
@@ -472,6 +515,10 @@ submit_io(struct worker *worker, struct io_task *task, bool write, uint64_t lba)
 	uint32_t lba_count = g_io_size / sector_size;
 	int rc;
 
+	/* Modified By Yida: posix 模式写方向先把 HBM 数据搬到 host 暂存缓冲 */
+	if (write && staged_copy(worker, task, true) != 0) {
+		return -EIO;
+	}
 	task->write = write;
 	task->submit_tsc = spdk_get_ticks();
 	task->in_flight = true;
@@ -504,10 +551,10 @@ wait_for_task(struct worker *worker, struct io_task *task)
 	return atomic_load_explicit(&g_failed, memory_order_acquire) ? -EIO : 0;
 }
 
-/* Modified By Yida: posix 模式的预检 —— 缓冲区就是 host 内存，直接在 CPU 上
- * 填模式、比对，不需要 CUDA 拷贝。 */
+/* Modified By Yida: cpu 模式（原 posix）的预检 —— 缓冲区就是 host 内存，直接在
+ * CPU 上填模式、比对，不需要 CUDA 拷贝。 */
 static int
-verify_posix_to_ssd_path(struct worker *worker)
+verify_cpu_to_ssd_path(struct worker *worker)
 {
 	struct io_task *task = &worker->tasks[0];
 	uint8_t *expected = malloc(g_io_size);
@@ -544,6 +591,66 @@ out:
 	return rc;
 }
 
+/* Modified By Yida: posix(新语义) 的预检 —— 数据"产自" HBM：expected 先 HtoD 进
+ * 影子缓冲；write 由 submit_io 内部的 DtoH 搬到 host 暂存缓冲再发；read 完成后
+ * io_complete 已把数据 host→HBM，最后 DtoH 拉回 CPU 比对，覆盖完整分级路径。 */
+static int
+verify_staged_to_ssd_path(struct worker *worker)
+{
+	struct io_task *task = &worker->tasks[0];
+	uint8_t *expected;
+	uint8_t *actual;
+	CUdeviceptr gpu0 = (CUdeviceptr)(uintptr_t)worker->gpu_alloc.addr;
+	CUresult result;
+	int rc = -EIO;
+	uint32_t i;
+
+	expected = malloc(g_io_size);
+	actual = calloc(1, g_io_size);
+	if (expected == NULL || actual == NULL) {
+		goto out;
+	}
+	for (i = 0; i < g_io_size; i++) {
+		expected[i] = (uint8_t)(i * 131U + 17U);
+	}
+	result = g_cuda.ctx_set_current(g_cuda.context);
+	if (result != URMA_PERF_CUDA_SUCCESS) {
+		cuda_print_error("cuCtxSetCurrent", result);
+		goto out;
+	}
+	result = g_cuda.memcpy_h2d(gpu0, expected, g_io_size);
+	if (result != URMA_PERF_CUDA_SUCCESS) {
+		cuda_print_error("cuMemcpyHtoD", result);
+		goto out;
+	}
+	if (submit_io(worker, task, true, worker->range_start_lba) != 0 ||
+	    wait_for_task(worker, task) != 0) {
+		fprintf(stderr, "Verification WRITE failed\n");
+		goto out;
+	}
+	if (submit_io(worker, task, false, worker->range_start_lba) != 0 ||
+	    wait_for_task(worker, task) != 0) {
+		fprintf(stderr, "Verification READ failed\n");
+		goto out;
+	}
+	result = g_cuda.memcpy_d2h(actual, gpu0, g_io_size);
+	if (result != URMA_PERF_CUDA_SUCCESS) {
+		cuda_print_error("cuMemcpyDtoH", result);
+		goto out;
+	}
+	if (memcmp(expected, actual, g_io_size) != 0) {
+		fprintf(stderr, "Verification failed: SSD data does not match the staged pattern\n");
+		goto out;
+	}
+	printf("Preflight staged GPU->host WRITE + READ verification passed at LBA %" PRIu64 "\n",
+	       worker->range_start_lba);
+	rc = 0;
+out:
+	free(expected);
+	free(actual);
+	return rc;
+}
+
 static int
 verify_gpu_to_ssd_path(struct worker *worker)
 {
@@ -554,8 +661,11 @@ verify_gpu_to_ssd_path(struct worker *worker)
 	int rc = -EIO;
 	uint32_t i;
 
+	if (g_mem_type == URMA_PERF_MEM_CPU) {
+		return verify_cpu_to_ssd_path(worker);
+	}
 	if (g_mem_type == URMA_PERF_MEM_POSIX) {
-		return verify_posix_to_ssd_path(worker);
+		return verify_staged_to_ssd_path(worker);
 	}
 	expected = malloc(g_io_size);
 	actual = calloc(1, g_io_size);
@@ -627,6 +737,17 @@ work_fn(void *arg)
 	struct worker *worker = arg;
 	struct spdk_nvme_io_qpair_opts qpair_opts;
 	uint32_t i;
+
+	/* Modified By Yida: posix(新语义) 的 worker 线程做 cuMemcpy，先把 CUDA
+	 * context 设为当前线程的（多线程共享同一 context，driver 内部串行化） */
+	if (g_mem_type == URMA_PERF_MEM_POSIX) {
+		CUresult result = g_cuda.ctx_set_current(g_cuda.context);
+
+		if (result != URMA_PERF_CUDA_SUCCESS) {
+			cuda_print_error("cuCtxSetCurrent(worker)", result);
+			atomic_store_explicit(&g_failed, true, memory_order_release);
+		}
+	}
 
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(g_ctrlr, &qpair_opts, sizeof(qpair_opts));
 	qpair_opts.io_queue_size = g_batch_size + 1;
@@ -723,6 +844,8 @@ print_results(void)
 	struct spdk_nvme_urma_memory_stats memory_stats;
 	struct latency_percentiles percentiles = {};
 	uint64_t total_ios = 0, total_latency = 0, min_latency = UINT64_MAX, max_latency = 0;
+	/* Modified By Yida: posix(新语义) 分级拷贝的汇总 */
+	uint64_t total_copy_ticks = 0, total_copy_ios = 0;
 	uint64_t finish_tsc = g_stop_tsc;
 	double ticks_hz = spdk_get_ticks_hz();
 	double seconds, bandwidth_mib, iops;
@@ -739,6 +862,9 @@ print_results(void)
 		       worker->id, worker->core, worker->completed, worker->errors);
 		total_ios += worker->completed;
 		total_latency += worker->latency_tsc;
+		/* Modified By Yida: posix(新语义) 汇总分级拷贝耗时 */
+		total_copy_ticks += worker->copy_ticks;
+		total_copy_ios += worker->copy_ios;
 		min_latency = spdk_min(min_latency, worker->min_latency_tsc);
 		max_latency = spdk_max(max_latency, worker->max_latency_tsc);
 		finish_tsc = spdk_max(finish_tsc, worker->finish_tsc);
@@ -750,10 +876,13 @@ print_results(void)
 	spdk_histogram_data_iterate(aggregate, collect_percentiles, &percentiles);
 	spdk_nvme_urma_get_memory_stats(&memory_stats);
 
-	/* Modified By Yida: 结果头部标明内存路线，便于对比 posix / peermem / dmabuf */
+	/* Modified By Yida: 结果头部标明内存路线，便于对比 posix / cpu / peermem / dmabuf。
+	 * posix(新语义) = staged：数据在 HBM，每 I/O cuMemcpy 到 host 暂存缓冲再注册传输 */
 	printf("\nNVMe/URMA %s -> remote SSD result\n",
-	       g_mem_type == URMA_PERF_MEM_POSIX ? "host" : "GPU");
+	       g_mem_type == URMA_PERF_MEM_CPU ? "host" :
+	       g_mem_type == URMA_PERF_MEM_POSIX ? "staged GPU->host" : "GPU");
 	printf("mem_type=%s\n",
+	       g_mem_type == URMA_PERF_MEM_CPU ? "cpu" :
 	       g_mem_type == URMA_PERF_MEM_POSIX ? "posix" :
 	       g_mem_type == URMA_PERF_MEM_PEERMEM ? "peermem" : "dmabuf");
 	printf("operation=%s io_size=%u threads=%u batch_size=%u elapsed=%.6f s\n",
@@ -769,6 +898,16 @@ print_results(void)
 		       percentiles.p99 * 1000000.0 / ticks_hz,
 		       percentiles.p999 * 1000000.0 / ticks_hz,
 		       max_latency * 1000000.0 / ticks_hz);
+	}
+	/* Modified By Yida: posix(新语义) 单独打印分级拷贝成本——它不计入上面的
+	 * NVMe 延迟，端到端 posix 成本 = 延迟 + 拷贝（写方向 HBM→host 在提交前，
+	 * 读方向 host→HBM 在完成后） */
+	if (g_mem_type == URMA_PERF_MEM_POSIX && total_copy_ios != 0) {
+		printf("staged_copy %s n=%" PRIu64 " avg_us=%.3f total_ms=%.3f\n",
+		       g_read_workload ? "HtoD(host->HBM, post-read)" : "DtoH(HBM->host, pre-write)",
+		       total_copy_ios,
+		       total_copy_ticks * 1000000.0 / ticks_hz / total_copy_ios,
+		       total_copy_ticks * 1000.0 / ticks_hz);
 	}
 	printf("memory_registration accelerator=%" PRIu64 " dmabuf=%" PRIu64
 	       " peer_memory_fallback=%" PRIu64 " failures=%" PRIu64 "\n",
@@ -809,9 +948,12 @@ usage(const char *program)
 	printf("  -g, --gpu <id>          CUDA GPU ordinal (default: 0)\n");
 	printf("  -l, --start-lba <lba>   first destructive test LBA (default: 0)\n");
 	printf("  -m, --core-mask <mask>  SPDK core mask; default selects the first T cores\n");
-	/* Modified By Yida: mem-type 三选一（-m 已被 core-mask 占用，故用 -M） */
-	printf("  -M, --mem-type <type>   posix, peermem or dmabuf (default: dmabuf)\n");
-	printf("                          posix:   host memory, plain CPU path, no CUDA\n");
+	/* Modified By Yida: mem-type 四选一（-m 已被 core-mask 占用，故用 -M） */
+	printf("  -M, --mem-type <type>   posix, cpu, peermem or dmabuf (default: dmabuf)\n");
+	printf("                          posix:   staged path, data in HBM copied to a host\n");
+	printf("                                   staging buffer per I/O (HBM->host->NIC);\n");
+	printf("                                   copy time printed separately\n");
+	printf("                          cpu:     plain host memory, no CUDA (old posix)\n");
 	printf("                          peermem: GPU memory via nvidia_p2p peer-memory path\n");
 	printf("                          dmabuf:  GPU memory via CUDA dmabuf export\n");
 	printf("      --require-dmabuf    fail if any timed GPU registration uses peer-memory fallback\n");
@@ -905,15 +1047,18 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			g_core_mask_set = true;
 			break;
 		case 'M':
-			/* Modified By Yida: 内存路线三选一 */
+			/* Modified By Yida: 内存路线四选一（cpu = 原 posix 行为；
+			 * posix 改为 HBM→host 暂存的分级路线） */
 			if (strcasecmp(optarg, "posix") == 0) {
 				g_mem_type = URMA_PERF_MEM_POSIX;
+			} else if (strcasecmp(optarg, "cpu") == 0) {
+				g_mem_type = URMA_PERF_MEM_CPU;
 			} else if (strcasecmp(optarg, "peermem") == 0) {
 				g_mem_type = URMA_PERF_MEM_PEERMEM;
 			} else if (strcasecmp(optarg, "dmabuf") == 0) {
 				g_mem_type = URMA_PERF_MEM_DMABUF;
 			} else {
-				fprintf(stderr, "Unknown mem type \"%s\" (expected posix, peermem or dmabuf)\n",
+				fprintf(stderr, "Unknown mem type \"%s\" (expected posix, cpu, peermem or dmabuf)\n",
 					optarg);
 				return -EINVAL;
 			}
@@ -1007,15 +1152,30 @@ prepare_workers(void)
 		if (worker->tasks == NULL || worker->histogram == NULL) {
 			return -ENOMEM;
 		}
-		/* Modified By Yida: posix 模式用 host 大页内存（4K 对齐，满足 UMMU
-		 * Table mode 的注册对齐要求），完全不碰 CUDA；其余模式照旧 cuMemAlloc。 */
-		if (g_mem_type == URMA_PERF_MEM_POSIX) {
+		/* Modified By Yida: cpu（原 posix）模式用 host 大页内存（4K 对齐，满足
+		 * UMMU Table mode 的注册对齐要求），完全不碰 CUDA；
+		 * posix(新语义) host 暂存缓冲同样 4K 对齐注册，另加 cuMemAlloc 的
+		 * HBM 影子缓冲做分级拷贝；peermem/dmabuf 照旧整个缓冲就是 GPU 内存。 */
+		if (g_mem_type == URMA_PERF_MEM_CPU) {
 			worker->allocation.dmabuf_fd = -1;
 			worker->allocation.used_size = (size_t)g_io_size * g_batch_size;
 			worker->allocation.alloc_size = (size_t)g_io_size * g_batch_size;
 			worker->allocation.addr = spdk_dma_zmalloc(worker->allocation.alloc_size,
 						   4096, NULL);
 			if (worker->allocation.addr == NULL) {
+				return -ENOMEM;
+			}
+		} else if (g_mem_type == URMA_PERF_MEM_POSIX) {
+			worker->allocation.dmabuf_fd = -1;
+			worker->allocation.used_size = (size_t)g_io_size * g_batch_size;
+			worker->allocation.alloc_size = (size_t)g_io_size * g_batch_size;
+			worker->allocation.addr = spdk_dma_zmalloc(worker->allocation.alloc_size,
+						   4096, NULL);
+			if (worker->allocation.addr == NULL) {
+				return -ENOMEM;
+			}
+			if (cuda_alloc_buffer(&worker->gpu_alloc,
+					      (size_t)g_io_size * g_batch_size) != 0) {
 				return -ENOMEM;
 			}
 		} else if (cuda_alloc_buffer(&worker->allocation,
@@ -1030,10 +1190,10 @@ prepare_workers(void)
 		}
 	}
 
-	/* Modified By Yida: posix 模式既不建 cuda memory domain 也不注册 provider，
-	 * tasks 的 io_opts.memory_domain 保持 NULL → 传输层
-	 * nvme_urma_req_memory_type() 返回 MEM_HOST，走普通 host 注册路线。 */
-	if (g_mem_type == URMA_PERF_MEM_POSIX) {
+	/* Modified By Yida: cpu / posix(新语义) 注册的都是 host 缓冲 —— 不建 cuda
+	 * memory domain 也不注册 provider，tasks 的 io_opts.memory_domain 保持 NULL
+	 * → 传输层 nvme_urma_req_memory_type() 返回 MEM_HOST，走普通 host 注册路线。 */
+	if (g_mem_type == URMA_PERF_MEM_CPU || g_mem_type == URMA_PERF_MEM_POSIX) {
 		return 0;
 	}
 	domain_ctx.size = sizeof(domain_ctx);
@@ -1074,9 +1234,13 @@ cleanup_workers(void)
 		return;
 	}
 	for (i = 0; i < g_num_workers; i++) {
-		/* Modified By Yida: posix 模式的缓冲区是 spdk_dma 分配的，对应释放 */
-		if (g_mem_type == URMA_PERF_MEM_POSIX) {
+		/* Modified By Yida: cpu/posix 的 host 缓冲是 spdk_dma 分配的；
+		 * posix 另有 HBM 影子缓冲；peermem/dmabuf 整个缓冲是 GPU 内存 */
+		if (g_mem_type == URMA_PERF_MEM_CPU) {
 			spdk_dma_free(g_workers[i].allocation.addr);
+		} else if (g_mem_type == URMA_PERF_MEM_POSIX) {
+			spdk_dma_free(g_workers[i].allocation.addr);
+			cuda_free_buffer(&g_workers[i].gpu_alloc);
 		} else {
 			cuda_free_buffer(&g_workers[i].allocation);
 		}
@@ -1137,8 +1301,9 @@ main(int argc, char **argv)
 		fprintf(stderr, "Unable to initialize the SPDK environment\n");
 		return EXIT_FAILURE;
 	}
-	/* Modified By Yida: posix 模式完全不初始化 CUDA（无 GPU 的机器也能跑普通路径） */
-	if (g_mem_type != URMA_PERF_MEM_POSIX && cuda_driver_init(g_gpu_id) != 0) {
+	/* Modified By Yida: cpu 模式完全不初始化 CUDA（无 GPU 的机器也能跑普通路径）；
+	 * posix(新语义) 要做 cuMemcpy，同样需要初始化 */
+	if (g_mem_type != URMA_PERF_MEM_CPU && cuda_driver_init(g_gpu_id) != 0) {
 		rc = EXIT_FAILURE;
 		goto out_env;
 	}
@@ -1175,7 +1340,7 @@ out_ctrlr:
 		spdk_nvme_detach_poll(detach_ctx);
 	}
 out_cuda:
-	if (g_mem_type != URMA_PERF_MEM_POSIX) {
+	if (g_mem_type != URMA_PERF_MEM_CPU) {
 		cuda_driver_fini();
 	}
 out_env:
