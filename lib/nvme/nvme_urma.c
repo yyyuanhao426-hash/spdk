@@ -13,6 +13,7 @@
 #include "spdk/nvmf.h"
 
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <sys/ioctl.h>
 
 /* Modified By Yida: rdtsc-style per-phase timing for performance diagnosis */
@@ -266,6 +267,12 @@ nvme_urma_connect_socket(const struct spdk_nvme_transport_id *trid)
 	}
 	for (it = result; it != NULL; it = it->ai_next) {
 		fd = socket(it->ai_family, it->ai_socktype | SOCK_CLOEXEC, it->ai_protocol);
+		if (fd >= 0) {
+			/* Modified by Yin: 禁用 Nagle——capsule 分 hdr/capsule 两次小 write，
+			 * Nagle+delayed-ACK 会让每个包卡 ~40ms，低深度时端到端延迟被抬到 ~88ms */
+			int flag = 1;
+			setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+		}
 		if (fd >= 0 && connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
 			break;
 		}

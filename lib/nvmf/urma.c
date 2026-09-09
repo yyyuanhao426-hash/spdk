@@ -17,6 +17,7 @@
 #include "../nvme/nvme_urma_internal.h"
 
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
@@ -435,6 +436,12 @@ nvmf_urma_accept(void *arg)
 			}
 			if (fd < 0) {
 				break;
+			}
+			/* Modified by Yin: 禁用 Nagle——rsp 同样分 hdr/rsp 两次小 write，
+			 * 对端在等完整包时没有数据可发，delayed-ACK 超时(~40ms)才放行被扣的包 */
+			{
+				int flag = 1;
+				setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 			}
 			uqpair = calloc(1, sizeof(*uqpair));
 			if (uqpair == NULL) {
