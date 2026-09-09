@@ -61,6 +61,13 @@ struct nvmf_urma_tgt_timing {
 	uint64_t release_n;
 	uint64_t total_ticks;    /* capsule parsed -> rsp written (target service time) */
 	uint64_t total_n;
+	/* Modified By Yida(v4): W4p — capsule queueing before parse. peek = first
+	 * poll round whose MSG_PEEK saw the hdr; parse = t_parse0. Covers rcvbuf
+	 * residency + poller interval. partial_n counts rounds where the hdr was
+	 * visible but the capsule body was still in flight (FIONREAD gate bounced). */
+	uint64_t peek_wait_ticks;
+	uint64_t peek_wait_n;
+	uint64_t partial_n;
 };
 
 static struct nvmf_urma_tgt_timing g_tgt_timing;
@@ -73,6 +80,29 @@ static struct nvmf_urma_tgt_timing g_tgt_timing;
 	NVMF_URMA_TGT_ADD(field ## _ticks, (ticks)); \
 	NVMF_URMA_TGT_INC(field ## _n); \
 } while (0)
+
+/* Modified By Yida(v4): per-I/O receive trace for cross-machine correlation.
+ * One record per capsule: peek = first poll round that observed the hdr in the
+ * kernel rcvbuf (MSG_PEEK success), parse = capsule fully arrived and being
+ * read, rsp = response write_full done. Joined with the initiator's per-I/O
+ * send records (lib/nvme/nvme_urma.c g_tx_trace) by (qid, cid) to get
+ * per-I/O wire transit + queueing time (requires clock sync across hosts).
+ * Ring keeps the most recent N records; outstanding requests are far below N
+ * so a wrapped record can never belong to an in-flight request. */
+struct nvmf_urma_rx_trace {
+	uint64_t peek_tick;
+	uint64_t parse_tick;
+	uint64_t rsp_tick;
+	uint32_t length;
+	uint16_t qid;
+	uint16_t cid;
+	uint8_t opcode;
+	uint8_t xfer;
+};
+
+#define NVMF_URMA_RX_TRACE_SIZE 8192
+static struct nvmf_urma_rx_trace g_rx_trace[NVMF_URMA_RX_TRACE_SIZE];
+static uint64_t g_rx_trace_idx;
 
 static void
 nvmf_urma_timing_dump(void)
@@ -101,12 +131,19 @@ nvmf_urma_timing_dump(void)
 	uint64_t rel_n = __atomic_load_n(&g_tgt_timing.release_n, __ATOMIC_RELAXED);
 	uint64_t tot = __atomic_load_n(&g_tgt_timing.total_ticks, __ATOMIC_RELAXED);
 	uint64_t tot_n = __atomic_load_n(&g_tgt_timing.total_n, __ATOMIC_RELAXED);
+	/* Modified By Yida(v4): W4p queueing before parse */
+	uint64_t peek_wait = __atomic_load_n(&g_tgt_timing.peek_wait_ticks, __ATOMIC_RELAXED);
+	uint64_t peek_n = __atomic_load_n(&g_tgt_timing.peek_wait_n, __ATOMIC_RELAXED);
+	uint64_t partial = __atomic_load_n(&g_tgt_timing.partial_n, __ATOMIC_RELAXED);
 
 	/* printf instead of SPDK_NOTICELOG, same reason as the initiator dump:
 	 * nvmf_tgt's default log level filters NOTICE, printf always shows. */
 	/* Modified By Yida: avg 一律先除 n 再乘系数，避免 ticks×1e9 溢出 uint64
 	 * （64K/128K 的 W9 累计 2.3e10~1.1e11 ticks，旧式先乘后除打印出错的 avg） */
 	printf("==== URMA target timing breakdown (hz=%lu) ====\n", hz);
+	printf("  W4p peek->parse:     %lu ticks, n=%lu, avg=%lu ns (rcvbuf/poll queueing)\n",
+	       peek_wait, peek_n, peek_n ? peek_wait / peek_n * 1000000000ULL / hz : 0);
+	printf("  capsule splits (hdr seen, body pending): n=%lu\n", partial);
 	printf("  W4a parse capsule:   %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
 	       capsule, cap_n, cap_n ? capsule / cap_n * 1000000000ULL / hz : 0,
 	       capsule * 1000 / hz);
@@ -158,6 +195,33 @@ nvmf_urma_timing_dump_poller(void *ctx)
 	return SPDK_POLLER_IDLE;
 }
 
+/* Modified By Yida(v4): dump the per-I/O receive trace as CSV. Called only at
+ * round end (new connection resets) and transport destroy — never from the
+ * periodic poller dump, which would flood the log. */
+static void
+nvmf_urma_rx_trace_dump(void)
+{
+	uint64_t total = __atomic_load_n(&g_rx_trace_idx, __ATOMIC_RELAXED);
+	uint64_t n = total < NVMF_URMA_RX_TRACE_SIZE ? total : NVMF_URMA_RX_TRACE_SIZE;
+	uint64_t start = total - n;
+
+	if (n == 0) {
+		return;
+	}
+	printf("==== URMA rx trace (most recent %lu of %lu; peek/parse/rsp are target-local TSC) ====\n",
+	       n, total);
+	printf("seq,qid,cid,opcode,length,peek_tick,parse_tick,rsp_tick,peek_to_parse_ticks\n");
+	for (uint64_t i = 0; i < n; i++) {
+		const struct nvmf_urma_rx_trace *rec = &g_rx_trace[(start + i) % NVMF_URMA_RX_TRACE_SIZE];
+
+		printf("%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu\n",
+		       start + i, rec->qid, rec->cid, rec->opcode, rec->length,
+		       rec->peek_tick, rec->parse_tick, rec->rsp_tick,
+		       rec->parse_tick - rec->peek_tick);
+	}
+	fflush(stdout);
+}
+
 /* Modified By Yida(v3): target 是长驻进程，计数自启动起一直累加，多轮 urma_perf
  * （不同 iosize）的数据会混在一起没法按轮分析。每接受一条新连接（新一轮
  * urma_perf 开始）时，先把上一轮的最终累计 dump 出来再清零——日志里每轮独立成块。
@@ -170,6 +234,9 @@ nvmf_urma_timing_reset(void)
 		printf("---- 新连接进入：以下为上一轮（自上次清零以来）的最终计时 ----\n");
 		nvmf_urma_timing_dump();
 	}
+	/* Modified By Yida(v4): per-round per-I/O trace, cleared with the aggregates */
+	nvmf_urma_rx_trace_dump();
+	__atomic_store_n(&g_rx_trace_idx, 0, __ATOMIC_RELAXED);
 	memset(&g_tgt_timing, 0, sizeof(g_tgt_timing));
 }
 
@@ -198,6 +265,8 @@ struct nvmf_urma_req {
 	uint64_t start_tick;   /* capsule parsed; 0 = not a timed data request */
 	uint64_t post_tick;    /* data WR posted (JFC wait start) */
 	uint64_t exec_tick;    /* spdk_nvmf_request_exec called; 0 = not timed */
+	/* Modified By Yida(v4): index into g_rx_trace for this I/O's per-I/O record */
+	uint32_t trace_idx;
 	TAILQ_ENTRY(nvmf_urma_req) link;
 };
 
@@ -215,6 +284,10 @@ struct nvmf_urma_qpair {
 	uint32_t resource_count;
 	uint32_t max_io_size;
 	struct nvmf_urma_req *reqs;
+	/* Modified By Yida(v4): tick of the poll round that first MSG_PEEK'd the
+	 * hdr currently at the head of rcvbuf; 0 = none. Kept across rounds while
+	 * the capsule body is still in flight so peek->parse covers real queueing. */
+	uint64_t pending_peek_tick;
 	/* Modified By Yida: target-side registration cache */
 	struct nvmf_urma_reg_entry reg_cache[NVMF_URMA_REG_CACHE_SIZE];
 	TAILQ_HEAD(, nvmf_urma_req) free_reqs;
@@ -610,6 +683,8 @@ nvmf_urma_destroy(struct spdk_nvmf_transport *base,
 	/* Modified By Yida(v3): stop periodic dump and print final staged latencies */
 	spdk_poller_unregister(&transport->dump_poller);
 	nvmf_urma_timing_dump();
+	/* Modified By Yida(v4): final per-I/O rx trace for the last round */
+	nvmf_urma_rx_trace_dump();
 	TAILQ_FOREACH_SAFE(port, &transport->ports, link, tmp) {
 		TAILQ_REMOVE(&transport->ports, port, link);
 		close(port->fd);
@@ -770,6 +845,14 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 		NVMF_URMA_TGT_STAGE(total, t_rsp1 - ureq->start_tick);
 		ureq->start_tick = 0;
 	}
+	/* Modified By Yida(v4): close this I/O's rx trace record with the response
+	 * completion tick (per-I/O target service time, even for un-timed reqs). */
+	if (ureq->trace_idx != UINT32_MAX) {
+		uint64_t idx = ureq->trace_idx % NVMF_URMA_RX_TRACE_SIZE;
+
+		__atomic_store_n(&g_rx_trace[idx].rsp_tick, spdk_get_ticks(), __ATOMIC_RELAXED);
+		ureq->trace_idx = UINT32_MAX;
+	}
 	nvmf_urma_release_req(ureq);
 	return rc;
 }
@@ -904,10 +987,22 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 		return 0;
 	}
 	if (rc <= 0) {
+		uqpair->pending_peek_tick = 0;
 		return -ECONNRESET;
 	}
 	if ((size_t)rc < sizeof(hdr)) {
 		return 0;
+	}
+	/* Modified By Yida(v4): W4p — stamp when the poller FIRST observed this
+	 * capsule in the kernel rcvbuf. If the hdr was already seen on an earlier
+	 * poll round (capsule body still in flight), reuse that tick: the capsule
+	 * has been queueing ever since. */
+	uint64_t t_peek;
+	if (uqpair->pending_peek_tick != 0) {
+		t_peek = uqpair->pending_peek_tick;
+	} else {
+		t_peek = spdk_get_ticks();
+		uqpair->pending_peek_tick = t_peek;
 	}
 	{
 		int available = 0;
@@ -916,9 +1011,13 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 			return -errno;
 		}
 		if ((size_t)available < sizeof(hdr) + hdr.length) {
+			/* Capsule split across TCP segments: hdr arrived, body not yet.
+			 * Keep pending_peek_tick and retry on a later poll round. */
+			NVMF_URMA_TGT_INC(partial_n);
 			return 0;
 		}
 	}
+	uqpair->pending_peek_tick = 0; /* full capsule arrived; marker consumed */
 	uint64_t t_parse0 = spdk_get_ticks(); /* Modified By Yida(v3): W4a parse start */
 	if (nvmf_urma_read_full(uqpair->fd, &hdr, sizeof(hdr)) != 0 ||
 	    hdr.magic != SPDK_URMA_WIRE_MAGIC || hdr.version != SPDK_URMA_WIRE_VERSION ||
@@ -940,6 +1039,24 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 	/* Modified By Yida(v3): reset instrumentation ticks from previous request life */
 	ureq->start_tick = 0;
 	ureq->exec_tick = 0;
+	/* Modified By Yida(v4): per-I/O receive trace record (joined with the
+	 * initiator's tx record by qid+cid); also accumulates the W4p stage. */
+	ureq->trace_idx = UINT32_MAX;
+	NVMF_URMA_TGT_STAGE(peek_wait, t_parse0 - t_peek);
+	{
+		uint64_t idx = __atomic_fetch_add(&g_rx_trace_idx, 1, __ATOMIC_RELAXED) %
+			       NVMF_URMA_RX_TRACE_SIZE;
+		struct nvmf_urma_rx_trace *rec = &g_rx_trace[idx];
+
+		rec->peek_tick = t_peek;
+		rec->parse_tick = t_parse0;
+		rec->rsp_tick = 0;
+		rec->length = capsule.data.length;
+		rec->qid = hdr.qid;
+		rec->cid = capsule.cmd.cid;
+		rec->opcode = capsule.cmd.opc;
+		ureq->trace_idx = idx;
+	}
 	ureq->cmd.nvme_cmd = capsule.cmd;
 	ureq->remote_data = capsule.data;
 	ureq->req.raw = 0;
