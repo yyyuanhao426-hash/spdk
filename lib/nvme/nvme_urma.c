@@ -33,6 +33,26 @@ struct nvme_urma_timing {
 
 static struct nvme_urma_timing g_timing;
 
+/* Modified By Yida(v4): per-I/O send trace for cross-machine correlation with
+ * the target's per-I/O rx trace (lib/nvmf/urma.c g_rx_trace), joined by
+ * (qid, cid). send_end = both write_full() calls returned, i.e. bytes are in
+ * the kernel sndbuf — NOT yet on the wire. (qid, cid, send_end) vs the
+ * target's (qid, cid, peek_tick) gives per-I/O transit + queueing time;
+ * requires clock sync across hosts to compare ticks. */
+struct nvme_urma_tx_trace {
+	uint64_t submit_tick;
+	uint64_t send_end_tick;
+	uint32_t length;
+	uint16_t qid;
+	uint16_t cid;
+	uint8_t opcode;
+	uint8_t xfer;
+};
+
+#define NVME_URMA_TX_TRACE_SIZE 8192
+static struct nvme_urma_tx_trace g_tx_trace[NVME_URMA_TX_TRACE_SIZE];
+static uint64_t g_tx_trace_idx;
+
 static void
 nvme_urma_timing_dump(void)
 {
@@ -70,6 +90,25 @@ nvme_urma_timing_dump(void)
 		printf("  breakdown: reg=%.1f%% send=%.1f%% compl=%.1f%% release=%.1f%%\n",
 		       100.0 * reg / tot, 100.0 * send / tot,
 		       100.0 * compl / tot, 100.0 * rel / tot);
+	}
+	/* Modified By Yida(v4): per-I/O send trace CSV (joined with target rx trace
+	 * by qid+cid). Ticks are initiator-local TSC. */
+	{
+		uint64_t total = __atomic_load_n(&g_tx_trace_idx, __ATOMIC_RELAXED);
+		uint64_t n = total < NVME_URMA_TX_TRACE_SIZE ? total : NVME_URMA_TX_TRACE_SIZE;
+		uint64_t start = total - n;
+
+		printf("==== URMA tx trace (most recent %lu of %lu; submit/send_end are initiator-local TSC) ====\n",
+		       n, total);
+		printf("seq,qid,cid,opcode,length,submit_tick,send_end_tick\n");
+		for (uint64_t i = 0; i < n; i++) {
+			const struct nvme_urma_tx_trace *rec =
+				&g_tx_trace[(start + i) % NVME_URMA_TX_TRACE_SIZE];
+
+			printf("%lu,%u,%u,%u,%u,%lu,%lu\n",
+			       start + i, rec->qid, rec->cid, rec->opcode, rec->length,
+			       rec->submit_tick, rec->send_end_tick);
+		}
 	}
 	fflush(stdout);
 }
@@ -474,6 +513,18 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		uint64_t t_send1 = spdk_get_ticks();
 		__atomic_add_fetch(&g_timing.send_ticks, t_send1 - ureq->send_start, __ATOMIC_RELAXED);
 		__atomic_add_fetch(&g_timing.send_count, 1, __ATOMIC_RELAXED);
+		/* Modified By Yida(v4): per-I/O send trace record */
+		uint64_t idx = __atomic_fetch_add(&g_tx_trace_idx, 1, __ATOMIC_RELAXED) %
+			       NVME_URMA_TX_TRACE_SIZE;
+		struct nvme_urma_tx_trace *rec = &g_tx_trace[idx];
+
+		rec->submit_tick = ureq->submit_tick;
+		rec->send_end_tick = t_send1;
+		rec->length = req->payload.size;
+		rec->qid = qpair->id;
+		rec->cid = req->cmd.cid;
+		rec->opcode = req->cmd.opc;
+		rec->xfer = (uint8_t)spdk_nvme_opc_get_data_transfer(req->cmd.opc);
 	}
 	if (rc != 0) {
 		/* Modified By Yida: on send failure, release cache refcount if cached */
