@@ -24,6 +24,9 @@
 
 /* Modified By Yida: Target-side memory registration cache */
 #define NVMF_URMA_REG_CACHE_SIZE 128
+/* Modified By Yida(v4): max capsules parsed per poll round. Bounded so JFC
+ * completions for in-flight data still get polled promptly on bursts. */
+#define NVMF_URMA_CAPSULE_BATCH 64
 
 struct nvmf_urma_reg_entry {
 	void *va;
@@ -1121,12 +1124,22 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 				total++;
 			}
 		}
-		int rc = nvmf_urma_receive_capsule(uqpair);
-		if (rc < 0) {
-			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
-			continue;
+		/* Modified By Yida(v4): drain every fully-arrived capsule instead of
+		 * one per poll round — bursty submitters used to back up one capsule
+		 * per round in the rcvbuf. Capped at NVMF_URMA_CAPSULE_BATCH so JFC
+		 * completions for in-flight data still get polled promptly. */
+		for (int n = 0; n < NVMF_URMA_CAPSULE_BATCH; n++) {
+			int rc = nvmf_urma_receive_capsule(uqpair);
+
+			if (rc < 0) {
+				uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+				break;
+			}
+			if (rc == 0) {
+				break;
+			}
+			total += rc;
 		}
-		total += rc;
 	}
 	return total;
 }
