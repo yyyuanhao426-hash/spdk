@@ -836,9 +836,16 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 	hdr.type = SPDK_URMA_MSG_CAPSULE_RSP;
 	hdr.length = sizeof(rsp);
 	hdr.qid = uqpair->qpair.qid;
-	rc = nvmf_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
-	if (rc == 0) {
-		rc = nvmf_urma_write_full(uqpair->fd, &rsp, sizeof(rsp));
+	/* Modified By Yida(v4): hdr+rsp 合并成一次 send，同 initiator 的 cmd 方向：
+	 * 两次小 send 产生两个 TCP 段，initiator 的 FIONREAD 门控要等第二段到齐
+	 * 才能读 rsp（completion_wait 里那次成功读之前全是空转）。单段到达 + 省
+	 * 一次 syscall。线上字节布局不变，新旧版本互通。 */
+	{
+		uint8_t msg[sizeof(hdr) + sizeof(rsp)];
+
+		memcpy(msg, &hdr, sizeof(hdr));
+		memcpy(msg + sizeof(hdr), &rsp, sizeof(rsp));
+		rc = nvmf_urma_write_full(uqpair->fd, msg, sizeof(msg));
 	}
 	/* Modified By Yida(v3): W10 send rsp + target service total (parse -> rsp written) */
 	if (ureq->start_tick != 0) {

@@ -504,10 +504,18 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	hdr.type = SPDK_URMA_MSG_CAPSULE_CMD;
 	hdr.length = sizeof(capsule);
 	hdr.qid = qpair->id;
-	ureq->send_start = spdk_get_ticks();  /* send-phase start */
-	rc = nvme_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
-	if (rc == 0) {
-		rc = nvme_urma_write_full(uqpair->fd, &capsule, sizeof(capsule));
+	/* Modified By Yida(v4): hdr+capsule 合并成一次 send。两次小 send 在
+	 * NODELAY 下产生两个独立 TCP 段，capsule 本体比 hdr 晚 ~15μs 到达对端
+	 * （v3 打点：target W4p=15.26μs、partial_n=12.3 次/capsule），target 的
+	 * FIONREAD 门控每条 capsule 空转 ~12 轮。合并后单段到达，同时也省一次
+	 * syscall。线上字节布局不变（hdr.length 语义不变），新旧版本互通。 */
+	{
+		uint8_t msg[sizeof(hdr) + sizeof(capsule)];
+
+		memcpy(msg, &hdr, sizeof(hdr));
+		memcpy(msg + sizeof(hdr), &capsule, sizeof(capsule));
+		ureq->send_start = spdk_get_ticks();  /* send-phase start */
+		rc = nvme_urma_write_full(uqpair->fd, msg, sizeof(msg));
 	}
 	{
 		uint64_t t_send1 = spdk_get_ticks();
