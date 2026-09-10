@@ -477,6 +477,12 @@ if ! ls "$LIBDIR" 2>/dev/null | grep -q '^liburma_common\.so'; then
     confirm "仍要继续?" || abort "换用成套库目录重跑：-L <同时含 liburma* 与 liburma_common* 的目录>"
 fi
 
+if [ "$MAX_IO_SIZE" -gt 0 ] && [ "$IB_LARGE_COUNT" -gt 0 ] && [ "$IB_LARGE_COUNT" -lt 256 ]; then
+    # transport 缓存已显式压小（每 PG 32 large），pool=160 时预占 64+32=96、剩 64，
+    # 单核 32 个在飞 4MB I/O 够用；T/b 更大或 -R raid0 时余量变薄，建议 256（1GiB）
+    warn "-O 大 I/O 时 large_pool_count=$IB_LARGE_COUNT 偏小，建议 ≥256（-I 第 3 个字段）"
+fi
+
 TOTAL_HP=$(awk '/^HugePages_Total/{print $2}' /proc/meminfo)
 if [ "${TOTAL_HP:-0}" -lt "$HUGE_PAGES" ]; then
     info "HugePages_Total=${TOTAL_HP:-0} < $HUGE_PAGES，尝试补齐"
@@ -557,7 +563,12 @@ for _idx in "${!DISK_LIST[@]}"; do
     run_rpc bdev_nvme_attach_controller -b "${CTRLRS[$_idx]}" -t PCIe -a "${BDFS[$_idx]}"
 done
 if [ "$MAX_IO_SIZE" -gt 0 ]; then
-    run_rpc nvmf_create_transport -t URMA -i "$MAX_IO_SIZE"
+    # transport 的 iobuf 缓存默认"自动吃大池的一半再按已有 PG 数均分"（transport.c:640），
+    # 第一个 PG 独吞 pool/2，叠加每核 bdev(16)+accel(16) 个 large 预占后，
+    # add_ns 建通道时池子必被抽干（0/16 失败）。显式压小：每 PG 固定 32 个 large
+    # （够单核 32 个在飞 I/O），small 1024 同理封顶，余量留给共享池。
+    run_rpc nvmf_create_transport -t URMA -i "$MAX_IO_SIZE" \
+        --iobuf-large-cache-size 32 --iobuf-small-cache-size 1024
 else
     run_rpc nvmf_create_transport -t URMA
 fi
