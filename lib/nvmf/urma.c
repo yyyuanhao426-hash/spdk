@@ -198,6 +198,21 @@ nvmf_urma_timing_dump_poller(void *ctx)
 	return SPDK_POLLER_IDLE;
 }
 
+/* Modified By Yida(v6): per-I/O rx trace CSV 默认关闭（每轮最多 8192 行，刷屏）；
+ * SPDK_URMA_TRACE=1 时才采集并 dump，聚合 breakdown 不受影响。 */
+static int
+nvmf_urma_trace_enabled(void)
+{
+	static int enabled = -1;
+
+	if (enabled == -1) {
+		const char *v = getenv("SPDK_URMA_TRACE");
+
+		enabled = (v != NULL && v[0] == '1');
+	}
+	return enabled;
+}
+
 /* Modified By Yida(v4): dump the per-I/O receive trace as CSV. Called only at
  * round end (new connection resets) and transport destroy — never from the
  * periodic poller dump, which would flood the log. */
@@ -208,7 +223,7 @@ nvmf_urma_rx_trace_dump(void)
 	uint64_t n = total < NVMF_URMA_RX_TRACE_SIZE ? total : NVMF_URMA_RX_TRACE_SIZE;
 	uint64_t start = total - n;
 
-	if (n == 0) {
+	if (!nvmf_urma_trace_enabled() || n == 0) {
 		return;
 	}
 	printf("==== URMA rx trace (most recent %lu of %lu; peek/parse/rsp are target-local TSC) ====\n",
@@ -1053,7 +1068,9 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 	 * initiator's tx record by qid+cid); also accumulates the W4p stage. */
 	ureq->trace_idx = UINT32_MAX;
 	NVMF_URMA_TGT_STAGE(peek_wait, t_parse0 - t_peek);
-	{
+	/* Modified By Yida(v6): SPDK_URMA_TRACE=1 才采集；默认关闭时 trace_idx
+	 * 保持 UINT32_MAX，rsp 闭合记录与本 dump 自然跳过 */
+	if (nvmf_urma_trace_enabled()) {
 		uint64_t idx = __atomic_fetch_add(&g_rx_trace_idx, 1, __ATOMIC_RELAXED) %
 			       NVMF_URMA_RX_TRACE_SIZE;
 		struct nvmf_urma_rx_trace *rec = &g_rx_trace[idx];

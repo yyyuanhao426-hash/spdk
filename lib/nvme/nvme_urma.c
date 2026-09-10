@@ -53,6 +53,21 @@ struct nvme_urma_tx_trace {
 static struct nvme_urma_tx_trace g_tx_trace[NVME_URMA_TX_TRACE_SIZE];
 static uint64_t g_tx_trace_idx;
 
+/* Modified By Yida(v6): per-I/O tx trace CSV 默认关闭（每轮最多 8192 行，刷屏）；
+ * SPDK_URMA_TRACE=1 时才采集并 dump，聚合 breakdown 不受影响。 */
+static int
+nvme_urma_trace_enabled(void)
+{
+	static int enabled = -1;
+
+	if (enabled == -1) {
+		const char *v = getenv("SPDK_URMA_TRACE");
+
+		enabled = (v != NULL && v[0] == '1');
+	}
+	return enabled;
+}
+
 static void
 nvme_urma_timing_dump(void)
 {
@@ -92,8 +107,9 @@ nvme_urma_timing_dump(void)
 		       100.0 * compl / tot, 100.0 * rel / tot);
 	}
 	/* Modified By Yida(v4): per-I/O send trace CSV (joined with target rx trace
-	 * by qid+cid). Ticks are initiator-local TSC. */
-	{
+	 * by qid+cid). Ticks are initiator-local TSC.
+	 * Modified By Yida(v6): SPDK_URMA_TRACE=1 才打印，默认关闭。 */
+	if (nvme_urma_trace_enabled()) {
 		uint64_t total = __atomic_load_n(&g_tx_trace_idx, __ATOMIC_RELAXED);
 		uint64_t n = total < NVME_URMA_TX_TRACE_SIZE ? total : NVME_URMA_TX_TRACE_SIZE;
 		uint64_t start = total - n;
@@ -521,18 +537,21 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		uint64_t t_send1 = spdk_get_ticks();
 		__atomic_add_fetch(&g_timing.send_ticks, t_send1 - ureq->send_start, __ATOMIC_RELAXED);
 		__atomic_add_fetch(&g_timing.send_count, 1, __ATOMIC_RELAXED);
-		/* Modified By Yida(v4): per-I/O send trace record */
-		uint64_t idx = __atomic_fetch_add(&g_tx_trace_idx, 1, __ATOMIC_RELAXED) %
-			       NVME_URMA_TX_TRACE_SIZE;
-		struct nvme_urma_tx_trace *rec = &g_tx_trace[idx];
+		/* Modified By Yida(v4): per-I/O send trace record
+		 * Modified By Yida(v6): SPDK_URMA_TRACE=1 才采集，默认关闭 */
+		if (nvme_urma_trace_enabled()) {
+			uint64_t idx = __atomic_fetch_add(&g_tx_trace_idx, 1, __ATOMIC_RELAXED) %
+				       NVME_URMA_TX_TRACE_SIZE;
+			struct nvme_urma_tx_trace *rec = &g_tx_trace[idx];
 
-		rec->submit_tick = ureq->submit_tick;
-		rec->send_end_tick = t_send1;
-		rec->length = req->payload.size;
-		rec->qid = qpair->id;
-		rec->cid = req->cmd.cid;
-		rec->opcode = req->cmd.opc;
-		rec->xfer = (uint8_t)spdk_nvme_opc_get_data_transfer(req->cmd.opc);
+			rec->submit_tick = ureq->submit_tick;
+			rec->send_end_tick = t_send1;
+			rec->length = req->payload.size;
+			rec->qid = qpair->id;
+			rec->cid = req->cmd.cid;
+			rec->opcode = req->cmd.opc;
+			rec->xfer = (uint8_t)spdk_nvme_opc_get_data_transfer(req->cmd.opc);
+		}
 	}
 	if (rc != 0) {
 		/* Modified By Yida: on send failure, release cache refcount if cached */
