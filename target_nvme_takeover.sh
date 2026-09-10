@@ -5,7 +5,7 @@
 # 流程：
 #   1. lsblk 展示系统盘分布，标出“绝对不能碰”的盘（root/home 挂载、LVM PV、md 成员）
 #   2. 分析候选空闲盘；选定盘后【现查】其 BDF（nvmeXn1 每次开机重排，旧记录不可信）
-#   3. lspci -nns 显示 vendor:device，用该 BDF 执行 new_id → unbind → bind
+#   3. lspci -nns 显示 vendor:device，用该 BDF 执行 driver_override → unbind → bind
 #   4. 验证 vfio-pci 已接管 + 根分区仍是 rw（bind 错盘 = 根文件系统变 ro，实测过）
 #   5. 环境检查：liburma 与 liburma_common 成套、hugepages（按 iobuf 池自动上调）、无残留 nvmf_tgt
 #   6. 后台启动 ./build/bin/nvmf_tgt -m <mask>（计时为可选开关 -s 秒数；
@@ -54,6 +54,9 @@
 #===============================================================================
 
 set -u -o pipefail
+# 防 env 污染：继承到 noglob 会让所有 * 失效（node1 实测：候选分析表打出字面
+# "nvme*n"）。脚本自己把 globbing 打开，不依赖调用方 shell 的状态
+set +f
 
 HUGE_PAGES=2048
 
@@ -214,15 +217,11 @@ restore_vfio_nvme() {
     done
     confirm "还原以上盘?" || abort "用户取消"
     lsmod | grep -q '^nvme' || modprobe nvme 2>/dev/null || true
-    # 先从 vfio-pci 的 ID 表摘掉，防止解绑后被自动 probe 抢回去
-    if [ -e /sys/bus/pci/drivers/vfio-pci/remove_id ]; then
-        for bdf in "${restore_list[@]}"; do
-            vid_did=$(lspci -nns "$bdf" 2>/dev/null \
-                      | grep -oE '\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]' | head -n1 | tr -d '[]')
-            [ -n "$vid_did" ] && echo "$vid_did" \
-                > /sys/bus/pci/drivers/vfio-pci/remove_id 2>/dev/null
-        done
-    fi
+    for bdf in "${restore_list[@]}"; do
+        # 先清掉残留的 driver_override（上次运行可能死在 unbind 和 bind 之间）：
+        # override 指着 vfio-pci 时，PCI 核心会拒绝绑回 nvme
+        echo "" > "/sys/bus/pci/devices/$bdf/driver_override" 2>/dev/null || true
+    done
     for bdf in "${restore_list[@]}"; do
         echo "$bdf" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null
         if echo "$bdf" > /sys/bus/pci/drivers/nvme/bind 2>/dev/null; then
@@ -295,7 +294,7 @@ IFS=',' read -ra DISK_LIST <<< "$DISKS"
 
 # 先全部校验、再动手：任何一块盘不安全就在碰 sysfs 之前 abort
 declare -a BDFS=() CTRLRS=()
-declare -A SEEN_BDF=() NEW_ID=()   # NEW_ID: vendor:device 去重，new_id 每种只写一次
+declare -A SEEN_BDF=()
 for _idx in "${!DISK_LIST[@]}"; do
     DISK="${DISK_LIST[$_idx]}"
     case "$DISK" in
@@ -321,10 +320,6 @@ for _idx in "${!DISK_LIST[@]}"; do
     SEEN_BDF[$BDF]="$DISK"
 
     LSPCI_LINE=$(lspci -nns "$BDF") || abort "lspci 找不到 $BDF"
-    VID_DID=$(echo "$LSPCI_LINE" | grep -oE '\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]' \
-              | head -n1 | tr -d '[]')
-    [ -n "$VID_DID" ] || abort "无法从 lspci 解析 $DISK 的 vendor:device"
-    NEW_ID[$VID_DID]=1
     BDFS+=("$BDF")
     CTRLRS+=("Nvme$_idx")
     info "盘[$_idx] $DISK → BDF $BDF  $LSPCI_LINE  model=$(lsblk -dno MODEL "/dev/$DISK" 2>/dev/null)"
@@ -375,40 +370,34 @@ fi
 restore_vfio_nvme
 check_root_rw
 
-# new_id 按 vendor:device 去重：同型号多盘只需注册一次
-for _vid_did in "${!NEW_ID[@]}"; do
-    if ! echo "$_vid_did" > /sys/bus/pci/drivers/vfio-pci/new_id 2>/tmp/.newid.err; then
-        if grep -q "File exists" /tmp/.newid.err 2>/dev/null; then
-            info "new_id $_vid_did 已注册过，跳过"
-        else
-            abort "new_id 失败: $(cat /tmp/.newid.err 2>/dev/null)"
-        fi
-    fi
-done
-
-# 逐盘 unbind/bind；每绑完一块立刻 check_root_rw（错盘事故要当场暴露）
+# 逐盘 driver_override 接管（SPDK setup.sh 的标准做法，不依赖 new_id 动态 ID 表——
+# 部分 openEuler 内核对 new_id 写 vendor:device 直接回 EINVAL，node1 实测）。
+# override 先写后 unbind：万一解绑瞬间被 probe，也只有 override 指定的 vfio-pci 能匹配，
+# 不会漂回 nvme。每绑完一块立刻 check_root_rw（错盘事故要当场暴露）
 for _idx in "${!DISK_LIST[@]}"; do
     DISK="${DISK_LIST[$_idx]}"
     BDF="${BDFS[$_idx]}"
     DRV=$(driver_of "$BDF")
     if [ "$DRV" = "/sys/bus/pci/drivers/vfio-pci" ]; then
-        info "$BDF ($DISK) 已被 vfio-pci 接管，跳过 unbind/bind"
-    else
-        [ "$DRV" = "/sys/bus/pci/drivers/nvme" ] \
-            || abort "$BDF ($DISK) 当前驱动是 ${DRV:-无}，不是 nvme，请人工确认后再操作"
-        echo "$BDF" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null \
-            || abort "unbind $BDF 失败"
-        info "$DISK: 已从 nvme 驱动解绑（unbind 后 new_id 可能已自动 probe 到 vfio-pci，先确认）"
-        sleep 0.5
-        DRV=$(driver_of "$BDF")
-        if [ "$DRV" != "/sys/bus/pci/drivers/vfio-pci" ]; then
-            if ! echo "$BDF" > /sys/bus/pci/drivers/vfio-pci/bind 2>/tmp/.bind.err; then
-                DRV=$(driver_of "$BDF")
-                [ "$DRV" = "/sys/bus/pci/drivers/vfio-pci" ] \
-                    || abort "bind 失败: $(cat /tmp/.bind.err 2>/dev/null)"
-            fi
-        fi
+        info "$BDF ($DISK) 已被 vfio-pci 接管，跳过"
+        continue
     fi
+    [ "$DRV" = "/sys/bus/pci/drivers/nvme" ] \
+        || abort "$BDF ($DISK) 当前驱动是 ${DRV:-无}，不是 nvme，请人工确认后再操作"
+
+    echo "vfio-pci" > "/sys/bus/pci/devices/$BDF/driver_override" 2>/dev/null \
+        || abort "写 $BDF driver_override 失败"
+    echo "$BDF" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null \
+        || abort "unbind $BDF 失败"
+    if ! echo "$BDF" > /sys/bus/pci/drivers/vfio-pci/bind 2>/tmp/.bind.err; then
+        echo "" > "/sys/bus/pci/devices/$BDF/driver_override" 2>/dev/null || true
+        DRV=$(driver_of "$BDF")
+        [ "$DRV" = "/sys/bus/pci/drivers/vfio-pci" ] \
+            || abort "bind 失败: $(cat /tmp/.bind.err 2>/dev/null)（盘当前驱动: ${DRV:-无}，可重跑本脚本或 -r 还原）"
+    fi
+    # 已归 vfio-pci，清掉 override，免得 restore 时挡住绑回 nvme
+    echo "" > "/sys/bus/pci/devices/$BDF/driver_override" 2>/dev/null || true
+
     DRV=$(driver_of "$BDF")
     [ "$DRV" = "/sys/bus/pci/drivers/vfio-pci" ] || abort "$DISK 接管失败，当前驱动: ${DRV:-无}"
     ok "vfio-pci 已接管 $DISK：$BDF"
@@ -481,8 +470,8 @@ fi
 [ -x "$SPDK_DIR/scripts/rpc.py" ] \
     || abort "在 $SPDK_DIR 下找不到 scripts/rpc.py"
 
-ls "$LIBDIR"/liburma.so* >/dev/null 2>&1 || abort "$LIBDIR 里没有 liburma.so*"
-if ! ls "$LIBDIR"/liburma_common.so* >/dev/null 2>&1; then
+ls "$LIBDIR" 2>/dev/null | grep -q '^liburma\.so' || abort "$LIBDIR 里没有 liburma.so*"
+if ! ls "$LIBDIR" 2>/dev/null | grep -q '^liburma_common\.so'; then
     warn "$LIBDIR 缺 liburma_common.so*！liburma.so.0 依赖它，缺了会回落 /usr/lib64 旧版"
     warn "→ urma_init() 返回 4096 → nvmf_create_transport 静默失败（部署文档附录 F-3）"
     confirm "仍要继续?" || abort "换用成套库目录重跑：-L <同时含 liburma* 与 liburma_common* 的目录>"
