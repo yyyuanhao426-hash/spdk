@@ -4,24 +4,40 @@
 #
 # 流程：
 #   1. lsblk 展示系统盘分布，标出“绝对不能碰”的盘（root/home 挂载、LVM PV、md 成员）
-#   2. 分析候选空闲盘；选定一盘后【现查】其 BDF（nvmeXn1 每次开机重排，旧记录不可信）
+#   2. 分析候选空闲盘；选定盘后【现查】其 BDF（nvmeXn1 每次开机重排，旧记录不可信）
 #   3. lspci -nns 显示 vendor:device，用该 BDF 执行 new_id → unbind → bind
 #   4. 验证 vfio-pci 已接管 + 根分区仍是 rw（bind 错盘 = 根文件系统变 ro，实测过）
-#   5. 环境检查：liburma 与 liburma_common 成套、hugepages、无残留 nvmf_tgt
-#   6. 后台启动 ./build/bin/nvmf_tgt -m <mask>（计时为可选开关 -s 秒数）
-#   7. RPC 就绪后自动配置：attach controller（用刚接管的 BDF）→ create transport
-#      → subsystem → ns → listener（listener IP 自动探测，多网卡用 -i 显式指定）
+#   5. 环境检查：liburma 与 liburma_common 成套、hugepages（按 iobuf 池自动上调）、无残留 nvmf_tgt
+#   6. 后台启动 ./build/bin/nvmf_tgt -m <mask>（计时为可选开关 -s 秒数；
+#      给了 -I 时先以 --wait-for-rpc 启动，配好 iobuf 池再 framework_start_init）
+#   7. RPC 就绪后自动配置：attach controller（每盘一个）→ create transport
+#      → subsystem → ns（多盘默认多 namespace，-R 可合并成 raid0 单 namespace）
+#      → listener（listener IP 自动探测，多网卡用 -i 显式指定）
 #
 # 用法：
 #   ./target_nvme_takeover.sh                   # 只分析：列系统盘 + 空闲候选盘，不做任何变更
 #   ./target_nvme_takeover.sh -d nvme3n1        # 接管 nvme3n1 → 后台启动 nvmf_tgt → 自动配 RPC
 #   ./target_nvme_takeover.sh -d nvme3n1 -s 10  # 同上 + SPDK_URMA_TARGET_DUMP_SEC=10 计时
+#   ./target_nvme_takeover.sh -d nvme3n1,nvme4n1    # 两块盘 → subsystem 里两个 namespace（nsid 1,2）
+#   ./target_nvme_takeover.sh -d nvme3n1 -d nvme4n1 # 同上（-d 可重复，逗号分隔均可）
+#   ./target_nvme_takeover.sh -d nvme3n1,nvme4n1 -R 128  # 两块盘合成 raid0（strip 128KB）→ 单 namespace
+#   ./target_nvme_takeover.sh -d nvme3n1 -I 8192,8192,1024,4194304 -O 4194304
+#       # 4MB 大 I/O：重配 iobuf 池（large=1024×4MB）+ URMA transport max_io_size=4MB
+#       # 注意：initiator 侧也要 export SPDK_URMA_MAX_IO_SIZE=4194304，且 urma_perf -o ≤ 4MB
 #
 # 选项：
-#   -d <盘名>    目标 NVMe 盘（如 nvme3n1）；不带则只做分析不接管
+#   -d <盘名>    目标 NVMe 盘（如 nvme3n1）；可逗号分隔或重复 -d 接管多块盘；
+#                不带则只做分析不接管
+#   -R <strip>   把所有接管盘合成一个 raid0 bdev（单 namespace 聚合带宽），
+#                <strip> 为 strip 大小 KB（如 128）；0 = 用 raid 模块默认 strip
+#   -I <四元组>  iobuf 池 "小池数量,小池buf,大池数量,大池buf"（字节），
+#                如 8192,8192,1024,4194304。启动时自动 hugepages 上调，
+#                并以 --wait-for-rpc 启动后调 iobuf_set_options（仅 STARTUP 期可用）
+#   -O <字节>    URMA transport max_io_size（2 的幂且 ≥8KB）。注意：urma 数据路径
+#                要求 iovcnt==1，大 I/O 必须配合 -I 把 large_bufsize 配到 ≥ 此值
 #   -s <秒>      打开 target 计时（SPDK_URMA_TARGET_DUMP_SEC，transport 创建时读取）
 #   -i <IP>      listener 地址（默认自动探测本机第一个全局 IPv4；多网卡机器建议显式指定）
-#   -m <掩码>    nvmf_tgt core mask（默认 0x3）
+#   -m <掩码>    nvmf_tgt core mask（默认 0x3；盘多时可加宽，如 0xf）
 #   -w <目录>    SPDK 源码根（默认从脚本所在目录向上找 build/bin/nvmf_tgt）
 #   -L <目录>    URMA 库目录（默认 /home/yin/gdr/UMDK_netlab/lib，
 #                必须同时含 liburma.so* 与 liburma_common.so*，缺一不可）
@@ -41,7 +57,10 @@ set -u -o pipefail
 
 HUGE_PAGES=2048
 
-DISK=""
+DISKS=""             # 逗号分隔累积（支持多次 -d），后面拆成数组
+RAID0_STRIP=-1       # -1 = 不建 raid0；>=0 = 建 raid0（0 = 用 raid 模块默认 strip）
+IOBUF_SPEC=""        # "小池数量,小池buf,大池数量,大池buf"
+MAX_IO_SIZE=0        # URMA transport max_io_size（字节）
 DUMP_SEC=""
 COREMASK="0x3"
 SPDK_DIR=""
@@ -54,7 +73,7 @@ ASSUME_YES=0
 NQN="nqn.2026-01.io.spdk:urma-gpu-test"
 SUBSYS_SN="URMAGPU0001"
 LISTEN_PORT=4420
-BDEV_CTRL="Nvme0"
+RAID_NAME="URMA_RAID0"
 TGT_LOG="/tmp/nvmf_tgt.log"
 TGT_PIDFILE="/var/tmp/nvmf_tgt.pid"
 
@@ -71,15 +90,18 @@ confirm() {
     [ "$a" = "yes" ]
 }
 
-while getopts "d:s:i:m:w:L:N:ryh" opt; do
+while getopts "d:s:i:m:w:L:N:R:I:O:ryh" opt; do
     case $opt in
-        d) DISK=$OPTARG ;;
+        d) DISKS="${DISKS:+$DISKS,}$OPTARG" ;;
         s) DUMP_SEC=$OPTARG ;;
         i) LISTEN_IP=$OPTARG ;;
         m) COREMASK=$OPTARG ;;
         w) SPDK_DIR=$OPTARG ;;
         L) LIBDIR=$OPTARG ;;
         N) DEVNAME=$OPTARG ;;
+        R) RAID0_STRIP=$OPTARG ;;
+        I) IOBUF_SPEC=$OPTARG ;;
+        O) MAX_IO_SIZE=$OPTARG ;;
         r) RESTORE_ONLY=1 ;;
         y) ASSUME_YES=1 ;;
         h) usage ;;
@@ -260,47 +282,69 @@ done
 echo
 
 #---------------- 只分析模式 ----------------
-if [ -z "$DISK" ]; then
+if [ -z "$DISKS" ]; then
     info "未指定 -d，到此为止（未做任何变更）。选定“空闲”盘后："
-    info "  $0 -d <盘名> [-s 计时秒数] [-i listener IP]"
+    info "  $0 -d <盘名>[,<盘名>...] [-R strip_kb] [-I iobuf四元组] [-O max_io_size] [-s 计时秒数] [-i listener IP]"
     exit 0
 fi
 
 #---------------- 接管模式 ----------------
-case "$DISK" in
-    nvme[0-9]*n[0-9]*) ;;
-    *) abort "-d 需要整盘名（如 nvme3n1），不能是分区" ;;
-esac
-[ -e "/sys/block/$DISK" ] || abort "找不到 /sys/block/$DISK（盘名开机重排，用 lsblk 现查后重跑）"
+# 拆盘名列表：逗号分隔 + 多次 -d 都已归并到 $DISKS
+IFS=',' read -ra DISK_LIST <<< "$DISKS"
+[ "${#DISK_LIST[@]}" -ge 1 ] || abort "-d 解析失败"
 
-BDF=$(get_bdf "$DISK")
-[ -n "$BDF" ] || abort "无法从 sysfs 解析 $DISK 的 BDF"
+# 先全部校验、再动手：任何一块盘不安全就在碰 sysfs 之前 abort
+declare -a BDFS=() CTRLRS=()
+declare -A SEEN_BDF=() NEW_ID=()   # NEW_ID: vendor:device 去重，new_id 每种只写一次
+for _idx in "${!DISK_LIST[@]}"; do
+    DISK="${DISK_LIST[$_idx]}"
+    case "$DISK" in
+        nvme[0-9]*n[0-9]*) ;;
+        *) abort "-d 需要整盘名（如 nvme3n1），不能是分区：$DISK" ;;
+    esac
+    [ -e "/sys/block/$DISK" ] || abort "找不到 /sys/block/$DISK（盘名开机重排，用 lsblk 现查后重跑）"
 
-REASONS=$(disk_reasons "$DISK")
-[ -n "$REASONS" ] && abort "$DISK 不是空闲盘：$REASONS"
+    BDF=$(get_bdf "$DISK")
+    [ -n "$BDF" ] || abort "无法从 sysfs 解析 $DISK 的 BDF"
 
-if protected_bdfs | grep -qx "$BDF"; then
-    abort "$BDF 属于系统盘（挂载/LVM-PV/md 成员），绝对不能碰"
-fi
+    REASONS=$(disk_reasons "$DISK")
+    [ -n "$REASONS" ] && abort "$DISK 不是空闲盘：$REASONS"
 
-echo "=== 3) $DISK → BDF $BDF ==="
-LSPCI_LINE=$(lspci -nns "$BDF") || abort "lspci 找不到 $BDF"
-echo "  $LSPCI_LINE"
-VID_DID=$(echo "$LSPCI_LINE" | grep -oE '\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]' \
-          | head -n1 | tr -d '[]')
-[ -n "$VID_DID" ] || abort "无法从 lspci 解析 vendor:device"
-VENDOR=${VID_DID%%:*}
-DEVID=${VID_DID##*:}
-info "vendor:device = $VID_DID，model = $(lsblk -dno MODEL "/dev/$DISK" 2>/dev/null)"
+    if protected_bdfs | grep -qx "$BDF"; then
+        abort "$BDF ($DISK) 属于系统盘（挂载/LVM-PV/md 成员），绝对不能碰"
+    fi
+
+    # 同一控制器的两个 namespace（nvme3n1/nvme3n2）BDF 相同：绑一次就是整盘，重复传会双 attach
+    if [ -n "${SEEN_BDF[$BDF]:-}" ]; then
+        abort "$DISK 与 ${SEEN_BDF[$BDF]} 是同一控制器（BDF $BDF）：接管按整盘进行，不要重复传"
+    fi
+    SEEN_BDF[$BDF]="$DISK"
+
+    LSPCI_LINE=$(lspci -nns "$BDF") || abort "lspci 找不到 $BDF"
+    VID_DID=$(echo "$LSPCI_LINE" | grep -oE '\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]' \
+              | head -n1 | tr -d '[]')
+    [ -n "$VID_DID" ] || abort "无法从 lspci 解析 $DISK 的 vendor:device"
+    NEW_ID[$VID_DID]=1
+    BDFS+=("$BDF")
+    CTRLRS+=("Nvme$_idx")
+    info "盘[$_idx] $DISK → BDF $BDF  $LSPCI_LINE  model=$(lsblk -dno MODEL "/dev/$DISK" 2>/dev/null)"
+done
+
 echo
-
 echo "--------------------------------------------------------------"
-echo "即将把 $DISK (BDF=$BDF, $VID_DID) 从 nvme 驱动接管到 vfio-pci (noiommu)"
-echo "之后该盘无法再作为块设备访问；请再次确认不是系统盘。"
+echo "即将把以下 ${#DISK_LIST[@]} 块盘从 nvme 驱动接管到 vfio-pci (noiommu)："
+for _idx in "${!DISK_LIST[@]}"; do
+    echo "  ${DISK_LIST[$_idx]} (BDF ${BDFS[$_idx]}) → ${CTRLRS[$_idx]}"
+done
+echo "之后这些盘无法再作为块设备访问；请再次确认都不是系统盘。"
+[ "$RAID0_STRIP" -ge 0 ] && echo "命名空间模式：raid0（$RAID_NAME，strip=$RAID0_STRIP KB）单 namespace"
+[ "$RAID0_STRIP" -lt 0 ] && echo "命名空间模式：每盘一个 namespace（nsid 1..${#DISK_LIST[@]}）"
+[ -n "$IOBUF_SPEC" ] && echo "iobuf 池：$IOBUF_SPEC（--wait-for-rpc 启动 + iobuf_set_options）"
+[ "$MAX_IO_SIZE" -gt 0 ] && echo "transport max_io_size：$MAX_IO_SIZE 字节"
 confirm "继续?" || abort "用户取消"
 echo
 
-echo "=== 4) vfio-pci noiommu 接管 ==="
+echo "=== 3) vfio-pci noiommu 接管 ==="
 lsmod | grep -q '^vfio_pci' || modprobe vfio-pci || abort "modprobe vfio-pci 失败"
 lsmod | grep -q '^vfio'     || modprobe vfio     || abort "modprobe vfio 失败"
 
@@ -331,52 +375,92 @@ fi
 restore_vfio_nvme
 check_root_rw
 
-if ! echo "$VENDOR $DEVID" > /sys/bus/pci/drivers/vfio-pci/new_id 2>/tmp/.newid.err; then
-    if grep -q "File exists" /tmp/.newid.err 2>/dev/null; then
-        info "new_id $VID_DID 已注册过，跳过"
-    else
-        abort "new_id 失败: $(cat /tmp/.newid.err 2>/dev/null)"
-    fi
-fi
-
-DRV=$(driver_of "$BDF")
-if [ "$DRV" = "/sys/bus/pci/drivers/vfio-pci" ]; then
-    info "$BDF 已被 vfio-pci 接管，跳过 unbind/bind"
-else
-    [ "$DRV" = "/sys/bus/pci/drivers/nvme" ] \
-        || abort "$BDF 当前驱动是 ${DRV:-无}，不是 nvme，请人工确认后再操作"
-    echo "$BDF" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null \
-        || abort "unbind $BDF 失败"
-    info "已从 nvme 驱动解绑（unbind 后 new_id 可能已自动 probe 到 vfio-pci，先确认）"
-    sleep 0.5
-    DRV=$(driver_of "$BDF")
-    if [ "$DRV" != "/sys/bus/pci/drivers/vfio-pci" ]; then
-        if ! echo "$BDF" > /sys/bus/pci/drivers/vfio-pci/bind 2>/tmp/.bind.err; then
-            DRV=$(driver_of "$BDF")
-            [ "$DRV" = "/sys/bus/pci/drivers/vfio-pci" ] \
-                || abort "bind 失败: $(cat /tmp/.bind.err 2>/dev/null)"
+# new_id 按 vendor:device 去重：同型号多盘只需注册一次
+for _vid_did in "${!NEW_ID[@]}"; do
+    if ! echo "$_vid_did" > /sys/bus/pci/drivers/vfio-pci/new_id 2>/tmp/.newid.err; then
+        if grep -q "File exists" /tmp/.newid.err 2>/dev/null; then
+            info "new_id $_vid_did 已注册过，跳过"
+        else
+            abort "new_id 失败: $(cat /tmp/.newid.err 2>/dev/null)"
         fi
     fi
-fi
+done
 
-DRV=$(driver_of "$BDF")
-[ "$DRV" = "/sys/bus/pci/drivers/vfio-pci" ] || abort "接管失败，当前驱动: ${DRV:-无}"
-ok "vfio-pci 已接管：$(driver_of "$BDF")"
+# 逐盘 unbind/bind；每绑完一块立刻 check_root_rw（错盘事故要当场暴露）
+for _idx in "${!DISK_LIST[@]}"; do
+    DISK="${DISK_LIST[$_idx]}"
+    BDF="${BDFS[$_idx]}"
+    DRV=$(driver_of "$BDF")
+    if [ "$DRV" = "/sys/bus/pci/drivers/vfio-pci" ]; then
+        info "$BDF ($DISK) 已被 vfio-pci 接管，跳过 unbind/bind"
+    else
+        [ "$DRV" = "/sys/bus/pci/drivers/nvme" ] \
+            || abort "$BDF ($DISK) 当前驱动是 ${DRV:-无}，不是 nvme，请人工确认后再操作"
+        echo "$BDF" > /sys/bus/pci/drivers/nvme/unbind 2>/dev/null \
+            || abort "unbind $BDF 失败"
+        info "$DISK: 已从 nvme 驱动解绑（unbind 后 new_id 可能已自动 probe 到 vfio-pci，先确认）"
+        sleep 0.5
+        DRV=$(driver_of "$BDF")
+        if [ "$DRV" != "/sys/bus/pci/drivers/vfio-pci" ]; then
+            if ! echo "$BDF" > /sys/bus/pci/drivers/vfio-pci/bind 2>/tmp/.bind.err; then
+                DRV=$(driver_of "$BDF")
+                [ "$DRV" = "/sys/bus/pci/drivers/vfio-pci" ] \
+                    || abort "bind 失败: $(cat /tmp/.bind.err 2>/dev/null)"
+            fi
+        fi
+    fi
+    DRV=$(driver_of "$BDF")
+    [ "$DRV" = "/sys/bus/pci/drivers/vfio-pci" ] || abort "$DISK 接管失败，当前驱动: ${DRV:-无}"
+    ok "vfio-pci 已接管 $DISK：$BDF"
+    check_root_rw
+done
 
 [ -e /dev/vfio/vfio ] || abort "/dev/vfio/vfio 不存在"
 GRP_CNT=$(find /dev/vfio -maxdepth 1 -type c ! -name vfio 2>/dev/null | wc -l)
-[ "$GRP_CNT" -ge 1 ] || warn "/dev/vfio/ 下没有组设备，SPDK 可能打不开该盘"
-
-# bind 错盘 = 根文件系统变 ro 的实测事故（附录 F-1），必须立刻检查
-check_root_rw
+[ "$GRP_CNT" -ge 1 ] || warn "/dev/vfio/ 下没有组设备，SPDK 可能打不开这些盘"
 echo
 
-echo "=== 5) 环境与前置检查 ==="
+echo "=== 4) 环境与前置检查 ==="
 if [ -n "$DUMP_SEC" ]; then
     case "$DUMP_SEC" in
         ''|*[!0-9]*) abort "-s 需要正整数秒" ;;
     esac
     [ "$DUMP_SEC" -ge 1 ] || abort "-s 需要正整数秒"
+fi
+
+# -I 四元组校验：小池数量,小池buf,大池数量,大池buf（对照 lib/thread/iobuf.c 的下限）
+IB_SMALL_COUNT=0; IB_SMALL_SIZE=0; IB_LARGE_COUNT=0; IB_LARGE_SIZE=0
+if [ -n "$IOBUF_SPEC" ]; then
+    IFS=',' read -ra _IB <<< "$IOBUF_SPEC"
+    [ "${#_IB[@]}" -eq 4 ] || abort "-I 需要 4 个逗号分隔数字：small_count,small_size,large_count,large_size"
+    for _v in "${_IB[@]}"; do
+        case "$_v" in ''|*[!0-9]*) abort "-I 的每个字段都必须是非负整数，收到: $_v" ;; esac
+    done
+    IB_SMALL_COUNT=${_IB[0]}; IB_SMALL_SIZE=${_IB[1]}; IB_LARGE_COUNT=${_IB[2]}; IB_LARGE_SIZE=${_IB[3]}
+    [ "$IB_SMALL_COUNT" -ge 64 ]  || abort "small_pool_count 最小 64（IOBUF_MIN_SMALL_POOL_SIZE）"
+    [ "$IB_LARGE_COUNT" -ge 8 ]   || abort "large_pool_count 最小 8（IOBUF_MIN_LARGE_POOL_SIZE）"
+    [ "$IB_SMALL_SIZE"  -ge 4096 ] || abort "small_bufsize 最小 4096（IOBUF_MIN_SMALL_BUFSIZE）"
+    [ "$IB_LARGE_SIZE"  -ge 8192 ] || abort "large_bufsize 最小 8192（IOBUF_MIN_LARGE_BUFSIZE）"
+
+    # 池内存 = 小池 + 大池 + 1GiB 余量，换算成 2MB hugepages；不够就自动上调
+    _pool_bytes=$(( IB_SMALL_COUNT * IB_SMALL_SIZE + IB_LARGE_COUNT * IB_LARGE_SIZE ))
+    _need_pages=$(( (_pool_bytes + 1073741824 + 2097151) / 2097152 ))
+    [ "$_need_pages" -gt "$HUGE_PAGES" ] && HUGE_PAGES=$_need_pages
+    info "iobuf 池内存 ≈ $((_pool_bytes / 1048576)) MiB（hugepages 目标上调为 $HUGE_PAGES 页 ≈ $((HUGE_PAGES / 512)) GiB）"
+fi
+
+# -O 校验：2 的幂且 ≥8KB（与 transport 层一致）；且必须 ≤ large_bufsize
+# —— urma 数据路径要求 iovcnt==1（urma.c nvmf_urma_post_data），I/O 大于 large_bufsize
+#    会被拆成多个 iobuf buffer，直接 -ENOTSUP 失败，所以这里提前把配置卡死
+if [ "$MAX_IO_SIZE" -gt 0 ]; then
+    [ $((MAX_IO_SIZE & (MAX_IO_SIZE - 1))) -eq 0 ] && [ "$MAX_IO_SIZE" -ge 8192 ] \
+        || abort "-O max_io_size 必须是 2 的幂且 ≥8KB"
+    if [ -n "$IOBUF_SPEC" ] && [ "$IB_LARGE_SIZE" -lt "$MAX_IO_SIZE" ]; then
+        abort "-O $MAX_IO_SIZE > -I 的 large_bufsize $IB_LARGE_SIZE：urma 要求数据单 buffer（iovcnt==1），请把 -I 第 4 个字段配到 ≥ $MAX_IO_SIZE"
+    fi
+    if [ -z "$IOBUF_SPEC" ] && [ "$MAX_IO_SIZE" -gt 135168 ]; then
+        abort "-O $MAX_IO_SIZE 但未配 -I：默认 large_bufsize 只有 135168，>135168 的 I/O 会因 iovcnt!=1 失败。请加 -I，例如 -I 8192,8192,1024,$MAX_IO_SIZE"
+    fi
 fi
 
 # SPDK 源码根：-w 优先；否则从脚本所在目录、当前目录分别向上找 build/bin/nvmf_tgt
@@ -422,18 +506,18 @@ if [ -z "$LISTEN_IP" ]; then
 fi
 [ -n "$LISTEN_IP" ] || abort "无法自动探测本机 IP，用 -i <IP> 指定 listener 地址"
 
-echo "=== 6) 后台启动 nvmf_tgt ==="
+echo "=== 5) 后台启动 nvmf_tgt ==="
 cd "$SPDK_DIR" || abort "cd $SPDK_DIR 失败"
 export LD_LIBRARY_PATH="$LIBDIR:${LD_LIBRARY_PATH:-}"
 export SPDK_URMA_DEV_NAME="$DEVNAME"
-info "LD_LIBRARY_PATH=$LIBDIR  SPDK_URMA_DEV_NAME=$DEVNAME  core mask=$COREMASK$( [ -n "$DUMP_SEC" ] && echo "  SPDK_URMA_TARGET_DUMP_SEC=$DUMP_SEC")"
+info "LD_LIBRARY_PATH=$LIBDIR  SPDK_URMA_DEV_NAME=$DEVNAME  core mask=$COREMASK$( [ -n "$DUMP_SEC" ] && echo "  SPDK_URMA_TARGET_DUMP_SEC=$DUMP_SEC")$( [ -n "$IOBUF_SPEC" ] && echo "  --wait-for-rpc")"
 
-if [ -n "$DUMP_SEC" ]; then
-    nohup env SPDK_URMA_TARGET_DUMP_SEC="$DUMP_SEC" \
-        ./build/bin/nvmf_tgt -m "$COREMASK" > "$TGT_LOG" 2>&1 &
-else
-    nohup ./build/bin/nvmf_tgt -m "$COREMASK" > "$TGT_LOG" 2>&1 &
-fi
+# -I 需要在子系统初始化前设 iobuf 池（iobuf_set_options 仅 SPDK_RPC_STARTUP 可调），
+# 所以先以 --wait-for-rpc 启动，RPC 配完池子再 framework_start_init
+TGT_ARGS=(-m "$COREMASK")
+[ -n "$IOBUF_SPEC" ] && TGT_ARGS+=(--wait-for-rpc)
+nohup env $( [ -n "$DUMP_SEC" ] && echo "SPDK_URMA_TARGET_DUMP_SEC=$DUMP_SEC" ) \
+    ./build/bin/nvmf_tgt "${TGT_ARGS[@]}" > "$TGT_LOG" 2>&1 &
 TGT_PID=$!
 echo "$TGT_PID" > "$TGT_PIDFILE"
 info "nvmf_tgt 已后台启动 PID=$TGT_PID（日志: $TGT_LOG；停止: kill \$(cat $TGT_PIDFILE)）"
@@ -460,7 +544,6 @@ done
 [ "$READY" = 1 ] || { tail -n 30 "$TGT_LOG" >&2; abort "30s 内 RPC 未就绪"; }
 ok "RPC 就绪（PID $TGT_PID）"
 
-echo "=== 7) 配置 RPC ==="
 run_rpc() {
     info "\$ rpc.py $*"
     if ! "$RPC" "$@"; then
@@ -469,25 +552,75 @@ run_rpc() {
         abort "RPC 失败: $*"
     fi
 }
-run_rpc bdev_nvme_attach_controller -b "$BDEV_CTRL" -t PCIe -a "$BDF"
-run_rpc nvmf_create_transport -t URMA
+
+if [ -n "$IOBUF_SPEC" ]; then
+    echo "=== 6) 配置 iobuf 池（startup 窗口） ==="
+    run_rpc iobuf_set_options \
+        --small-pool-count "$IB_SMALL_COUNT" --small-bufsize "$IB_SMALL_SIZE" \
+        --large-pool-count "$IB_LARGE_COUNT" --large-bufsize "$IB_LARGE_SIZE"
+    run_rpc framework_start_init
+    ok "iobuf 池已生效（small ${IB_SMALL_COUNT}x${IB_SMALL_SIZE}B，large ${IB_LARGE_COUNT}x${IB_LARGE_SIZE}B）"
+fi
+
+echo "=== 7) 配置 RPC ==="
+# 每块盘一个 controller（Nvme0/Nvme1/...）
+for _idx in "${!DISK_LIST[@]}"; do
+    run_rpc bdev_nvme_attach_controller -b "${CTRLRS[$_idx]}" -t PCIe -a "${BDFS[$_idx]}"
+done
+if [ "$MAX_IO_SIZE" -gt 0 ]; then
+    run_rpc nvmf_create_transport -t URMA -i "$MAX_IO_SIZE"
+else
+    run_rpc nvmf_create_transport -t URMA
+fi
 run_rpc nvmf_create_subsystem "$NQN" -a -s "$SUBSYS_SN"
-run_rpc nvmf_subsystem_add_ns "$NQN" "${BDEV_CTRL}n1" -n 1
+
+if [ "$RAID0_STRIP" -ge 0 ]; then
+    # raid0：把所有 base bdev 拼成一个大 bdev，单 namespace 聚合带宽
+    _bases=""
+    for _c in "${CTRLRS[@]}"; do _bases+="${_c}n1 "; done
+    _raid_args=(-n "$RAID_NAME" -r raid0 -b "$_bases")
+    [ "$RAID0_STRIP" -gt 0 ] && _raid_args+=(-z "$RAID0_STRIP")
+    run_rpc bdev_raid_create "${_raid_args[@]}"
+    run_rpc nvmf_subsystem_add_ns "$NQN" "$RAID_NAME" -n 1
+    info "namespace: $RAID_NAME（raid0，成员: $_bases）→ nsid 1"
+else
+    # 多 namespace：每盘一个 bdev，nsid 依次 1..N（同一 subsystem 内 nsid 必须唯一）
+    for _idx in "${!DISK_LIST[@]}"; do
+        run_rpc nvmf_subsystem_add_ns "$NQN" "${CTRLRS[$_idx]}n1" -n $((_idx + 1))
+    done
+fi
 run_rpc nvmf_subsystem_add_listener "$NQN" -t URMA -f IPv4 -a "$LISTEN_IP" -s "$LISTEN_PORT"
 ok "全部 RPC 配置完成"
 
 echo
 echo "================================================================"
 echo "Target 就绪："
-echo "  NVMe      : $DISK (BDF $BDF) → $BDEV_CTRL"
-echo "  subsystem : $NQN"
-echo "  listener  : $LISTEN_IP:$LISTEN_PORT (URMA)"
-echo "  nvmf_tgt  : PID $TGT_PID，日志 $TGT_LOG$( [ -n "$DUMP_SEC" ] && echo "；target 打点每 ${DUMP_SEC}s 输出一次（==== URMA target timing breakdown ====）")"
-echo "  停止      : kill \$(cat $TGT_PIDFILE)"
+for _idx in "${!DISK_LIST[@]}"; do
+    echo "  NVMe[$_idx] : ${DISK_LIST[$_idx]} (BDF ${BDFS[$_idx]}) → ${CTRLRS[$_idx]}"
+done
+if [ "$RAID0_STRIP" -ge 0 ]; then
+    echo "  namespace  : $RAID_NAME（raid0）→ nsid 1"
+else
+    echo "  namespaces : ${CTRLRS[*]}n1 → nsid 1..${#DISK_LIST[@]}"
+fi
+echo "  subsystem  : $NQN"
+echo "  listener   : $LISTEN_IP:$LISTEN_PORT (URMA)"
+[ -n "$IOBUF_SPEC" ] && echo "  iobuf      : small ${IB_SMALL_COUNT}x${IB_SMALL_SIZE}B / large ${IB_LARGE_COUNT}x${IB_LARGE_SIZE}B"
+[ "$MAX_IO_SIZE" -gt 0 ] && echo "  max_io_size: $MAX_IO_SIZE B（transport）"
+echo "  nvmf_tgt   : PID $TGT_PID，日志 $TGT_LOG$( [ -n "$DUMP_SEC" ] && echo "；target 打点每 ${DUMP_SEC}s 输出一次（==== URMA target timing breakdown ====）")"
+echo "  停止       : kill \$(cat $TGT_PIDFILE)"
 echo
 echo "151（Initiator）上测试："
+if [ "$MAX_IO_SIZE" -gt 0 ]; then
+    echo "  # transport max_io_size=$MAX_IO_SIZE，initiator 侧必须一致（否则 hello 协商后按小的算）："
+    echo "  export SPDK_URMA_MAX_IO_SIZE=$MAX_IO_SIZE"
+fi
 echo "  sudo LD_LIBRARY_PATH=<成套库目录> SPDK_URMA_DEV_NAME=$DEVNAME \\"
 echo "      ./build/examples/urma_perf \\"
 echo "      -r 'trtype:URMA adrfam:IPv4 traddr:$LISTEN_IP trsvcid:$LISTEN_PORT subnqn:$NQN' \\"
 echo "      -w write -o 4096 -T 4 -b 32 -t 30 -n 1 -g 0 -l 0 -M posix"
+if [ "$RAID0_STRIP" -lt 0 ] && [ "${#DISK_LIST[@]}" -gt 1 ]; then
+    echo "  # 多 namespace 模式：所有 ns 在一个 ctrlr 下，perf 线程会自动摊到各 ns；"
+    echo "  # 想单独压某个盘用 urma_perf 的 namespace 选择（或临时去掉其他 ns）"
+fi
 echo "================================================================"
