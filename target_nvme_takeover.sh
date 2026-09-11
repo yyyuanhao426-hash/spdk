@@ -36,8 +36,11 @@
 #   -O <字节>    URMA transport max_io_size（2 的幂且 ≥8KB）。注意：urma 数据路径
 #                要求 iovcnt==1，大 I/O 必须配合 -I 把 large_bufsize 配到 ≥ 此值
 #   -C <个数>    -O 生效时 URMA transport 每个 PG 的 large iobuf 缓存（默认 32）。
-#                核多时压小：每核固定预占 32 个 large（bdev 16+accel 16），PG≈每核
-#                一个，池子必须盖住 核数×(32+此值)，否则启动/建 ns 报 populate 0/16
+#                语义是"钉住"地址：必须 ≥ 每 PG 峰值并发（≈ urma_perf 的 -T×-b ÷
+#                活跃连接数）。小于它，I/O 会从共享池轮换抓不同 buffer，target 侧
+#                注册缓存（只进不出，128 个）命中率崩塌 → 每 miss 同步阻塞一次
+#                UMMU 注册（数十 ms）→ 吞吐崩。每核固定预占 32 个 large
+#                （bdev 16+accel 16），池子必须盖住 核数×(32+此值)+余量
 #   -s <秒>      打开 target 计时（SPDK_URMA_TARGET_DUMP_SEC，transport 创建时读取）
 #   -i <IP>      listener 地址（默认自动探测本机第一个全局 IPv4；多网卡机器建议显式指定）
 #   -m <掩码>    nvmf_tgt core mask（默认 0x3；盘多时可加宽，如 0xf）
@@ -570,9 +573,12 @@ done
 if [ "$MAX_IO_SIZE" -gt 0 ]; then
     # transport 的 iobuf 缓存默认"自动吃大池的一半再按已有 PG 数均分"（transport.c:640），
     # 第一个 PG 独吞 pool/2，叠加每核 bdev(16)+accel(16) 个 large 预占后，
-    # add_ns 建通道时池子必被抽干（0/16 失败）。显式压小：每 PG 默认 32 个 large
-    # （够单核 32 个在飞 I/O），small 1024 同理封顶，余量留给共享池。
-    # 核多时（-m 加宽）PG 数≈核数，固定预占随核数线性涨——小池每核 1280
+    # add_ns 建通道时池子必被抽干（0/16 失败）。显式压小：每 PG 默认 32 个 large，
+    # small 1024 同理封顶，余量留给共享池。
+    # 注意 -C 的下限：必须 ≥ 每 PG 峰值并发（urma_perf 的 -T×-b ÷ 活跃连接数）。
+    # 缓存不够 → I/O 从共享池轮换抓不同地址 → target 注册缓存（128 个、只进不出）
+    # 命中率崩塌 → 每 miss 同步阻塞一次 UMMU 注册（数十 ms）→ 吞吐崩盘。
+    # 核多时（-m 加宽）固定预占随核数线性涨——小池每核 1280
     # （bdev 128+accel 128+PG 1024），大池每核 32+IOBUF_PG_CACHE，池子必须盖住。
     _ncore=0
     _v=$(printf '%d' "$COREMASK" 2>/dev/null)
