@@ -69,6 +69,33 @@ posix 路线中每个 I/O 的 HBM↔host 一次 cuMemcpy（写方向提交前 Dt
 HtoD）；其耗时单独统计，不计入 NVMe 延迟——端到端成本 = 延迟 + 拷贝。
 _Avoid_: 预拷贝（不是只做一次，是每 I/O）
 
+### 数据面与吞吐
+
+**拉数（pull）**:
+URMA 写方向的数据搬运：target 收到 capsule 后在 jetty 上发起远程读，把 initiator
+缓冲的数据 DMA 进本地 iobuf。target 打点 "W8 JFC wait (pull)" 计的就是等它完成。
+_Avoid_: 下载、反向读
+
+**推送（push）**:
+数据面的另一方向（C2H 直推），当前写路径的少数派；对应 target 打点
+"push JFC wait (C2H)"。
+_Avoid_: _
+
+**拆分（split）**:
+initiator 按 noiob（stripe 边界）把一条越界 I/O 拆成多个子请求的行为；strip 与
+transport max_io_size 共同决定是否发生，拆分会成倍消耗 qpair request pool。
+_Avoid_: 分片
+
+**在飞窗口（window）**:
+一端同时在网上的 I/O 数（urma_perf 为 -T×-b，经 qpair num_entries 与对端
+max_queue_depth 协商收窄）。带宽 = 窗口 × I/O 大小 ÷ 往返。
+_Avoid_: 队列深度（那是单连接的配置上限，不是实际在网数）
+
+**每操作固定开销（per-op overhead）**:
+与 I/O 大小无关、每次拉数都要付的控制面+建立成本（实测 ~60μs 量级），是 1MB I/O
+聚合带宽 ~10.7 GiB/s 上限的来源；加大 I/O 是摊薄它的唯一杠杆，加盘/加连接无效。
+_Avoid_: RTT（往返是端到端延迟、含排队，别与固定开销混用）
+
 ### 计时打点
 
 **轮（round）**:
