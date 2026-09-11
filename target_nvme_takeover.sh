@@ -35,6 +35,9 @@
 #                并以 --wait-for-rpc 启动后调 iobuf_set_options（仅 STARTUP 期可用）
 #   -O <字节>    URMA transport max_io_size（2 的幂且 ≥8KB）。注意：urma 数据路径
 #                要求 iovcnt==1，大 I/O 必须配合 -I 把 large_bufsize 配到 ≥ 此值
+#   -C <个数>    -O 生效时 URMA transport 每个 PG 的 large iobuf 缓存（默认 32）。
+#                核多时压小：每核固定预占 32 个 large（bdev 16+accel 16），PG≈每核
+#                一个，池子必须盖住 核数×(32+此值)，否则启动/建 ns 报 populate 0/16
 #   -s <秒>      打开 target 计时（SPDK_URMA_TARGET_DUMP_SEC，transport 创建时读取）
 #   -i <IP>      listener 地址（默认自动探测本机第一个全局 IPv4；多网卡机器建议显式指定）
 #   -m <掩码>    nvmf_tgt core mask（默认 0x3；盘多时可加宽，如 0xf）
@@ -63,6 +66,7 @@ HUGE_PAGES=2048
 DISKS=""             # 逗号分隔累积（支持多次 -d），后面拆成数组
 RAID0_STRIP=-1       # -1 = 不建 raid0；>=0 = 建 raid0（0 = 用 raid 模块默认 strip）
 IOBUF_SPEC=""        # "小池数量,小池buf,大池数量,大池buf"
+IOBUF_PG_CACHE=32    # -O 生效时 URMA transport 每 PG 的 large 缓存（-C 可调）
 MAX_IO_SIZE=0        # URMA transport max_io_size（字节）
 DUMP_SEC=""
 COREMASK="0x3"
@@ -93,7 +97,7 @@ confirm() {
     [ "$a" = "yes" ]
 }
 
-while getopts "d:s:i:m:w:L:N:R:I:O:ryh" opt; do
+while getopts "d:s:i:m:w:L:N:R:I:O:C:ryh" opt; do
     case $opt in
         d) DISKS="${DISKS:+$DISKS,}$OPTARG" ;;
         s) DUMP_SEC=$OPTARG ;;
@@ -105,6 +109,7 @@ while getopts "d:s:i:m:w:L:N:R:I:O:ryh" opt; do
         R) RAID0_STRIP=$OPTARG ;;
         I) IOBUF_SPEC=$OPTARG ;;
         O) MAX_IO_SIZE=$OPTARG ;;
+        C) IOBUF_PG_CACHE=$OPTARG ;;
         r) RESTORE_ONLY=1 ;;
         y) ASSUME_YES=1 ;;
         h) usage ;;
@@ -565,10 +570,24 @@ done
 if [ "$MAX_IO_SIZE" -gt 0 ]; then
     # transport 的 iobuf 缓存默认"自动吃大池的一半再按已有 PG 数均分"（transport.c:640），
     # 第一个 PG 独吞 pool/2，叠加每核 bdev(16)+accel(16) 个 large 预占后，
-    # add_ns 建通道时池子必被抽干（0/16 失败）。显式压小：每 PG 固定 32 个 large
+    # add_ns 建通道时池子必被抽干（0/16 失败）。显式压小：每 PG 默认 32 个 large
     # （够单核 32 个在飞 I/O），small 1024 同理封顶，余量留给共享池。
+    # 核多时（-m 加宽）PG 数≈核数，固定预占随核数线性涨——小池每核 1280
+    # （bdev 128+accel 128+PG 1024），大池每核 32+IOBUF_PG_CACHE，池子必须盖住。
+    _ncore=0
+    _v=$(printf '%d' "$COREMASK" 2>/dev/null)
+    case "$_v" in ''|*[!0-9]*) _v=0 ;; esac
+    while [ "$_v" -gt 0 ]; do _ncore=$((_ncore + _v % 2)); _v=$((_v / 2)); done
+    _large_eager=$((_ncore * (32 + IOBUF_PG_CACHE)))
+    if [ "$IB_LARGE_COUNT" -gt 0 ] && [ "$IB_LARGE_COUNT" -le "$_large_eager" ]; then
+        warn "large 池撑不住每核固定预占：核数=$_ncore × (32 bdev/accel + $IOBUF_PG_CACHE PG缓存) = $_large_eager ≥ 池 $IB_LARGE_COUNT → 启动/建 ns 会报 populate 0/16。用 -C 压小 PG 缓存，或调大 -I 第 3 个字段"
+    fi
+    _small_eager=$((_ncore * 1280))
+    if [ "$IB_SMALL_COUNT" -gt 0 ] && [ "$IB_SMALL_COUNT" -le "$_small_eager" ]; then
+        warn "small 池同理：核数=$_ncore × 1280（bdev 128+accel 128+PG 1024）= $_small_eager ≥ 池 $IB_SMALL_COUNT → 调大 -I 第 1 个字段（如 16384）"
+    fi
     run_rpc nvmf_create_transport -t URMA -i "$MAX_IO_SIZE" \
-        --iobuf-large-cache-size 32 --iobuf-small-cache-size 1024
+        --iobuf-large-cache-size "$IOBUF_PG_CACHE" --iobuf-small-cache-size 1024
 else
     run_rpc nvmf_create_transport -t URMA
 fi
@@ -606,7 +625,7 @@ fi
 echo "  subsystem  : $NQN"
 echo "  listener   : $LISTEN_IP:$LISTEN_PORT (URMA)"
 [ -n "$IOBUF_SPEC" ] && echo "  iobuf      : small ${IB_SMALL_COUNT}x${IB_SMALL_SIZE}B / large ${IB_LARGE_COUNT}x${IB_LARGE_SIZE}B"
-[ "$MAX_IO_SIZE" -gt 0 ] && echo "  max_io_size: $MAX_IO_SIZE B（transport）"
+[ "$MAX_IO_SIZE" -gt 0 ] && echo "  max_io_size: $MAX_IO_SIZE B（transport，PG large 缓存 $IOBUF_PG_CACHE/PG）"
 echo "  nvmf_tgt   : PID $TGT_PID，日志 $TGT_LOG$( [ -n "$DUMP_SEC" ] && echo "；target 打点每 ${DUMP_SEC}s 输出一次（==== URMA target timing breakdown ====）")"
 echo "  停止       : kill \$(cat $TGT_PIDFILE)"
 echo
