@@ -67,6 +67,21 @@ int spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length
 				  enum spdk_nvme_urma_memory_type type,
 				  struct spdk_nvme_urma_memory_region **region);
 
+/**
+ * Modified By Yida(v7): Register a whole contiguous buffer pool in the URMA
+ * context of an established qpair and record it in the process region
+ * registry. I/Os submitted through qpairs of the same context whose buffers
+ * fall inside the region then skip per-I/O registration, and their capsules
+ * carry the region-wide segment descriptor so the peer can import the whole
+ * pool once instead of per I/O.
+ *
+ * The region lives until spdk_nvme_unregister_memory() (which also removes it
+ * from the registry); it must outlive every I/O touching its buffers.
+ */
+int spdk_nvme_urma_register_memory_for_qpair(struct spdk_nvme_qpair *qpair, void *addr,
+		size_t length, enum spdk_nvme_urma_memory_type type,
+		struct spdk_nvme_urma_memory_region **region);
+
 void spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region);
 
 /** Return the local virtual address and size represented by a region. */

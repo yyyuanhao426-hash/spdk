@@ -87,6 +87,10 @@ struct worker {
 	uint32_t core;
 	struct spdk_nvme_qpair *qpair;
 	struct gpu_allocation allocation;
+	/* Modified By Yida(v7): URMA_PERF_REGION_REG=1 时整块 allocation 一次性
+	 * 注册（每 worker 连续区），I/O 提交路径自动采纳 → capsule 携带全区 seg，
+	 * target 每连接只 import 一次（整池 import）。work_fn 退出时注销。 */
+	struct spdk_nvme_urma_memory_region *region;
 	/* Modified By Yida: posix(新语义) 的 HBM 影子缓冲 + 分级拷贝耗时统计 */
 	struct gpu_allocation gpu_alloc;
 	uint64_t copy_ticks;
@@ -757,6 +761,26 @@ work_fn(void *arg)
 		fprintf(stderr, "Worker %u could not allocate an I/O qpair\n", worker->id);
 		atomic_store_explicit(&g_failed, true, memory_order_release);
 	}
+	/* Modified By Yida(v7): URMA_PERF_REGION_REG=1 且 cpu/posix 路线时，把每
+	 * worker 的整块连续 allocation 一次性注册进本 qpair 的 URMA context；
+	 * 提交路径按覆盖关系自动采纳 → 跳过 per-I/O register，capsule 携带全区
+	 * seg，target 每连接只 import 一次。注册失败降级为 per-I/O 路线并告警。 */
+	if (worker->qpair != NULL &&
+	    (g_mem_type == URMA_PERF_MEM_CPU || g_mem_type == URMA_PERF_MEM_POSIX) &&
+	    getenv("URMA_PERF_REGION_REG") != NULL) {
+		int rrc = spdk_nvme_urma_register_memory_for_qpair(worker->qpair,
+				worker->allocation.addr, worker->allocation.alloc_size,
+				SPDK_NVME_URMA_MEM_HOST, &worker->region);
+
+		if (rrc == 0) {
+			printf("Worker %u: whole-pool region registered (%zu bytes)\n",
+			       worker->id, worker->allocation.alloc_size);
+		} else {
+			fprintf(stderr, "Worker %u: whole-pool region register failed rc=%d, "
+				"falling back to per-IO registration\n", worker->id, rrc);
+			worker->region = NULL;
+		}
+	}
 	atomic_fetch_add_explicit(&g_ready_workers, 1, memory_order_acq_rel);
 
 	if (worker->id == 0) {
@@ -808,6 +832,11 @@ work_fn(void *arg)
 	}
 	worker->finish_tsc = spdk_get_ticks();
 out:
+	/* Modified By Yida(v7): 整池 region 随 worker 退出注销（注册表同步移除） */
+	if (worker->region != NULL) {
+		spdk_nvme_urma_unregister_memory(worker->region);
+		worker->region = NULL;
+	}
 	if (worker->qpair != NULL) {
 		spdk_nvme_ctrlr_free_io_qpair(worker->qpair);
 		worker->qpair = NULL;

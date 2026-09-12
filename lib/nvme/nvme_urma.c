@@ -156,6 +156,8 @@ struct nvme_urma_req {
 	struct spdk_nvme_urma_memory_region *region;
 	/* Modified By Yida: cache entry when region is cached (NULL if not cached) */
 	struct nvme_urma_reg_entry *cache_entry; /* NULL if not cached */
+	/* Modified By Yida(v7): region 来自整池注册表采纳——release 不得 unregister */
+	bool region_external;
 	uint64_t submit_tick;   /* 总往返计时起点 */
 	uint64_t send_start;    /* send 阶段计时起点 */
 	TAILQ_ENTRY(nvme_urma_req) link;
@@ -229,6 +231,30 @@ nvme_urma_cid_free(struct nvme_urma_qpair *uqpair, uint16_t cid)
 	if (uqpair->cid_bitmap != NULL && cid < uqpair->num_entries) {
 		uqpair->cid_bitmap[cid >> 3] &= (uint8_t)~(1u << (cid & 7));
 	}
+}
+
+/* Modified By Yida(v7): 应用侧整池注册入口。urma_perf 等应用在 qpair 建立后把
+ * 一整块连续缓冲（如每 worker 的 allocation）注册一次；提交 I/O 时
+ * nvme_urma_region_registry_find() 采纳覆盖缓冲的 region，跳过 per-I/O
+ * register，capsule.data.seg 携带全区描述，target 可整池 import 一次。
+ * region 生命周期由应用管理：spdk_nvme_urma_unregister_memory() 注销时
+ * 同步移出注册表。 */
+int
+spdk_nvme_urma_register_memory_for_qpair(struct spdk_nvme_qpair *qpair, void *addr,
+		size_t length, enum spdk_nvme_urma_memory_type type,
+		struct spdk_nvme_urma_memory_region **region)
+{
+	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
+	int rc;
+
+	if (uqpair->device == NULL) {
+		return -ENXIO;
+	}
+	rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr, length, type, region);
+	if (rc == 0) {
+		nvme_urma_region_registry_add(uqpair->device->context, addr, length, *region);
+	}
+	return rc;
 }
 
 /* Modified By Yida: registration cache helpers */
@@ -491,30 +517,44 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		capsule.cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK;
 		capsule.cmd.dptr.sgl1.unkeyed.subtype = SPDK_NVME_SGL_SUBTYPE_TRANSPORT;
 		addr = (void *)((uintptr_t)req->payload.contig_or_cb_arg + req->payload.offset);
-		/* Modified By Yida: check registration cache before doing a full register */
-		uint64_t t_reg0 = spdk_get_ticks();
-		struct nvme_urma_reg_entry *entry = nvme_urma_reg_cache_lookup(uqpair, addr,
-				req->payload.size);
-		if (entry != NULL) {
-			ureq->region = entry->region;
-			ureq->cache_entry = entry;
-			entry->refcount++;
+		/* Modified By Yida(v7): 整池注册采纳——应用预注册的连续大区（urma_perf
+		 * 每 worker 一块 allocation）直接作为本 I/O 的 region：跳过 per-I/O
+		 * register（W/reg 阶段），capsule.data.seg 携带全区描述，target 可整池
+		 * import 一次。注册表按 urma_context 键控（每 qpair 独立 device/context），
+		 * 采纳语义与 per-I/O 注册一致；region 生命周期由应用管理。 */
+		ureq->region_external = false;
+		ureq->cache_entry = NULL;
+		ureq->region = nvme_urma_region_registry_find(uqpair->device->context,
+				(uint64_t)addr, req->payload.size);
+		if (ureq->region != NULL) {
+			ureq->region_external = true;
 			__atomic_add_fetch(&g_timing.cache_hit_count, 1, __ATOMIC_RELAXED);
 		} else {
-			rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr,
-					req->payload.size, nvme_urma_req_memory_type(req), &ureq->region);
-			if (rc != 0) {
-				nvme_urma_cid_free(uqpair, req->cmd.cid);
-				free(ureq);
-				return rc;
+			/* Modified By Yida: check registration cache before doing a full register */
+			uint64_t t_reg0 = spdk_get_ticks();
+			struct nvme_urma_reg_entry *entry = nvme_urma_reg_cache_lookup(uqpair, addr,
+					req->payload.size);
+			if (entry != NULL) {
+				ureq->region = entry->region;
+				ureq->cache_entry = entry;
+				entry->refcount++;
+				__atomic_add_fetch(&g_timing.cache_hit_count, 1, __ATOMIC_RELAXED);
+			} else {
+				rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr,
+						req->payload.size, nvme_urma_req_memory_type(req), &ureq->region);
+				if (rc != 0) {
+					nvme_urma_cid_free(uqpair, req->cmd.cid);
+					free(ureq);
+					return rc;
+				}
+				ureq->cache_entry = nvme_urma_reg_cache_insert(uqpair, addr,
+						req->payload.size, ureq->region);
+				/* If cache_entry is NULL (cache full), region stays uncached and
+				 * will be unregistered on completion (old behavior). */
+				uint64_t t_reg1 = spdk_get_ticks();
+				__atomic_add_fetch(&g_timing.reg_ticks, t_reg1 - t_reg0, __ATOMIC_RELAXED);
+				__atomic_add_fetch(&g_timing.reg_count, 1, __ATOMIC_RELAXED);
 			}
-			ureq->cache_entry = nvme_urma_reg_cache_insert(uqpair, addr,
-					req->payload.size, ureq->region);
-			/* If cache_entry is NULL (cache full), region stays uncached and
-			 * will be unregistered on completion (old behavior). */
-			uint64_t t_reg1 = spdk_get_ticks();
-			__atomic_add_fetch(&g_timing.reg_ticks, t_reg1 - t_reg0, __ATOMIC_RELAXED);
-			__atomic_add_fetch(&g_timing.reg_count, 1, __ATOMIC_RELAXED);
 		}
 		capsule.data.seg = spdk_urma_memory_region_get_tseg(ureq->region)->seg;
 		capsule.data.address = (uint64_t)addr;
@@ -559,10 +599,11 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		}
 	}
 	if (rc != 0) {
-		/* Modified By Yida: on send failure, release cache refcount if cached */
+		/* Modified By Yida: on send failure, release cache refcount if cached.
+		 * Modified By Yida(v7): 整池采纳的 region_external 不 unregister。 */
 		if (ureq->cache_entry != NULL) {
 			nvme_urma_reg_cache_release(ureq->cache_entry);
-		} else {
+		} else if (!ureq->region_external) {
 			spdk_nvme_urma_unregister_memory(ureq->region);
 		}
 		/* Modified By Yida (v3): 归还 cid 位 */
@@ -635,11 +676,12 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		qpair->queue_depth--;
 		/* Modified By Yida (v3): 归还 cid 位 */
 		nvme_urma_cid_free(uqpair, ureq->req->cmd.cid);
-		/* Modified By Yida: release cache refcount instead of unregister */
+		/* Modified By Yida: release cache refcount instead of unregister.
+		 * Modified By Yida(v7): 整池采纳的 region_external 不 unregister。 */
 		uint64_t t_rel0 = spdk_get_ticks();
 		if (ureq->cache_entry != NULL) {
 			nvme_urma_reg_cache_release(ureq->cache_entry);
-		} else {
+		} else if (!ureq->region_external) {
 			spdk_nvme_urma_unregister_memory(ureq->region);
 		}
 		uint64_t t_rel1 = spdk_get_ticks();
@@ -685,10 +727,11 @@ nvme_urma_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
 		TAILQ_REMOVE(&uqpair->outstanding, ureq, link);
 		/* Modified By Yida (v3): 归还 cid 位 */
 		nvme_urma_cid_free(uqpair, ureq->req->cmd.cid);
-		/* Modified By Yida: release cache refcount, unregister only uncached */
+		/* Modified By Yida: release cache refcount, unregister only uncached.
+		 * Modified By Yida(v7): 整池采纳的 region_external 不 unregister。 */
 		if (ureq->cache_entry != NULL) {
 			nvme_urma_reg_cache_release(ureq->cache_entry);
-		} else {
+		} else if (!ureq->region_external) {
 			spdk_nvme_urma_unregister_memory(ureq->region);
 		}
 		nvme_complete_request(ureq->req->cb_fn, ureq->req->cb_arg, qpair, ureq->req, &cpl);
