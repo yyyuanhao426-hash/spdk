@@ -415,6 +415,7 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		return -EINVAL;
 	}
 	if (spdk_urma_runtime_get() != 0) {
+		SPDK_ERRLOG("urma device open '%s': runtime init failed\n", opts->dev_name);
 		return -EIO;
 	}
 	device = calloc(1, sizeof(*device));
@@ -431,10 +432,13 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		}
 	}
 	if (selected == NULL) {
+		SPDK_ERRLOG("urma device open: device '%s' not found in device list\n",
+			    opts->dev_name);
 		goto fail;
 	}
 	eids = urma_get_eid_list(selected, &eid_count);
 	if (eids == NULL || eid_count == 0) {
+		SPDK_ERRLOG("urma device open '%s': no eid list\n", selected->name);
 		goto fail;
 	}
 	for (uint32_t i = 0; i < eid_count; i++) {
@@ -451,6 +455,10 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 	}
 	device->context = urma_create_context(selected, device->eid_index);
 	if (device->context == NULL || urma_query_device(selected, &device->attr) != URMA_SUCCESS) {
+		/* Modified By Yida(v6): 原本静默返回——失败后只剩 transport.c 一行兜底，
+		 * 卡 ~5s 才报 = 驱动层超时，这里标出设备名与 eid 便于定位 */
+		SPDK_ERRLOG("urma device open '%s' eid%u: create_context/query failed (~5s delay means driver timeout)\n",
+			    selected->name, (unsigned)device->eid_index);
 		rc = -EIO;
 		goto fail;
 	}
@@ -469,6 +477,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		};
 		urma_user_ctl_out_t out = {};
 		if (urma_user_ctl(device->context, &in, &out) != URMA_SUCCESS) {
+			SPDK_ERRLOG("urma device open '%s': set bonding mode failed\n",
+				    selected->name);
 			rc = -EIO;
 			goto fail;
 		}
@@ -486,6 +496,7 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			}
 		}
 		if (!found && device->attr.port_cnt != 0) {
+			SPDK_ERRLOG("urma device open '%s': no active port\n", selected->name);
 			rc = -ENETDOWN;
 			goto fail;
 		}
@@ -497,6 +508,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 	}
 	device->jfcs = calloc(device->jfc_count, sizeof(*device->jfcs));
 	if (device->jfcs == NULL) {
+		SPDK_ERRLOG("urma device open '%s': alloc jfc table (n=%u) failed\n",
+			    selected->name, device->jfc_count);
 		rc = -ENOMEM;
 		goto fail;
 	}
@@ -506,6 +519,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 				     (uint32_t)device->attr.dev_cap.max_jfc_depth);
 		device->jfcs[i] = urma_create_jfc(device->context, &cfg);
 		if (device->jfcs[i] == NULL) {
+			SPDK_ERRLOG("urma device open '%s': create jfc %u (depth %u) failed\n",
+				    selected->name, i, cfg.depth);
 			rc = -EIO;
 			goto fail;
 		}
@@ -534,6 +549,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		jfr_cfg.jfc = device->jfcs[0];
 		device->jfr = urma_create_jfr(device->context, &jfr_cfg);
 		if (device->jfr == NULL) {
+			SPDK_ERRLOG("urma device open '%s': create shared jfr (depth %u) failed\n",
+				    selected->name, jfr_cfg.depth);
 			rc = -EIO;
 			goto fail;
 		}
@@ -549,6 +566,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		snprintf(id, sizeof(id), "SPDK_URMA_DMA_DEVICE:%s", selected->name);
 		if (spdk_memory_domain_create(&device->memory_domain,
 				SPDK_DMA_DEVICE_VENDOR_SPECIFIC_TYPE_START, &domain_ctx, id) != 0) {
+			SPDK_ERRLOG("urma device open '%s': memory domain create failed\n",
+				    selected->name);
 			rc = -ENOMEM;
 			goto fail;
 		}

@@ -652,6 +652,9 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	free(json_opts.trans_mode);
 	transport->urma_opts.max_io_size = opts->max_io_size;
 	if (spdk_urma_device_open(&transport->urma_opts, &transport->device) != 0) {
+		/* Modified By Yida(v6): 具体失败阶段由 device_open 内部日志给出，这里带设备名兜底 */
+		SPDK_ERRLOG("urma transport create: device open failed for '%s'\n",
+			    transport->urma_opts.dev_name);
 		free(transport);
 		return NULL;
 	}
