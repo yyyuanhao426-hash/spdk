@@ -194,6 +194,80 @@ spdk_nvme_urma_unregister_memory_provider(enum spdk_nvme_urma_memory_type type)
 	return rc;
 }
 
+/* Modified By Yida(v7): 整池注册表 —— 仅由应用侧 spdk_nvme_urma_register_memory_for_qpair
+ * （预注册整块连续缓冲）填充；I/O 提交路径用 find() 采纳覆盖本 I/O 缓冲的 region，
+ * 跳过 per-I/O register，capsule 携带全区 seg，对端可整池 import 一次。
+ * 按 urma_context 键控：每 qpair 独立 device/context，注册只对同 context 的 I/O 生效。 */
+#define NVME_URMA_REGION_REGISTRY_SIZE 64
+
+struct nvme_urma_region_entry {
+	void *context;
+	uintptr_t start;
+	uintptr_t end;   /* start + length */
+	struct spdk_nvme_urma_memory_region *region;
+	bool used;
+};
+
+static struct nvme_urma_region_entry g_region_registry[NVME_URMA_REGION_REGISTRY_SIZE];
+static pthread_mutex_t g_region_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void
+nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
+			      struct spdk_nvme_urma_memory_region *region)
+{
+	pthread_mutex_lock(&g_region_registry_mutex);
+	for (int i = 0; i < NVME_URMA_REGION_REGISTRY_SIZE; i++) {
+		struct nvme_urma_region_entry *e = &g_region_registry[i];
+
+		if (!e->used) {
+			e->context = urma_context;
+			e->start = (uintptr_t)addr;
+			e->end = (uintptr_t)addr + length;
+			e->region = region;
+			e->used = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_region_registry_mutex);
+}
+
+void
+nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region)
+{
+	if (region == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&g_region_registry_mutex);
+	for (int i = 0; i < NVME_URMA_REGION_REGISTRY_SIZE; i++) {
+		struct nvme_urma_region_entry *e = &g_region_registry[i];
+
+		if (e->used && e->region == region) {
+			e->used = false;
+			e->region = NULL;
+		}
+	}
+	pthread_mutex_unlock(&g_region_registry_mutex);
+}
+
+struct spdk_nvme_urma_memory_region *
+nvme_urma_region_registry_find(void *urma_context, uint64_t addr, size_t length)
+{
+	struct spdk_nvme_urma_memory_region *found = NULL;
+
+	pthread_mutex_lock(&g_region_registry_mutex);
+	for (int i = 0; i < NVME_URMA_REGION_REGISTRY_SIZE; i++) {
+		struct nvme_urma_region_entry *e = &g_region_registry[i];
+
+		if (e->used && e->context == urma_context &&
+		    addr >= e->start && addr + length <= e->end) {
+			found = e->region;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_region_registry_mutex);
+	return found;
+}
+
 int
 spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 				  enum spdk_nvme_urma_memory_type type,
@@ -320,6 +394,8 @@ spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 	if (region == NULL) {
 		return;
 	}
+	/* Modified By Yida(v7): 整池 region 注销时同步移出注册表，防悬垂采纳 */
+	nvme_urma_region_registry_remove(region);
 	if (region->target_seg != NULL) {
 		urma_unregister_seg(region->target_seg);
 	}

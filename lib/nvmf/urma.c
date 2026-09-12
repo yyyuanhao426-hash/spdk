@@ -24,6 +24,22 @@
 
 /* Modified By Yida: Target-side memory registration cache */
 #define NVMF_URMA_REG_CACHE_SIZE 128
+
+/* Modified By Yida(v7): 远端段 import 缓存。capsule 每条 I/O 携带 initiator 的
+ * 内存段描述 (urma_seg_t)，同一段反复 import/unimport 是纯开销：按 seg 字节
+ * 缓存 import 结果（urma_target_seg_t），命中则本 I/O 完全不调 import，release
+ * 也不 unimport。配合 initiator 整池注册（spdk_nvme_urma_register_memory_for_qpair
+ * + urma_perf URMA_PERF_REGION_REG=1），capsule 每条 I/O 携带同一全区 seg →
+ * 每 qpair 只剩 1 条 import，所有 I/O 共享同一 UMMU 映射。
+ * 约束：initiator 在 qpair 存活期间不得 unregister 已出现过的 (va,len)——v6 起
+ * reg cache(128 槽) ≥ 工作集，稳态成立。SPDK_URMA_IMPORT_CACHE=0 可关闭。 */
+#define NVMF_URMA_IMPORT_CACHE_SIZE 128
+
+struct nvmf_urma_import_entry {
+	urma_seg_t seg;
+	urma_target_seg_t *tseg;
+	bool used;
+};
 /* Modified By Yida(v4): max capsules parsed per poll round. Bounded so JFC
  * completions for in-flight data still get polled promptly on bursts. */
 #define NVMF_URMA_CAPSULE_BATCH 64
@@ -45,8 +61,9 @@ struct nvmf_urma_tgt_timing {
 	uint64_t capsule_n;
 	uint64_t buffer_ticks;   /* W4b: capsule parsed -> buffers ready */
 	uint64_t buffer_n;
-	uint64_t import_ticks;   /* W5: urma_import_seg (every I/O) */
+	uint64_t import_ticks;   /* W5: urma_import_seg (cache miss only) */
 	uint64_t import_n;
+	uint64_t import_hits;    /* Modified By Yida(v7): W5 import 缓存命中数 */
 	uint64_t reg_ticks;      /* W6: register_memory (cache miss only) */
 	uint64_t reg_misses;
 	uint64_t reg_hits;
@@ -156,6 +173,8 @@ nvmf_urma_timing_dump(void)
 	printf("  W5 import_seg:       %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
 	       imp, imp_n, imp_n ? imp / imp_n * 1000000000ULL / hz : 0,
 	       imp * 1000 / hz);
+	printf("  W5 cache_hit:        n=%lu, miss=%lu\n",
+	       __atomic_load_n(&g_tgt_timing.import_hits, __ATOMIC_RELAXED), imp_n);
 	printf("  W6 register (miss):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
 	       reg, miss, miss ? reg / miss * 1000000000ULL / hz : 0,
 	       reg * 1000 / hz);
@@ -275,6 +294,8 @@ struct nvmf_urma_req {
 	union nvmf_c2h_msg rsp;
 	struct spdk_urma_data_desc remote_data;
 	urma_target_seg_t *remote_seg;
+	/* Modified By Yida(v7): remote_seg 保活于 qpair import_cache——release 不得 unimport */
+	bool remote_seg_cached;
 	struct spdk_nvme_urma_memory_region *local_region;
 	/* Modified By Yida: cache entry when local_region is cached (NULL if uncached) */
 	struct nvmf_urma_reg_entry *cache_entry; /* NULL if uncached */
@@ -308,6 +329,8 @@ struct nvmf_urma_qpair {
 	uint64_t pending_peek_tick;
 	/* Modified By Yida: target-side registration cache */
 	struct nvmf_urma_reg_entry reg_cache[NVMF_URMA_REG_CACHE_SIZE];
+	/* Modified By Yida(v7): 远端段 import 缓存（见 NVMF_URMA_IMPORT_CACHE_SIZE 注释） */
+	struct nvmf_urma_import_entry import_cache[NVMF_URMA_IMPORT_CACHE_SIZE];
 	TAILQ_HEAD(, nvmf_urma_req) free_reqs;
 	TAILQ_HEAD(, nvmf_urma_req) working_reqs;
 	TAILQ_ENTRY(nvmf_urma_qpair) link;
@@ -896,11 +919,28 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	if (ureq->req.iovcnt != 1) {
 		return -ENOTSUP;
 	}
-	import_flag.bs.cacheable = URMA_NON_CACHEABLE;
+	import_flag.bs.cacheable = URMA_CACHEABLE;
 	import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
 	import_flag.bs.mapping = URMA_SEG_NOMAP;
-	{
-		/* Modified By Yida(v3): W5 — urma_import_seg (every I/O) */
+	/* Modified By Yida(v7): W5 — 远端段 import 缓存：seg 相同的 I/O 复用已
+	 * import 的 tseg，只有首次见到的 seg 才真正调 urma_import_seg。
+	 * initiator 整池注册时所有 I/O 共享同一 seg → 每 qpair 仅 1 次 import。 */
+	ureq->remote_seg_cached = false;
+	if (nvmf_urma_import_cache_enabled()) {
+		for (int i = 0; i < NVMF_URMA_IMPORT_CACHE_SIZE; i++) {
+			struct nvmf_urma_import_entry *e = &uqpair->import_cache[i];
+
+			if (e->used && memcmp(&e->seg, &ureq->remote_data.seg,
+					      sizeof(urma_seg_t)) == 0) {
+				ureq->remote_seg = e->tseg;
+				ureq->remote_seg_cached = true;
+				NVMF_URMA_TGT_INC(import_hits);
+				break;
+			}
+		}
+	}
+	if (ureq->remote_seg == NULL) {
+		/* Modified By Yida(v3): W5 — urma_import_seg (cache miss only) */
 		uint64_t t_import0 = spdk_get_ticks();
 
 		ureq->remote_seg = urma_import_seg(device->context, &ureq->remote_data.seg,
@@ -909,6 +949,18 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 			return -EIO;
 		}
 		NVMF_URMA_TGT_STAGE(import, spdk_get_ticks() - t_import0);
+		/* 缓存满（>128 个不同 seg）时该 I/O 走旧路径：release 时 unimport */
+		for (int i = 0; i < NVMF_URMA_IMPORT_CACHE_SIZE; i++) {
+			struct nvmf_urma_import_entry *e = &uqpair->import_cache[i];
+
+			if (!e->used) {
+				e->seg = ureq->remote_data.seg;
+				e->tseg = ureq->remote_seg;
+				e->used = true;
+				ureq->remote_seg_cached = true;
+				break;
+			}
+		}
 	}
 	/* Modified By Yida: check target-side registration cache before registering */
 	ureq->cache_entry = NULL;
@@ -1179,10 +1231,12 @@ nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 	}
 	ureq->local_region = NULL;
 	ureq->cache_entry = NULL;
-	if (ureq->remote_seg != NULL) {
+	/* Modified By Yida(v7): import 缓存保活的段留在缓存里，不 unimport */
+	if (ureq->remote_seg != NULL && !ureq->remote_seg_cached) {
 		urma_unimport_seg(ureq->remote_seg);
-		ureq->remote_seg = NULL;
 	}
+	ureq->remote_seg = NULL;
+	ureq->remote_seg_cached = false;
 	/* Modified By Yida(v3): release — unregister (uncached) + urma_unimport_seg */
 	NVMF_URMA_TGT_STAGE(release, spdk_get_ticks() - t_rel0);
 	if (ureq->req.data_from_pool) {
@@ -1256,6 +1310,15 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 			spdk_nvme_urma_unregister_memory(e->region);
 			e->used = false;
 			e->region = NULL;
+		}
+	}
+	/* Modified By Yida(v7): 释放 import 缓存里保活的远端段 */
+	for (int i = 0; i < NVMF_URMA_IMPORT_CACHE_SIZE; i++) {
+		struct nvmf_urma_import_entry *e = &uqpair->import_cache[i];
+		if (e->used) {
+			urma_unimport_seg(e->tseg);
+			e->used = false;
+			e->tseg = NULL;
 		}
 	}
 	spdk_urma_device_close(uqpair->device);
