@@ -135,8 +135,13 @@ spdk_nvme_urma_dump_timing(void)
 	nvme_urma_timing_dump();
 }
 
-/* Modified By Yida: Memory registration cache (Initiator 侧) */
-#define NVME_URMA_REG_CACHE_SIZE 64
+/* Modified By Yida: Memory registration cache (Initiator 侧)
+ * Modified By Yida(v6): 64 → 128。缓存只进不出、填满即冻结：urma_perf 的
+ * preflight 缓冲先连先占 1 槽，-b 64 时 64 个任务地址只剩 63 个空位，
+ * 每 qpair 恒有 1 个地址永久入不了缓存 → 每轮一遍 ~100ms UMMU 注册税
+ * （实测 6 盘 4MB 只剩 6 GiB/s）。128 与 target 侧 NVMF_URMA_REG_CACHE_SIZE
+ * 对齐，覆盖 b=64 + preflight 的完整工作集。 */
+#define NVME_URMA_REG_CACHE_SIZE 128
 
 struct nvme_urma_reg_entry {
 	void *va;
