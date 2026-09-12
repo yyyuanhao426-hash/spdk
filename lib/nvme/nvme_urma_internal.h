@@ -101,4 +101,14 @@ void spdk_urma_device_close(struct spdk_urma_device *device);
 urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 	struct spdk_nvme_urma_memory_region *region);
 
+/* Modified By Yida(v7): 整池注册表（实现见 nvme_urma_common.c）。仅由应用侧
+ * spdk_nvme_urma_register_memory_for_qpair 填充；I/O 提交路径用 find() 采纳
+ * 覆盖本 I/O 缓冲的 region，跳过 per-I/O register，capsule 携带全区 seg，
+ * 对端可整池 import 一次。按 urma_context 键控（每 qpair 独立 device/context）。 */
+void nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
+				   struct spdk_nvme_urma_memory_region *region);
+void nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region);
+struct spdk_nvme_urma_memory_region *
+nvme_urma_region_registry_find(void *urma_context, uint64_t addr, size_t length);
+
 #endif /* SPDK_NVME_URMA_INTERNAL_H */
