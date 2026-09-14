@@ -72,7 +72,7 @@ spdk_urma_parse_mode(const char *value)
 	return URMA_TM_RM;
 }
 
-static uint32_t
+uint32_t
 spdk_urma_env_u32(const char *name, uint32_t default_value)
 {
 	const char *value = getenv(name);

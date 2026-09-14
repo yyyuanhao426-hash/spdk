@@ -444,7 +444,10 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 
 	jfs.depth = device->opts.jetty_depth;
 	jfs.trans_mode = device->opts.transport_mode;
-	jfs.priority = SPDK_URMA_DEFAULT_PRIORITY;
+	/* Modified By Yida(v7): priority 可 env 覆盖——liburma 提示 CTP 建议 6，
+	 * SPDK 默认 15（裸工具未设置），用于判别引擎按 priority 调度的差异 */
+	jfs.priority = spdk_urma_env_u32("SPDK_URMA_JETTY_PRIORITY",
+					 SPDK_URMA_DEFAULT_PRIORITY);
 	jfs.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
 	jfs.rnr_retry = SPDK_URMA_DEFAULT_RNR_RETRY;
 	jfs.err_timeout = SPDK_URMA_DEFAULT_ERR_TIMEOUT;
