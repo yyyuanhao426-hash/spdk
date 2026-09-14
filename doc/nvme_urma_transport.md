@@ -8,7 +8,7 @@
 
 ## 当前分支实现快照
 
-当前 `urma_enable` 分支已经提供第一版可联调代码，而不是仅有接口占位：
+当前分支已经提供可联调代码，而不是仅有接口占位：
 
 - SPDK initiator 与 NVMf target 均注册独立的 `URMA` transport，没有调用 NVMe/RDMA transport。
 - TCP socket 当前只承担 endpoint 描述符、NVMe command capsule 和 completion 的控制面交换；有数据的 command 使用 URMA READ/WRITE 搬运 payload。
@@ -16,7 +16,7 @@
 - 增加 HOST、CUDA、ROCm、NPU 和 XDS memory provider 抽象。HOST 可直接注册；异构内存由外部 provider 负责 pin/unpin 和可选 DMA-BUF 导出，再由公共层完成 URMA segment 注册。
 - SPDK 增加 `build/examples/urma_perf`，可用 CUDA 显存直接连接 SPDK target，并统计正确性、时延、IOPS 与带宽；UMDK 源码不修改。
 
-本快照属于端到端 MVP：仅支持单个连续 SGL、每个 qpair 一个 Jetty、最大 I/O 默认 128 KiB，尚未实现注册缓存、重连、超时恢复、多 SGL、协议 golden test 和完整性能调优。当前 UMDK 的 DMA-BUF 接口仍可能返回不支持，此时会回退到该分支已有的 `is_gpu_seg` peer-memory 注册路径；是否为真正零 HOST staging 必须在目标硬件上验证。
+当前仍仅支持单个连续 SGL、每个 qpair 一个 Jetty、最大 I/O 默认 128 KiB。target 已实现共享 context 的 worker/JFC 池、HOST hugepage 预注册、远端 segment import 缓存、批量 WR 与软件流控；重连、超时恢复、多 SGL 和协议 golden test 仍未完成。当前 UMDK 的 DMA-BUF 接口仍可能返回不支持，此时会回退到该分支已有的 `is_gpu_seg` peer-memory 注册路径；是否为真正零 HOST staging 必须在目标硬件上验证。
 
 ### 编译开关
 
@@ -41,13 +41,15 @@ SPDK 使用以下环境变量；为便于与 Mooncake 联调，四个 Mooncake �
 | `SPDK_URMA_BONDING_MULTIPATH_ENABLE` | `MC_URMA_BONDING_MULTIPATH_ENABLE` | `false` |
 | `SPDK_URMA_DEV_NAME` | 无 | 第一个匹配设备 |
 | `SPDK_URMA_EID_INDEX` | 无 | `0`，不存在时使用首个 EID |
-| `SPDK_URMA_JFC_COUNT` | 无 | `2` |
+| `SPDK_URMA_JFC_COUNT` | `MC_NUM_CQ_PER_CTX` | `2` |
 | `SPDK_URMA_JFC_DEPTH` | 无 | `4096` |
 | `SPDK_URMA_JETTY_COUNT` | 无 | `1` |
-| `SPDK_URMA_JETTY_DEPTH` | 无 | `2048` |
+| `SPDK_URMA_JETTY_DEPTH` | `MC_MAX_WR` | `2048` |
 | `SPDK_URMA_MAX_IO_SIZE` | 无 | `131072` |
+| `SPDK_URMA_WORKERS_PER_CTX` | `MC_WORKERS_PER_CTX` | `2`，最大 `8`，并受 JFC 数量限制 |
+| `SPDK_URMA_BATCH_SIZE` | 无 | `32`，不超过 transport queue depth |
 
-NVMf target 的 transport-specific JSON 还可覆盖 `dev_name`、`trans_mode`、`active_port`、`eid_index`、`jfc_count`、`jfc_depth`、`jetty_count`、`jetty_depth`、`bonding_balance` 和 `bonding_multipath`。
+NVMf target 的 transport-specific JSON 还可覆盖 `dev_name`、`trans_mode`、`active_port`、`eid_index`、`jfc_count`、`jfc_depth`、`jetty_count`、`jetty_depth`、`bonding_balance`、`bonding_multipath`、`worker_count` 和 `batch_size`。所有 worker 共享一个长期存活的 URMA context；每个 worker 固定分配一个 JFC/JFR 和一个 SPDK poll group，其 qpair 在对应 reactor 上完成提交和轮询。
 
 ### 最小联调示例
 
@@ -202,7 +204,7 @@ trtype:URMA adrfam:IB traddr:<eid> trsvcid:<service> subnqn:<nqn>
 
 ## 6. URMA 连接模型
 
-每个进程为选定 URMA device 和 EID index 创建一个 URMA context。每个 SPDK poll group 创建或关联 JFC。每个 qpair 持有 send/receive object 和连接状态。第一阶段使用 UDMA provider 支持的 reliable connected mode。
+target 创建一个共享 URMA context，并把每个 worker 的 JFC/JFR 固定映射到 SPDK poll group；initiator 仍为每个 qpair 创建 context。qpair 归属一个 worker，并持有 Jetty 与连接状态。
 
 ### 6.1 连接自举
 
