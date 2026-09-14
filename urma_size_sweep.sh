@@ -15,7 +15,7 @@
 #   SWEEP_ONE_WAY=1 ./urma_size_sweep.sh          # 只测 node3→node2 单向
 #
 # 前提：与 check_urma.sh 相同 —— 两个节点的 urma_perftest 在 PATH 中，
-#       执行机装了 sshpass 且能 root SSH 到两个节点。
+#       执行机对两个节点已配好 SSH 密钥免密登录（本脚本用普通 ssh，不用 sshpass）。
 # =============================================================================
 
 set -u
@@ -32,15 +32,15 @@ URMA_PERF="${URMA_PERF:-urma_perftest}"
 TIMEOUT=60                # 单次 client 超时(秒)；大消息给足余量，健康运行远早于此结束
 SERVER_READY_WAIT=5       # server 就绪等待重试次数(秒)
 SSH_PORT=22
-SSH_USER="root"
-SSH_PASS="${SSH_PASS:-Huawei12#$}"
+SSH_USER="${SSH_USER:-root}"
 LOG_DIR="/tmp/urma_size_sweep_logs"
 ONE_WAY="${SWEEP_ONE_WAY:-0}"
 
 # 历史基线：check_urma.sh 在 node2↔node3, udmac0d1e2, -s 65536 的实测值
 BASELINE_MBPS="${BASELINE_MBPS:-47148}"
-# SPDK v6 对照：9SSD 4MB pull, -b32 -T2, node3 initiator → node2 target
-SPDK_GIBPS="${SPDK_GIBPS:-38.5}"
+# SPDK v6 对照：9SSD 4MB pull 最新实测 43,034 MiB/s ≈ 42.0 GiB/s
+# （T8×b2 最优；T8×b16 41,836 / T8×b8 42,713 / T10×b8 42,485 —— 窗口不敏感）
+SPDK_GIBPS="${SPDK_GIBPS:-42.0}"
 
 RESULT_FILE="/tmp/urma_size_sweep_results_$$"
 
@@ -63,13 +63,13 @@ record() {
     echo "$1|$2|$3" >> "${RESULT_FILE}"
 }
 
-# SSH 远程执行（同 check_urma.sh：sshpass + 关闭 hostkey 检查）
+# SSH 远程执行（密钥免密认证；BatchMode 确保密钥失效时报错而不是卡在密码交互提示）
 ssh_exec() {
     local host="$1"
     local cmd="$2"
     local err_file="/tmp/urma_sweep_ssh_err_$$"
     local output
-    output=$(sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+    output=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
         -p "${SSH_PORT}" "${SSH_USER}@${host}" "${cmd}" 2>"${err_file}")
     local ret=$?
     rm -f "${err_file}"
@@ -88,7 +88,7 @@ ssh_exec_bg() {
 
     local cmd_b64
     cmd_b64=$(printf '%s' "${cmd}" | base64 | tr -d '\n')
-    sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
         -p "${SSH_PORT}" "${SSH_USER}@${host}" "echo '${cmd_b64}' | base64 -d > ${rscript} && chmod +x ${rscript}" 2>"${err_file}"
     local ret1=$?
     if [ $ret1 -ne 0 ]; then
@@ -98,19 +98,12 @@ ssh_exec_bg() {
     fi
 
     local output
-    output=$(sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+    output=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
         -p "${SSH_PORT}" "${SSH_USER}@${host}" "nohup ${rscript} > ${logfile} 2>&1 < /dev/null & echo \$!" 2>"${err_file}")
     local ret2=$?
     rm -f "${err_file}"
     echo "$output"
     return $ret2
-}
-
-check_sshpass() {
-    if ! command -v sshpass >/dev/null 2>&1; then
-        log_fail "sshpass 未安装! 请执行: yum install -y sshpass（或配免密后改用普通 ssh）"
-        exit 1
-    fi
 }
 
 cleanup_node() {
@@ -179,7 +172,7 @@ precheck() {
         if ssh_exec "${ip}" "echo ok" >/dev/null 2>&1; then
             log_ok "${ip}: SSH 可达"
         else
-            log_fail "${ip}: SSH 不可达 (检查网络/sshd/密码)"
+            log_fail "${ip}: SSH 不可达 (检查网络/sshd/密钥认证)"
             exit 1
         fi
     done
@@ -294,7 +287,6 @@ trap trap_cleanup INT TERM
 # ======================== 主流程 ========================
 main() {
     print_intro
-    check_sshpass
     mkdir -p "${LOG_DIR}"
     > "${RESULT_FILE}"
     precheck
