@@ -98,6 +98,8 @@ void spdk_urma_opts_init(struct spdk_urma_transport_opts *opts);
 int spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			  struct spdk_urma_device **device);
 void spdk_urma_device_close(struct spdk_urma_device *device);
+/* Modified By Yida(v7): 去掉 static 供两侧 transport 共用（SPDK_URMA_JETTY_PRIORITY 探针） */
+uint32_t spdk_urma_env_u32(const char *name, uint32_t default_value);
 urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 	struct spdk_nvme_urma_memory_region *region);
 
