@@ -908,6 +908,21 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 	return rc;
 }
 
+/* Modified By Yida(v7): 远端段 import 缓存默认开启；SPDK_URMA_IMPORT_CACHE=0
+ * 恢复 per-I/O import/unimport 旧路径（回归对比用）。 */
+static int
+nvmf_urma_import_cache_enabled(void)
+{
+	static int enabled = -1;
+
+	if (enabled == -1) {
+		const char *v = getenv("SPDK_URMA_IMPORT_CACHE");
+
+		enabled = !(v != NULL && v[0] == '0');
+	}
+	return enabled;
+}
+
 static int
 nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 {
