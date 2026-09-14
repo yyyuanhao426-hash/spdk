@@ -9,6 +9,8 @@
 #include "spdk/thread.h"
 
 DEFINE_STUB(spdk_iobuf_initialize, int, (void), 0);
+DEFINE_STUB(spdk_iobuf_for_each_pool_chunk, int,
+		(spdk_iobuf_for_each_pool_chunk_cb cb_fn, void *cb_arg), 0);
 DEFINE_STUB(spdk_iobuf_register_module, int, (const char *name), 0);
 DEFINE_STUB(spdk_iobuf_unregister_module, int, (const char *name), 0);
 DEFINE_STUB_V(spdk_iobuf_channel_fini, (struct spdk_iobuf_channel *ch));

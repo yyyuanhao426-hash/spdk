@@ -80,12 +80,16 @@ struct spdk_urma_transport_opts {
 	bool bonding_multipath;
 };
 
+struct spdk_urma_shared_context;
+
 struct spdk_urma_device {
 	urma_context_t *context;
+	struct spdk_urma_shared_context *shared_context;
 	urma_device_attr_t attr;
 	urma_eid_t eid;
 	uint32_t eid_index;
 	uint8_t active_port;
+	char dev_name[URMA_MAX_NAME];
 	struct spdk_urma_transport_opts opts;
 	urma_jfc_t **jfcs;
 	uint32_t jfc_count;
@@ -106,7 +110,8 @@ urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 /* Modified By Yida(v7): 整池注册表（实现见 nvme_urma_common.c）。仅由应用侧
  * spdk_nvme_urma_register_memory_for_qpair 填充；I/O 提交路径用 find() 采纳
  * 覆盖本 I/O 缓冲的 region，跳过 per-I/O register，capsule 携带全区 seg，
- * 对端可整池 import 一次。按 urma_context 键控（每 qpair 独立 device/context）。 */
+ * 对端可整池 import 一次。按共享 urma_context 键控；同一 context 上的 qpair
+ * 可以安全复用该 context 已注册的 region。 */
 void nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
 				   struct spdk_nvme_urma_memory_region *region);
 void nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region);

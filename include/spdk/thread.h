@@ -1193,12 +1193,43 @@ int spdk_iobuf_initialize(void);
 typedef void (*spdk_iobuf_finish_cb)(void *cb_arg);
 
 /**
+ * Callback invoked for each contiguous virtual allocation backing the iobuf pools.
+ *
+ * The small pool is reported as one chunk.  The large pool can be reported as multiple
+ * chunks.  The memory remains owned by iobuf and is valid only until spdk_iobuf_finish().
+ *
+ * \param cb_arg Callback argument.
+ * \param base Starting virtual address of the chunk.
+ * \param length Length of the chunk in bytes.
+ * \param numa_id NUMA node containing the chunk, or SPDK_ENV_NUMA_ID_ANY.
+ * \param large True for a large-pool chunk, false for the small pool.
+ *
+ * \return 0 to continue iteration, nonzero to stop and return that value to the caller.
+ */
+typedef int (*spdk_iobuf_for_each_pool_chunk_cb)(void *cb_arg, void *base, size_t length,
+		int32_t numa_id, bool large);
+
+/**
  * Clean up and free iobuf pools.
  *
  * \param cb_fn Callback to be executed once the clean up is completed.
  * \param cb_arg Callback argument.
  */
 void spdk_iobuf_finish(spdk_iobuf_finish_cb cb_fn, void *cb_arg);
+
+/**
+ * Iterate over all allocations backing the initialized iobuf pools.
+ *
+ * The pool layout is immutable between spdk_iobuf_initialize() and spdk_iobuf_finish().
+ * The callback must not retain ownership of or free the reported memory.
+ *
+ * \param cb_fn Callback invoked for every pool chunk.
+ * \param cb_arg Callback argument.
+ *
+ * \return 0 on success, -EINVAL for a NULL callback, -ENODEV if iobuf is not initialized,
+ * or the first nonzero value returned by the callback.
+ */
+int spdk_iobuf_for_each_pool_chunk(spdk_iobuf_for_each_pool_chunk_cb cb_fn, void *cb_arg);
 
 /**
  * Set iobuf options.  These options will be used during `spdk_iobuf_initialize()`.

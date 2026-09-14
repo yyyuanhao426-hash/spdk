@@ -73,6 +73,7 @@
 	spdk_spin_held;
 	spdk_iobuf_initialize;
 	spdk_iobuf_finish;
+	spdk_iobuf_for_each_pool_chunk;
 	spdk_iobuf_set_opts;
 	spdk_iobuf_get_opts;
 	spdk_iobuf_channel_init;

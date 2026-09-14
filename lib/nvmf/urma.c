@@ -51,6 +51,12 @@ struct nvmf_urma_reg_entry {
 	bool used;
 };
 
+struct nvmf_urma_pool_region {
+	uintptr_t start;
+	uintptr_t end;
+	struct spdk_nvme_urma_memory_region *region;
+};
+
 /* Modified By Yida(v3): target-side staged latency instrumentation, mirrors
  * lib/nvme/nvme_urma.c g_timing (tick accumulators + printf dump). Stages:
  * W4a parse capsule / W4b iobuf alloc / W5 import_seg / W6 register_memory /
@@ -67,6 +73,7 @@ struct nvmf_urma_tgt_timing {
 	uint64_t reg_ticks;      /* W6: register_memory (cache miss only) */
 	uint64_t reg_misses;
 	uint64_t reg_hits;
+	uint64_t pool_hits;
 	uint64_t post_ticks;     /* W7: urma_post_jetty_send_wr */
 	uint64_t post_n;
 	uint64_t jfc_ticks;      /* W8: WR posted -> JFC completion (incl. poller latency) */
@@ -137,6 +144,7 @@ nvmf_urma_timing_dump(void)
 	uint64_t reg = __atomic_load_n(&g_tgt_timing.reg_ticks, __ATOMIC_RELAXED);
 	uint64_t miss = __atomic_load_n(&g_tgt_timing.reg_misses, __ATOMIC_RELAXED);
 	uint64_t hit = __atomic_load_n(&g_tgt_timing.reg_hits, __ATOMIC_RELAXED);
+	uint64_t pool_hit = __atomic_load_n(&g_tgt_timing.pool_hits, __ATOMIC_RELAXED);
 	uint64_t post = __atomic_load_n(&g_tgt_timing.post_ticks, __ATOMIC_RELAXED);
 	uint64_t post_n = __atomic_load_n(&g_tgt_timing.post_n, __ATOMIC_RELAXED);
 	uint64_t jfc = __atomic_load_n(&g_tgt_timing.jfc_ticks, __ATOMIC_RELAXED);
@@ -178,7 +186,7 @@ nvmf_urma_timing_dump(void)
 	printf("  W6 register (miss):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
 	       reg, miss, miss ? reg / miss * 1000000000ULL / hz : 0,
 	       reg * 1000 / hz);
-	printf("  W6 cache_hit:        n=%lu, miss=%lu\n", hit, miss);
+	printf("  W6 pool_hit:         n=%lu, cache_hit=%lu, miss=%lu\n", pool_hit, hit, miss);
 	printf("  W7 post WR:          %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
 	       post, post_n, post_n ? post / post_n * 1000000000ULL / hz : 0,
 	       post * 1000 / hz);
@@ -299,6 +307,7 @@ struct nvmf_urma_req {
 	struct spdk_nvme_urma_memory_region *local_region;
 	/* Modified By Yida: cache entry when local_region is cached (NULL if uncached) */
 	struct nvmf_urma_reg_entry *cache_entry; /* NULL if uncached */
+	bool local_region_from_pool;
 	enum nvmf_urma_req_state state;
 	/* Modified By Yida(v3): staged latency instrumentation */
 	uint64_t start_tick;   /* capsule parsed; 0 = not a timed data request */
@@ -354,6 +363,10 @@ struct nvmf_urma_transport {
 	struct spdk_nvmf_transport transport;
 	struct spdk_urma_transport_opts urma_opts;
 	struct spdk_urma_device *device;
+	struct nvmf_urma_pool_region *pool_regions;
+	size_t pool_region_count;
+	size_t pool_region_capacity;
+	uint64_t pool_registered_bytes;
 	struct spdk_poller *accept_poller;
 	/* Modified By Yida(v3): optional periodic staged-latency dump */
 	struct spdk_poller *dump_poller;
@@ -386,6 +399,118 @@ static const struct spdk_json_object_decoder g_urma_opts_decoder[] = {
 	{"bonding_balance", offsetof(struct nvmf_urma_json_opts, bonding_balance), spdk_json_decode_bool, true},
 	{"bonding_multipath", offsetof(struct nvmf_urma_json_opts, bonding_multipath), spdk_json_decode_bool, true},
 };
+
+static void
+nvmf_urma_unregister_iobuf_pool(struct nvmf_urma_transport *transport)
+{
+	for (size_t i = 0; i < transport->pool_region_count; i++) {
+		spdk_nvme_urma_unregister_memory(transport->pool_regions[i].region);
+	}
+	free(transport->pool_regions);
+	transport->pool_regions = NULL;
+	transport->pool_region_count = 0;
+	transport->pool_region_capacity = 0;
+	transport->pool_registered_bytes = 0;
+}
+
+static int
+nvmf_urma_register_iobuf_chunk(void *cb_arg, void *base, size_t length,
+			       int32_t numa_id, bool large)
+{
+	struct nvmf_urma_transport *transport = cb_arg;
+	struct nvmf_urma_pool_region *entry;
+	struct nvmf_urma_pool_region *regions;
+	uintptr_t start = (uintptr_t)base;
+	size_t new_capacity;
+	int rc;
+
+	if (base == NULL || length == 0 || length > UINTPTR_MAX - start) {
+		return -ERANGE;
+	}
+	if (transport->pool_region_count == transport->pool_region_capacity) {
+		new_capacity = transport->pool_region_capacity == 0 ? 16 :
+			       transport->pool_region_capacity * 2;
+		regions = realloc(transport->pool_regions, new_capacity * sizeof(*regions));
+		if (regions == NULL) {
+			return -ENOMEM;
+		}
+		transport->pool_regions = regions;
+		transport->pool_region_capacity = new_capacity;
+	}
+
+	entry = &transport->pool_regions[transport->pool_region_count];
+	rc = spdk_nvme_urma_register_memory(transport->device->context, base, length,
+					    SPDK_NVME_URMA_MEM_HOST, &entry->region);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to register %s iobuf chunk %p/%zu on NUMA node %d: %d\n",
+			    large ? "large" : "small", base, length, numa_id, rc);
+		return rc;
+	}
+	entry->start = start;
+	entry->end = start + length;
+	transport->pool_region_count++;
+	transport->pool_registered_bytes += length;
+	return 0;
+}
+
+static int
+nvmf_urma_pool_region_compare(const void *lhs, const void *rhs)
+{
+	const struct nvmf_urma_pool_region *a = lhs;
+	const struct nvmf_urma_pool_region *b = rhs;
+
+	if (a->start < b->start) {
+		return -1;
+	}
+	return a->start > b->start ? 1 : 0;
+}
+
+static int
+nvmf_urma_register_iobuf_pool(struct nvmf_urma_transport *transport)
+{
+	int rc;
+
+	rc = spdk_iobuf_for_each_pool_chunk(nvmf_urma_register_iobuf_chunk, transport);
+	if (rc != 0) {
+		nvmf_urma_unregister_iobuf_pool(transport);
+		return rc;
+	}
+	qsort(transport->pool_regions, transport->pool_region_count,
+	      sizeof(*transport->pool_regions), nvmf_urma_pool_region_compare);
+	SPDK_NOTICELOG("URMA registered the complete iobuf pool: %zu regions, %.2f MiB, context %p\n",
+		       transport->pool_region_count,
+		       (double)transport->pool_registered_bytes / (1024.0 * 1024.0),
+		       transport->device->context);
+	return 0;
+}
+
+static struct spdk_nvme_urma_memory_region *
+nvmf_urma_find_iobuf_region(struct nvmf_urma_transport *transport, void *base, size_t length)
+{
+	struct nvmf_urma_pool_region *entry;
+	uintptr_t addr = (uintptr_t)base;
+	size_t low = 0;
+	size_t high = transport->pool_region_count;
+
+	while (low < high) {
+		size_t mid = low + (high - low) / 2;
+
+		if (transport->pool_regions[mid].start <= addr) {
+			low = mid + 1;
+		} else {
+			high = mid;
+		}
+	}
+	if (low == 0) {
+		return NULL;
+	}
+
+	entry = &transport->pool_regions[low - 1];
+	if (addr < entry->end && length <= entry->end - addr) {
+		return entry->region;
+	}
+	return NULL;
+}
 
 static inline struct nvmf_urma_qpair *
 nvmf_urma_qpair(struct spdk_nvmf_qpair *qpair)
@@ -684,6 +809,12 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 		free(transport);
 		return NULL;
 	}
+	if (nvmf_urma_register_iobuf_pool(transport) != 0) {
+		SPDK_ERRLOG("urma transport create: registering the complete iobuf pool failed\n");
+		spdk_urma_device_close(transport->device);
+		free(transport);
+		return NULL;
+	}
 	TAILQ_INIT(&transport->ports);
 	TAILQ_INIT(&transport->poll_groups);
 	transport->accept_poller = SPDK_POLLER_REGISTER(nvmf_urma_accept, transport, 1000);
@@ -709,7 +840,7 @@ nvmf_urma_dump_opts(struct spdk_nvmf_transport *base, struct spdk_json_write_ctx
 	const char *mode = transport->urma_opts.transport_mode == URMA_TM_RC ? "RC" :
 			   transport->urma_opts.transport_mode == URMA_TM_UM ? "UM" : "RM";
 
-	spdk_json_write_named_string(w, "dev_name", transport->device->context->dev->name);
+	spdk_json_write_named_string(w, "dev_name", transport->device->dev_name);
 	spdk_json_write_named_string(w, "trans_mode", mode);
 	spdk_json_write_named_int32(w, "active_port", transport->device->active_port);
 	spdk_json_write_named_uint32(w, "jfc_count", transport->device->jfc_count);
@@ -737,6 +868,7 @@ nvmf_urma_destroy(struct spdk_nvmf_transport *base,
 		close(port->fd);
 		free(port);
 	}
+	nvmf_urma_unregister_iobuf_pool(transport);
 	spdk_urma_device_close(transport->device);
 	free(transport);
 	if (cb_fn != NULL) {
@@ -983,41 +1115,53 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 			}
 		}
 	}
-	/* Modified By Yida: check target-side registration cache before registering */
+	/* The transport registers all iobuf allocations once.  This lookup replaces the
+	 * per-address registration cache for the normal target data path. */
 	ureq->cache_entry = NULL;
-	for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
-		struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
-		if (e->used && e->va == ureq->req.iov[0].iov_base && e->len == ureq->req.length) {
-			ureq->local_region = e->region;
-			ureq->cache_entry = e;
-			break;
-		}
-	}
-	if (ureq->cache_entry == NULL) {
-		/* Modified By Yida(v3): W6 — register_memory (cache miss only) */
-		uint64_t t_reg0 = spdk_get_ticks();
-
-		rc = spdk_nvme_urma_register_memory(device->context, ureq->req.iov[0].iov_base,
-				ureq->req.length, SPDK_NVME_URMA_MEM_HOST, &ureq->local_region);
-		if (rc != 0) {
-			return rc;
-		}
-		NVMF_URMA_TGT_ADD(reg_ticks, spdk_get_ticks() - t_reg0);
-		NVMF_URMA_TGT_INC(reg_misses);
-		/* Insert into cache */
+	ureq->local_region_from_pool = false;
+	ureq->local_region = nvmf_urma_find_iobuf_region(uqpair->transport,
+				     ureq->req.iov[0].iov_base, ureq->req.length);
+	if (ureq->local_region != NULL) {
+		ureq->local_region_from_pool = true;
+		NVMF_URMA_TGT_INC(pool_hits);
+	} else {
+		/* Keep the old cache as a fallback for transport-owned or custom buffers. */
 		for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
 			struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
-			if (!e->used) {
-				e->va = ureq->req.iov[0].iov_base;
-				e->len = ureq->req.length;
-				e->region = ureq->local_region;
-				e->used = true;
+
+			if (e->used && e->va == ureq->req.iov[0].iov_base &&
+			    e->len == ureq->req.length) {
+				ureq->local_region = e->region;
 				ureq->cache_entry = e;
 				break;
 			}
 		}
-	} else {
-		NVMF_URMA_TGT_INC(reg_hits);
+		if (ureq->cache_entry == NULL) {
+			uint64_t t_reg0 = spdk_get_ticks();
+
+			rc = spdk_nvme_urma_register_memory(device->context, ureq->req.iov[0].iov_base,
+					ureq->req.length, SPDK_NVME_URMA_MEM_HOST,
+					&ureq->local_region);
+			if (rc != 0) {
+				return rc;
+			}
+			NVMF_URMA_TGT_ADD(reg_ticks, spdk_get_ticks() - t_reg0);
+			NVMF_URMA_TGT_INC(reg_misses);
+			for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
+				struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
+
+				if (!e->used) {
+					e->va = ureq->req.iov[0].iov_base;
+					e->len = ureq->req.length;
+					e->region = ureq->local_region;
+					e->used = true;
+					ureq->cache_entry = e;
+					break;
+				}
+			}
+		} else {
+			NVMF_URMA_TGT_INC(reg_hits);
+		}
 	}
 	local_sge.addr = (uint64_t)ureq->req.iov[0].iov_base;
 	local_sge.len = ureq->req.length;
@@ -1247,11 +1391,13 @@ nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
 	uint64_t t_rel0 = spdk_get_ticks(); /* Modified By Yida(v3): release start */
 	/* Modified By Yida: if local_region was cached, keep it cached for future I/O reuse */
-	if (ureq->local_region != NULL && ureq->cache_entry == NULL) {
+	if (ureq->local_region != NULL && ureq->cache_entry == NULL &&
+	    !ureq->local_region_from_pool) {
 		spdk_nvme_urma_unregister_memory(ureq->local_region);
 	}
 	ureq->local_region = NULL;
 	ureq->cache_entry = NULL;
+	ureq->local_region_from_pool = false;
 	/* Modified By Yida(v7): import 缓存保活的段留在缓存里，不 unimport */
 	if (ureq->remote_seg != NULL && !ureq->remote_seg_cached) {
 		urma_unimport_seg(ureq->remote_seg);

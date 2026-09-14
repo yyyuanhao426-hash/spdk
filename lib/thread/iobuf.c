@@ -55,11 +55,16 @@ struct iobuf_module {
 	TAILQ_ENTRY(iobuf_module)	tailq;
 };
 
+struct iobuf_pool_chunk {
+	void			*base;
+	uint32_t		buf_count;
+};
+
 struct iobuf_node {
 	struct spdk_ring		*small_pool;
 	struct spdk_ring		*large_pool;
 	void				*small_pool_base;
-	void				**large_pool_chunks;
+	struct iobuf_pool_chunk	*large_pool_chunks;
 	uint32_t			large_pool_chunk_count;
 };
 
@@ -134,7 +139,7 @@ iobuf_large_chunks_free(struct iobuf_node *node)
 	}
 
 	for (i = 0; i < node->large_pool_chunk_count; i++) {
-		spdk_free(node->large_pool_chunks[i]);
+		spdk_free(node->large_pool_chunks[i].base);
 	}
 
 	spdk_free(node->large_pool_chunks);
@@ -160,7 +165,8 @@ iobuf_large_chunks_alloc(struct iobuf_node *node, uint32_t numa_id)
 
 	/* Size the chunk table for the worst case: every chunk shrunk to the minimum. */
 	num_chunks = SPDK_CEIL_DIV(opts->large_pool_count, IOBUF_LARGE_POOL_MIN_CHUNK_SIZE);
-	node->large_pool_chunks = spdk_malloc(num_chunks * sizeof(void *), IOBUF_ALIGNMENT,
+	node->large_pool_chunks = spdk_malloc(num_chunks * sizeof(*node->large_pool_chunks),
+					      IOBUF_ALIGNMENT,
 					      NULL, numa_id, SPDK_MALLOC_DMA);
 	if (node->large_pool_chunks == NULL) {
 		SPDK_ERRLOG("Unable to allocate large iobuf chunk table\n");
@@ -187,7 +193,9 @@ iobuf_large_chunks_alloc(struct iobuf_node *node, uint32_t numa_id)
 			return -ENOMEM;
 		}
 
-		node->large_pool_chunks[allocated++] = chunk;
+		node->large_pool_chunks[allocated].base = chunk;
+		node->large_pool_chunks[allocated].buf_count = want;
+		allocated++;
 		node->large_pool_chunk_count = allocated;
 
 		for (j = 0; j < want; j++) {
@@ -358,6 +366,44 @@ spdk_iobuf_finish(spdk_iobuf_finish_cb cb_fn, void *cb_arg)
 	g_iobuf.finish_arg = cb_arg;
 
 	spdk_io_device_unregister(&g_iobuf, iobuf_unregister_cb);
+}
+
+int
+spdk_iobuf_for_each_pool_chunk(spdk_iobuf_for_each_pool_chunk_cb cb_fn, void *cb_arg)
+{
+	struct iobuf_node *node;
+	int32_t i;
+	int rc;
+
+	if (cb_fn == NULL) {
+		return -EINVAL;
+	}
+	if (!g_iobuf_is_initialized) {
+		return -ENODEV;
+	}
+
+	IOBUF_FOREACH_NUMA_ID(i) {
+		node = &g_iobuf.node[i];
+		rc = cb_fn(cb_arg, node->small_pool_base,
+			   (size_t)g_iobuf.opts.small_pool_count * g_iobuf.opts.small_bufsize,
+			   g_iobuf.opts.enable_numa ? i : SPDK_ENV_NUMA_ID_ANY, false);
+		if (rc != 0) {
+			return rc;
+		}
+
+		for (uint32_t j = 0; j < node->large_pool_chunk_count; j++) {
+			struct iobuf_pool_chunk *chunk = &node->large_pool_chunks[j];
+
+			rc = cb_fn(cb_arg, chunk->base,
+				   (size_t)chunk->buf_count * g_iobuf.opts.large_bufsize,
+				   g_iobuf.opts.enable_numa ? i : SPDK_ENV_NUMA_ID_ANY, true);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+	}
+
+	return 0;
 }
 
 int

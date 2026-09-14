@@ -45,6 +45,31 @@ ut_iobuf_foreach_cb(struct spdk_iobuf_channel *ch, struct spdk_iobuf_entry *entr
 	return 0;
 }
 
+struct ut_iobuf_pool_chunks {
+	uint32_t small_chunks;
+	uint32_t large_chunks;
+	size_t small_bytes;
+	size_t large_bytes;
+};
+
+static int
+ut_iobuf_pool_chunk_cb(void *cb_arg, void *base, size_t length, int32_t numa_id, bool large)
+{
+	struct ut_iobuf_pool_chunks *chunks = cb_arg;
+
+	CU_ASSERT_PTR_NOT_NULL(base);
+	CU_ASSERT_NOT_EQUAL(length, 0);
+	CU_ASSERT_EQUAL(numa_id, SPDK_ENV_NUMA_ID_ANY);
+	if (large) {
+		chunks->large_chunks++;
+		chunks->large_bytes += length;
+	} else {
+		chunks->small_chunks++;
+		chunks->small_bytes += length;
+	}
+	return 0;
+}
+
 #define SMALL_BUFSIZE 4096
 #define LARGE_BUFSIZE 8192
 
@@ -58,6 +83,7 @@ iobuf(void)
 		.large_bufsize = LARGE_BUFSIZE,
 	};
 	struct ut_iobuf_entry *entry;
+	struct ut_iobuf_pool_chunks pool_chunks = {};
 	struct spdk_iobuf_channel mod0_ch[2], mod1_ch[2];
 	struct ut_iobuf_entry mod0_entries[] = {
 		{ .thread_id = 0, .module = "ut_module0", },
@@ -91,6 +117,12 @@ iobuf(void)
 	g_iobuf.opts = opts;
 	rc = spdk_iobuf_initialize();
 	CU_ASSERT_EQUAL(rc, 0);
+	rc = spdk_iobuf_for_each_pool_chunk(ut_iobuf_pool_chunk_cb, &pool_chunks);
+	CU_ASSERT_EQUAL(rc, 0);
+	CU_ASSERT_EQUAL(pool_chunks.small_chunks, 1);
+	CU_ASSERT_EQUAL(pool_chunks.large_chunks, 1);
+	CU_ASSERT_EQUAL(pool_chunks.small_bytes, 2 * SMALL_BUFSIZE);
+	CU_ASSERT_EQUAL(pool_chunks.large_bytes, 2 * LARGE_BUFSIZE);
 
 	rc = spdk_iobuf_register_module("ut_module0");
 	CU_ASSERT_EQUAL(rc, 0);

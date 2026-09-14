@@ -197,7 +197,7 @@ spdk_nvme_urma_unregister_memory_provider(enum spdk_nvme_urma_memory_type type)
 /* Modified By Yida(v7): 整池注册表 —— 仅由应用侧 spdk_nvme_urma_register_memory_for_qpair
  * （预注册整块连续缓冲）填充；I/O 提交路径用 find() 采纳覆盖本 I/O 缓冲的 region，
  * 跳过 per-I/O register，capsule 携带全区 seg，对端可整池 import 一次。
- * 按 urma_context 键控：每 qpair 独立 device/context，注册只对同 context 的 I/O 生效。 */
+ * 按 urma_context 键控：共享同一 context 的 qpair 可以复用该 context 已注册的 region。 */
 #define NVME_URMA_REGION_REGISTRY_SIZE 64
 
 struct nvme_urma_region_entry {
@@ -475,17 +475,207 @@ spdk_nvme_urma_reset_memory_stats(void)
 	__atomic_store_n(&g_memory_stats.registration_failures, 0, __ATOMIC_RELAXED);
 }
 
+struct spdk_urma_shared_context {
+	urma_context_t *context;
+	urma_device_attr_t attr;
+	urma_eid_t eid;
+	uint32_t eid_index;
+	uint8_t active_port;
+	int32_t requested_active_port;
+	bool bonding_balance;
+	bool bonding_multipath;
+	char dev_name[URMA_MAX_NAME];
+	uint32_t refcnt;
+	TAILQ_ENTRY(spdk_urma_shared_context) link;
+};
+
+static TAILQ_HEAD(, spdk_urma_shared_context) g_shared_contexts =
+	TAILQ_HEAD_INITIALIZER(g_shared_contexts);
+static pthread_mutex_t g_shared_context_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static bool
+spdk_urma_shared_context_matches(const struct spdk_urma_shared_context *shared,
+				 const struct spdk_urma_transport_opts *opts,
+				 const char *dev_name, uint32_t eid_index)
+{
+	return strcmp(shared->dev_name, dev_name) == 0 && shared->eid_index == eid_index &&
+	       shared->requested_active_port == opts->active_port &&
+	       shared->bonding_balance == opts->bonding_balance &&
+	       shared->bonding_multipath == opts->bonding_multipath;
+}
+
+static int
+spdk_urma_shared_context_get(const struct spdk_urma_transport_opts *opts,
+			     struct spdk_urma_shared_context **shared_out)
+{
+	struct spdk_urma_shared_context *shared;
+	urma_device_t **devices = NULL;
+	urma_device_t *selected = NULL;
+	urma_eid_info_t *eids = NULL;
+	urma_eid_t eid = {};
+	uint32_t eid_index = 0;
+	uint32_t eid_count = 0;
+	bool eid_found = false;
+	int count = 0;
+	int rc = -ENODEV;
+
+	devices = urma_get_device_list(&count);
+	for (int i = 0; devices != NULL && i < count; i++) {
+		if (opts->dev_name[0] == '\0' || strcmp(opts->dev_name, devices[i]->name) == 0) {
+			selected = devices[i];
+			break;
+		}
+	}
+	if (selected == NULL) {
+		SPDK_ERRLOG("urma context acquire: device '%s' not found in device list\n",
+			    opts->dev_name);
+		goto out;
+	}
+
+	eids = urma_get_eid_list(selected, &eid_count);
+	if (eids == NULL || eid_count == 0) {
+		SPDK_ERRLOG("urma context acquire '%s': no eid list\n", selected->name);
+		goto out;
+	}
+	for (uint32_t i = 0; i < eid_count; i++) {
+		if (eids[i].eid_index == opts->eid_index) {
+			eid = eids[i].eid;
+			eid_index = eids[i].eid_index;
+			eid_found = true;
+			break;
+		}
+	}
+	if (!eid_found) {
+		eid = eids[0].eid;
+		eid_index = eids[0].eid_index;
+	}
+
+	pthread_mutex_lock(&g_shared_context_mutex);
+	TAILQ_FOREACH(shared, &g_shared_contexts, link) {
+		if (spdk_urma_shared_context_matches(shared, opts, selected->name, eid_index)) {
+			shared->refcnt++;
+			*shared_out = shared;
+			rc = 0;
+			goto out_unlock;
+		}
+	}
+
+	shared = calloc(1, sizeof(*shared));
+	if (shared == NULL) {
+		rc = -ENOMEM;
+		goto out_unlock;
+	}
+	shared->eid = eid;
+	shared->eid_index = eid_index;
+	shared->requested_active_port = opts->active_port;
+	shared->bonding_balance = opts->bonding_balance;
+	shared->bonding_multipath = opts->bonding_multipath;
+	snprintf(shared->dev_name, sizeof(shared->dev_name), "%s", selected->name);
+
+	shared->context = urma_create_context(selected, eid_index);
+	if (shared->context == NULL || urma_query_device(selected, &shared->attr) != URMA_SUCCESS) {
+		SPDK_ERRLOG("urma context acquire '%s' eid%u: create_context/query failed "
+			    "(~5s delay means driver timeout)\n", selected->name, eid_index);
+		rc = -EIO;
+		goto out_free_shared;
+	}
+
+	if (opts->bonding_balance || opts->bonding_multipath) {
+		bondp_set_bonding_mode_in_t mode = {
+			.bonding_mode = BONDP_BONDING_MODE_BALANCE,
+			.bonding_level = opts->bonding_multipath ?
+					BONDP_BONDING_LEVEL_IODIE : BONDP_BONDING_LEVEL_PORT,
+		};
+		urma_user_ctl_in_t in = {
+			.addr = (uint64_t)&mode,
+			.len = sizeof(mode),
+			.opcode = BONDP_USER_CTL_SET_BONDING_MODE,
+		};
+		urma_user_ctl_out_t out_ctl = {};
+
+		if (urma_user_ctl(shared->context, &in, &out_ctl) != URMA_SUCCESS) {
+			SPDK_ERRLOG("urma context acquire '%s': set bonding mode failed\n",
+				    selected->name);
+			rc = -EIO;
+			goto out_free_shared;
+		}
+	}
+
+	if (opts->active_port >= 0 && opts->active_port < MAX_PORT_CNT) {
+		shared->active_port = opts->active_port;
+	} else {
+		bool found = false;
+
+		for (uint32_t i = 0; i < MAX_PORT_CNT; i++) {
+			if (shared->attr.port_attr[i].state == URMA_PORT_ACTIVE ||
+			    shared->attr.port_attr[i].state == URMA_PORT_ACTIVE_DEFER) {
+				shared->active_port = i;
+				found = true;
+				break;
+			}
+		}
+		if (!found && shared->attr.port_cnt != 0) {
+			SPDK_ERRLOG("urma context acquire '%s': no active port\n", selected->name);
+			rc = -ENETDOWN;
+			goto out_free_shared;
+		}
+	}
+
+	shared->refcnt = 1;
+	TAILQ_INSERT_TAIL(&g_shared_contexts, shared, link);
+	*shared_out = shared;
+	SPDK_NOTICELOG("URMA context %p created for %s eid%u\n", shared->context,
+		       shared->dev_name, shared->eid_index);
+	rc = 0;
+	goto out_unlock;
+
+out_free_shared:
+	if (shared->context != NULL) {
+		urma_delete_context(shared->context);
+	}
+	free(shared);
+out_unlock:
+	pthread_mutex_unlock(&g_shared_context_mutex);
+out:
+	if (eids != NULL) {
+		urma_free_eid_list(eids);
+	}
+	if (devices != NULL) {
+		urma_free_device_list(devices);
+	}
+	return rc;
+}
+
+static void
+spdk_urma_shared_context_put(struct spdk_urma_shared_context *shared)
+{
+	bool destroy = false;
+
+	if (shared == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&g_shared_context_mutex);
+	assert(shared->refcnt > 0);
+	if (--shared->refcnt == 0) {
+		TAILQ_REMOVE(&g_shared_contexts, shared, link);
+		destroy = true;
+	}
+	pthread_mutex_unlock(&g_shared_context_mutex);
+
+	if (destroy) {
+		SPDK_NOTICELOG("URMA context %p released for %s eid%u\n", shared->context,
+			       shared->dev_name, shared->eid_index);
+		urma_delete_context(shared->context);
+		free(shared);
+	}
+}
+
 int
 spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			  struct spdk_urma_device **device_out)
 {
 	struct spdk_urma_device *device;
-	urma_device_t **devices = NULL;
-	urma_device_t *selected = NULL;
-	urma_eid_info_t *eids = NULL;
-	uint32_t eid_count = 0;
-	bool eid_found = false;
-	int count = 0, rc = -ENODEV;
+	int rc = -ENODEV;
 
 	if (opts == NULL || device_out == NULL) {
 		return -EINVAL;
@@ -500,83 +690,17 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		goto fail_runtime;
 	}
 	device->opts = *opts;
-	devices = urma_get_device_list(&count);
-	for (int i = 0; devices != NULL && i < count; i++) {
-		if (opts->dev_name[0] == '\0' || strcmp(opts->dev_name, devices[i]->name) == 0) {
-			selected = devices[i];
-			break;
-		}
-	}
-	if (selected == NULL) {
-		SPDK_ERRLOG("urma device open: device '%s' not found in device list\n",
-			    opts->dev_name);
+	rc = spdk_urma_shared_context_get(opts, &device->shared_context);
+	if (rc != 0) {
 		goto fail;
 	}
-	eids = urma_get_eid_list(selected, &eid_count);
-	if (eids == NULL || eid_count == 0) {
-		SPDK_ERRLOG("urma device open '%s': no eid list\n", selected->name);
-		goto fail;
-	}
-	for (uint32_t i = 0; i < eid_count; i++) {
-		if (eids[i].eid_index == opts->eid_index) {
-			device->eid = eids[i].eid;
-			device->eid_index = eids[i].eid_index;
-			eid_found = true;
-			break;
-		}
-	}
-	if (!eid_found) {
-		device->eid = eids[0].eid;
-		device->eid_index = eids[0].eid_index;
-	}
-	device->context = urma_create_context(selected, device->eid_index);
-	if (device->context == NULL || urma_query_device(selected, &device->attr) != URMA_SUCCESS) {
-		/* Modified By Yida(v6): 原本静默返回——失败后只剩 transport.c 一行兜底，
-		 * 卡 ~5s 才报 = 驱动层超时，这里标出设备名与 eid 便于定位 */
-		SPDK_ERRLOG("urma device open '%s' eid%u: create_context/query failed (~5s delay means driver timeout)\n",
-			    selected->name, (unsigned)device->eid_index);
-		rc = -EIO;
-		goto fail;
-	}
-	/* Modified by Yin: 仅 BALANCE/MULTIPATH 才调 SET_BONDING_MODE，STANDALONE 不调（防 jetty 野指针崩溃） */
-	if (opts->bonding_balance || opts->bonding_multipath) {
-		bondp_set_bonding_mode_in_t mode = {
-			/* Modified by Yin: bonding_mode 直接固定为 BALANCE（与上面守卫一致） */
-			.bonding_mode = BONDP_BONDING_MODE_BALANCE,
-			.bonding_level = opts->bonding_multipath ?
-					BONDP_BONDING_LEVEL_IODIE : BONDP_BONDING_LEVEL_PORT,
-		};
-		urma_user_ctl_in_t in = {
-			.addr = (uint64_t)&mode,
-			.len = sizeof(mode),
-			.opcode = BONDP_USER_CTL_SET_BONDING_MODE,
-		};
-		urma_user_ctl_out_t out = {};
-		if (urma_user_ctl(device->context, &in, &out) != URMA_SUCCESS) {
-			SPDK_ERRLOG("urma device open '%s': set bonding mode failed\n",
-				    selected->name);
-			rc = -EIO;
-			goto fail;
-		}
-	}
-	if (opts->active_port >= 0 && opts->active_port < MAX_PORT_CNT) {
-		device->active_port = opts->active_port;
-	} else {
-		bool found = false;
-		for (uint32_t i = 0; i < MAX_PORT_CNT; i++) {
-			if (device->attr.port_attr[i].state == URMA_PORT_ACTIVE ||
-			    device->attr.port_attr[i].state == URMA_PORT_ACTIVE_DEFER) {
-				device->active_port = i;
-				found = true;
-				break;
-			}
-		}
-		if (!found && device->attr.port_cnt != 0) {
-			SPDK_ERRLOG("urma device open '%s': no active port\n", selected->name);
-			rc = -ENETDOWN;
-			goto fail;
-		}
-	}
+	device->context = device->shared_context->context;
+	device->attr = device->shared_context->attr;
+	device->eid = device->shared_context->eid;
+	device->eid_index = device->shared_context->eid_index;
+	device->active_port = device->shared_context->active_port;
+	snprintf(device->dev_name, sizeof(device->dev_name), "%s",
+		 device->shared_context->dev_name);
 	device->jfc_count = spdk_min(opts->jfc_count,
 				     (uint32_t)device->attr.dev_cap.max_jfc);
 	if (device->jfc_count == 0) {
@@ -585,7 +709,7 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 	device->jfcs = calloc(device->jfc_count, sizeof(*device->jfcs));
 	if (device->jfcs == NULL) {
 		SPDK_ERRLOG("urma device open '%s': alloc jfc table (n=%u) failed\n",
-			    selected->name, device->jfc_count);
+			    device->dev_name, device->jfc_count);
 		rc = -ENOMEM;
 		goto fail;
 	}
@@ -596,7 +720,7 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		device->jfcs[i] = urma_create_jfc(device->context, &cfg);
 		if (device->jfcs[i] == NULL) {
 			SPDK_ERRLOG("urma device open '%s': create jfc %u (depth %u) failed\n",
-				    selected->name, i, cfg.depth);
+				    device->dev_name, i, cfg.depth);
 			rc = -EIO;
 			goto fail;
 		}
@@ -626,7 +750,7 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		device->jfr = urma_create_jfr(device->context, &jfr_cfg);
 		if (device->jfr == NULL) {
 			SPDK_ERRLOG("urma device open '%s': create shared jfr (depth %u) failed\n",
-				    selected->name, jfr_cfg.depth);
+				    device->dev_name, jfr_cfg.depth);
 			rc = -EIO;
 			goto fail;
 		}
@@ -639,29 +763,19 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			.user_ctx_size = sizeof(device),
 		};
 		char id[URMA_MAX_NAME + 32];
-		snprintf(id, sizeof(id), "SPDK_URMA_DMA_DEVICE:%s", selected->name);
+		snprintf(id, sizeof(id), "SPDK_URMA_DMA_DEVICE:%s", device->dev_name);
 		if (spdk_memory_domain_create(&device->memory_domain,
 				SPDK_DMA_DEVICE_VENDOR_SPECIFIC_TYPE_START, &domain_ctx, id) != 0) {
 			SPDK_ERRLOG("urma device open '%s': memory domain create failed\n",
-				    selected->name);
+				    device->dev_name);
 			rc = -ENOMEM;
 			goto fail;
 		}
 	}
-	if (eids != NULL) {
-		urma_free_eid_list(eids);
-	}
-	urma_free_device_list(devices);
 	*device_out = device;
 	return 0;
 
 fail:
-	if (eids != NULL) {
-		urma_free_eid_list(eids);
-	}
-	if (devices != NULL) {
-		urma_free_device_list(devices);
-	}
 	spdk_urma_device_close(device);
 	return rc;
 fail_runtime:
@@ -689,9 +803,8 @@ spdk_urma_device_close(struct spdk_urma_device *device)
 	if (device->memory_domain != NULL) {
 		spdk_memory_domain_destroy(device->memory_domain);
 	}
-	if (device->context != NULL) {
-		urma_delete_context(device->context);
-	}
+	spdk_urma_shared_context_put(device->shared_context);
+	device->context = NULL;
 	free(device);
 	spdk_urma_runtime_put();
 }
