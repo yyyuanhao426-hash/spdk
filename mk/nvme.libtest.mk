@@ -8,7 +8,9 @@ NVME_DIR := $(SPDK_ROOT_DIR)/lib/nvme
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 
-C_SRCS := $(APP:%=%.c)
+# Extra per-app sources: apps set C_SRCS-y before including this file
+# (empty for all existing single-file examples, so behaviour is unchanged).
+C_SRCS := $(APP:%=%.c) $(C_SRCS-y)
 
 SPDK_LIB_LIST += $(SOCK_MODULES_LIST) nvme
 ifeq ($(CONFIG_VMD),y)

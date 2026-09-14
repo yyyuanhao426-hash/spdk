@@ -18,6 +18,8 @@
 #include <dlfcn.h>
 #include <strings.h>
 
+#include "urma_perf_npu.h"
+
 #define URMA_PERF_DEFAULT_IO_SIZE 4096
 #define URMA_PERF_DEFAULT_BATCH_SIZE 16
 #define URMA_PERF_DEFAULT_RUN_TIME 10
@@ -126,6 +128,9 @@ static struct spdk_nvme_transport_id g_trid;
 static struct spdk_nvme_ctrlr *g_ctrlr;
 static struct spdk_nvme_ns *g_ns;
 static struct spdk_memory_domain *g_cuda_domain;
+/* Modified By NDS: NPU memory domain — id "npu:spdk-urma-perf" so
+ * nvme_urma_req_memory_type() maps it to SPDK_NVME_URMA_MEM_NPU. */
+static struct spdk_memory_domain *g_npu_domain;
 static struct worker *g_workers;
 static bool g_provider_registered;
 static uint32_t g_num_workers = 1;
@@ -152,6 +157,11 @@ enum urma_perf_mem_type {
 	URMA_PERF_MEM_PEERMEM,
 	URMA_PERF_MEM_POSIX,
 	URMA_PERF_MEM_CPU,
+	/* Modified By NDS: NPU routes — npu mirrors peermem (HBM registered
+	 * whole via the peer-memory path, needs the Phase 2 kernel NPU bridge),
+	 * npu-staged mirrors posix (HBM -> host staging copy per I/O). */
+	URMA_PERF_MEM_NPU,
+	URMA_PERF_MEM_NPU_STAGED,
 };
 
 static enum urma_perf_mem_type g_mem_type;
@@ -416,6 +426,63 @@ cuda_provider_for_mode(void)
 	       &g_cuda_provider_dmabuf;
 }
 
+/* Modified By NDS: device-agnostic wrappers so the staged copy path and
+ * preflight verification work for both CUDA and NPU HBM without duplicating
+ * the surrounding control flow. */
+static bool
+using_npu(void)
+{
+	return g_mem_type == URMA_PERF_MEM_NPU || g_mem_type == URMA_PERF_MEM_NPU_STAGED;
+}
+
+static int
+dev_thread_bind(void)
+{
+	CUresult result;
+
+	if (using_npu()) {
+		return npu_worker_thread_bind();
+	}
+	result = g_cuda.ctx_set_current(g_cuda.context);
+	if (result != URMA_PERF_CUDA_SUCCESS) {
+		cuda_print_error("cuCtxSetCurrent", result);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int
+dev_memcpy_h2d(void *dst, const void *src, size_t size)
+{
+	CUresult result;
+
+	if (using_npu()) {
+		return npu_memcpy_h2d(dst, src, size);
+	}
+	result = g_cuda.memcpy_h2d((CUdeviceptr)(uintptr_t)dst, src, size);
+	if (result != URMA_PERF_CUDA_SUCCESS) {
+		cuda_print_error("cuMemcpyHtoD", result);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int
+dev_memcpy_d2h(void *dst, const void *src, size_t size)
+{
+	CUresult result;
+
+	if (using_npu()) {
+		return npu_memcpy_d2h(dst, src, size);
+	}
+	result = g_cuda.memcpy_d2h(dst, (CUdeviceptr)(uintptr_t)src, size);
+	if (result != URMA_PERF_CUDA_SUCCESS) {
+		cuda_print_error("cuMemcpyDtoH", result);
+		return -EIO;
+	}
+	return 0;
+}
+
 static bool
 probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 struct spdk_nvme_ctrlr_opts *opts)
@@ -456,26 +523,27 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 /* Modified By Yida: posix(新语义) 的分级拷贝 —— write 在提交前 HBM→host，
  * read 在完成后 host→HBM。同步 cuMemcpy；耗时**不计入** NVMe 延迟，单独
- * 累计到 worker->copy_ticks，结果里单独打印，端到端成本 = 延迟 + 拷贝。 */
+ * 累计到 worker->copy_ticks，结果里单独打印，端到端成本 = 延迟 + 拷贝。
+ * Modified By NDS: npu-staged 路线同样走这里，拷贝经 dev_memcpy_* 分流到
+ * AscendCL（aclrtMemcpy）。 */
 static int
 staged_copy(struct worker *worker, struct io_task *task, bool to_host)
 {
 	size_t offset = (uintptr_t)task->buf - (uintptr_t)worker->allocation.addr;
-	CUdeviceptr gpu = (CUdeviceptr)((uintptr_t)worker->gpu_alloc.addr + offset);
-	CUresult result;
+	void *dev = (void *)((uintptr_t)worker->gpu_alloc.addr + offset);
 	uint64_t start;
+	int rc;
 
-	if (g_mem_type != URMA_PERF_MEM_POSIX) {
+	if (g_mem_type != URMA_PERF_MEM_POSIX && g_mem_type != URMA_PERF_MEM_NPU_STAGED) {
 		return 0;
 	}
 	start = spdk_get_ticks();
 	if (to_host) {
-		result = g_cuda.memcpy_d2h(task->buf, gpu, g_io_size);
+		rc = dev_memcpy_d2h(task->buf, dev, g_io_size);
 	} else {
-		result = g_cuda.memcpy_h2d(gpu, task->buf, g_io_size);
+		rc = dev_memcpy_h2d(dev, task->buf, g_io_size);
 	}
-	if (result != URMA_PERF_CUDA_SUCCESS) {
-		cuda_print_error(to_host ? "cuMemcpyDtoH" : "cuMemcpyHtoD", result);
+	if (rc != 0) {
 		return -EIO;
 	}
 	worker->copy_ticks += spdk_get_ticks() - start;
@@ -597,15 +665,15 @@ out:
 
 /* Modified By Yida: posix(新语义) 的预检 —— 数据"产自" HBM：expected 先 HtoD 进
  * 影子缓冲；write 由 submit_io 内部的 DtoH 搬到 host 暂存缓冲再发；read 完成后
- * io_complete 已把数据 host→HBM，最后 DtoH 拉回 CPU 比对，覆盖完整分级路径。 */
+ * io_complete 已把数据 host→HBM，最后 DtoH 拉回 CPU 比对，覆盖完整分级路径。
+ * Modified By NDS: npu-staged 复用本函数，拷贝经 dev_memcpy_* 分流到 AscendCL。 */
 static int
 verify_staged_to_ssd_path(struct worker *worker)
 {
 	struct io_task *task = &worker->tasks[0];
 	uint8_t *expected;
 	uint8_t *actual;
-	CUdeviceptr gpu0 = (CUdeviceptr)(uintptr_t)worker->gpu_alloc.addr;
-	CUresult result;
+	void *dev0 = worker->gpu_alloc.addr;
 	int rc = -EIO;
 	uint32_t i;
 
@@ -617,14 +685,10 @@ verify_staged_to_ssd_path(struct worker *worker)
 	for (i = 0; i < g_io_size; i++) {
 		expected[i] = (uint8_t)(i * 131U + 17U);
 	}
-	result = g_cuda.ctx_set_current(g_cuda.context);
-	if (result != URMA_PERF_CUDA_SUCCESS) {
-		cuda_print_error("cuCtxSetCurrent", result);
+	if (dev_thread_bind() != 0) {
 		goto out;
 	}
-	result = g_cuda.memcpy_h2d(gpu0, expected, g_io_size);
-	if (result != URMA_PERF_CUDA_SUCCESS) {
-		cuda_print_error("cuMemcpyHtoD", result);
+	if (dev_memcpy_h2d(dev0, expected, g_io_size) != 0) {
 		goto out;
 	}
 	if (submit_io(worker, task, true, worker->range_start_lba) != 0 ||
@@ -637,17 +701,15 @@ verify_staged_to_ssd_path(struct worker *worker)
 		fprintf(stderr, "Verification READ failed\n");
 		goto out;
 	}
-	result = g_cuda.memcpy_d2h(actual, gpu0, g_io_size);
-	if (result != URMA_PERF_CUDA_SUCCESS) {
-		cuda_print_error("cuMemcpyDtoH", result);
+	if (dev_memcpy_d2h(actual, dev0, g_io_size) != 0) {
 		goto out;
 	}
 	if (memcmp(expected, actual, g_io_size) != 0) {
 		fprintf(stderr, "Verification failed: SSD data does not match the staged pattern\n");
 		goto out;
 	}
-	printf("Preflight staged GPU->host WRITE + READ verification passed at LBA %" PRIu64 "\n",
-	       worker->range_start_lba);
+	printf("Preflight staged %s->host WRITE + READ verification passed at LBA %" PRIu64 "\n",
+	       using_npu() ? "NPU" : "GPU", worker->range_start_lba);
 	rc = 0;
 out:
 	free(expected);
@@ -661,14 +723,13 @@ verify_gpu_to_ssd_path(struct worker *worker)
 	struct io_task *task = &worker->tasks[0];
 	uint8_t *expected;
 	uint8_t *actual;
-	CUresult result;
 	int rc = -EIO;
 	uint32_t i;
 
 	if (g_mem_type == URMA_PERF_MEM_CPU) {
 		return verify_cpu_to_ssd_path(worker);
 	}
-	if (g_mem_type == URMA_PERF_MEM_POSIX) {
+	if (g_mem_type == URMA_PERF_MEM_POSIX || g_mem_type == URMA_PERF_MEM_NPU_STAGED) {
 		return verify_staged_to_ssd_path(worker);
 	}
 	expected = malloc(g_io_size);
@@ -679,14 +740,10 @@ verify_gpu_to_ssd_path(struct worker *worker)
 	for (i = 0; i < g_io_size; i++) {
 		expected[i] = (uint8_t)(i * 131U + 17U);
 	}
-	result = g_cuda.ctx_set_current(g_cuda.context);
-	if (result != URMA_PERF_CUDA_SUCCESS) {
-		cuda_print_error("cuCtxSetCurrent", result);
+	if (dev_thread_bind() != 0) {
 		goto out;
 	}
-	result = g_cuda.memcpy_h2d((CUdeviceptr)(uintptr_t)task->buf, expected, g_io_size);
-	if (result != URMA_PERF_CUDA_SUCCESS) {
-		cuda_print_error("cuMemcpyHtoD", result);
+	if (dev_memcpy_h2d(task->buf, expected, g_io_size) != 0) {
 		goto out;
 	}
 	if (submit_io(worker, task, true, worker->range_start_lba) != 0 ||
@@ -694,9 +751,7 @@ verify_gpu_to_ssd_path(struct worker *worker)
 		fprintf(stderr, "Verification WRITE failed\n");
 		goto out;
 	}
-	result = g_cuda.memcpy_h2d((CUdeviceptr)(uintptr_t)task->buf, actual, g_io_size);
-	if (result != URMA_PERF_CUDA_SUCCESS) {
-		cuda_print_error("cuMemcpyHtoD(clear)", result);
+	if (dev_memcpy_h2d(task->buf, actual, g_io_size) != 0) {
 		goto out;
 	}
 	if (submit_io(worker, task, false, worker->range_start_lba) != 0 ||
@@ -704,17 +759,16 @@ verify_gpu_to_ssd_path(struct worker *worker)
 		fprintf(stderr, "Verification READ failed\n");
 		goto out;
 	}
-	result = g_cuda.memcpy_d2h(actual, (CUdeviceptr)(uintptr_t)task->buf, g_io_size);
-	if (result != URMA_PERF_CUDA_SUCCESS) {
-		cuda_print_error("cuMemcpyDtoH", result);
+	if (dev_memcpy_d2h(actual, task->buf, g_io_size) != 0) {
 		goto out;
 	}
 	if (memcmp(expected, actual, g_io_size) != 0) {
-		fprintf(stderr, "Verification failed: SSD data does not match the GPU pattern\n");
+		fprintf(stderr, "Verification failed: SSD data does not match the %s pattern\n",
+			using_npu() ? "NPU" : "GPU");
 		goto out;
 	}
-	printf("Preflight GPU WRITE + READ verification passed at LBA %" PRIu64 "\n",
-	       worker->range_start_lba);
+	printf("Preflight %s WRITE + READ verification passed at LBA %" PRIu64 "\n",
+	       using_npu() ? "NPU" : "GPU", worker->range_start_lba);
 	rc = 0;
 out:
 	free(expected);
@@ -743,12 +797,10 @@ work_fn(void *arg)
 	uint32_t i;
 
 	/* Modified By Yida: posix(新语义) 的 worker 线程做 cuMemcpy，先把 CUDA
-	 * context 设为当前线程的（多线程共享同一 context，driver 内部串行化） */
-	if (g_mem_type == URMA_PERF_MEM_POSIX) {
-		CUresult result = g_cuda.ctx_set_current(g_cuda.context);
-
-		if (result != URMA_PERF_CUDA_SUCCESS) {
-			cuda_print_error("cuCtxSetCurrent(worker)", result);
+	 * context 设为当前线程的（多线程共享同一 context，driver 内部串行化）。
+	 * Modified By NDS: npu-staged 同样需要线程绑定（AscendCL 等价路径）。 */
+	if (g_mem_type == URMA_PERF_MEM_POSIX || g_mem_type == URMA_PERF_MEM_NPU_STAGED) {
+		if (dev_thread_bind() != 0) {
 			atomic_store_explicit(&g_failed, true, memory_order_release);
 		}
 	}
@@ -763,10 +815,12 @@ work_fn(void *arg)
 	}
 	/* Modified By Yida(v7): URMA_PERF_REGION_REG=1 且 cpu/posix 路线时，把每
 	 * worker 的整块连续 allocation 一次性注册进本 qpair 的 URMA context；
+	 * Modified By NDS: npu-staged 的 host 暂存缓冲同样适用。
 	 * 提交路径按覆盖关系自动采纳 → 跳过 per-I/O register，capsule 携带全区
 	 * seg，target 每连接只 import 一次。注册失败降级为 per-I/O 路线并告警。 */
 	if (worker->qpair != NULL &&
-	    (g_mem_type == URMA_PERF_MEM_CPU || g_mem_type == URMA_PERF_MEM_POSIX) &&
+	    (g_mem_type == URMA_PERF_MEM_CPU || g_mem_type == URMA_PERF_MEM_POSIX ||
+	     g_mem_type == URMA_PERF_MEM_NPU_STAGED) &&
 	    getenv("URMA_PERF_REGION_REG") != NULL) {
 		int rrc = spdk_nvme_urma_register_memory_for_qpair(worker->qpair,
 				worker->allocation.addr, worker->allocation.alloc_size,
@@ -906,14 +960,19 @@ print_results(void)
 	spdk_nvme_urma_get_memory_stats(&memory_stats);
 
 	/* Modified By Yida: 结果头部标明内存路线，便于对比 posix / cpu / peermem / dmabuf。
-	 * posix(新语义) = staged：数据在 HBM，每 I/O cuMemcpy 到 host 暂存缓冲再注册传输 */
+	 * posix(新语义) = staged：数据在 HBM，每 I/O cuMemcpy 到 host 暂存缓冲再注册传输。
+	 * Modified By NDS: npu / npu-staged 同样标明。 */
 	printf("\nNVMe/URMA %s -> remote SSD result\n",
 	       g_mem_type == URMA_PERF_MEM_CPU ? "host" :
-	       g_mem_type == URMA_PERF_MEM_POSIX ? "staged GPU->host" : "GPU");
+	       g_mem_type == URMA_PERF_MEM_POSIX ? "staged GPU->host" :
+	       g_mem_type == URMA_PERF_MEM_NPU_STAGED ? "staged NPU->host" :
+	       g_mem_type == URMA_PERF_MEM_NPU ? "NPU" : "GPU");
 	printf("mem_type=%s\n",
 	       g_mem_type == URMA_PERF_MEM_CPU ? "cpu" :
 	       g_mem_type == URMA_PERF_MEM_POSIX ? "posix" :
-	       g_mem_type == URMA_PERF_MEM_PEERMEM ? "peermem" : "dmabuf");
+	       g_mem_type == URMA_PERF_MEM_PEERMEM ? "peermem" :
+	       g_mem_type == URMA_PERF_MEM_NPU ? "npu" :
+	       g_mem_type == URMA_PERF_MEM_NPU_STAGED ? "npu-staged" : "dmabuf");
 	printf("operation=%s io_size=%u threads=%u batch_size=%u elapsed=%.6f s\n",
 	       g_read_workload ? "read" : "write", g_io_size, g_num_workers,
 	       g_batch_size, seconds);
@@ -930,8 +989,9 @@ print_results(void)
 	}
 	/* Modified By Yida: posix(新语义) 单独打印分级拷贝成本——它不计入上面的
 	 * NVMe 延迟，端到端 posix 成本 = 延迟 + 拷贝（写方向 HBM→host 在提交前，
-	 * 读方向 host→HBM 在完成后） */
-	if (g_mem_type == URMA_PERF_MEM_POSIX && total_copy_ios != 0) {
+	 * 读方向 host→HBM 在完成后）。Modified By NDS: npu-staged 同样适用。 */
+	if ((g_mem_type == URMA_PERF_MEM_POSIX || g_mem_type == URMA_PERF_MEM_NPU_STAGED) &&
+	    total_copy_ios != 0) {
 		printf("staged_copy %s n=%" PRIu64 " avg_us=%.3f total_ms=%.3f\n",
 		       g_read_workload ? "HtoD(host->HBM, post-read)" : "DtoH(HBM->host, pre-write)",
 		       total_copy_ios,
@@ -974,17 +1034,21 @@ usage(const char *program)
 	printf("  -t, --time <seconds>    measurement time (default: %u)\n",
 	       URMA_PERF_DEFAULT_RUN_TIME);
 	printf("  -n, --nsid <id>         namespace ID (default: 1)\n");
-	printf("  -g, --gpu <id>          CUDA GPU ordinal (default: 0)\n");
+	printf("  -g, --gpu <id>          CUDA GPU / NPU device ordinal (default: 0; NPU routes use it as the AscendCL device id)\n");
 	printf("  -l, --start-lba <lba>   first destructive test LBA (default: 0)\n");
 	printf("  -m, --core-mask <mask>  SPDK core mask; default selects the first T cores\n");
 	/* Modified By Yida: mem-type 四选一（-m 已被 core-mask 占用，故用 -M） */
-	printf("  -M, --mem-type <type>   posix, cpu, peermem or dmabuf (default: dmabuf)\n");
+	printf("  -M, --mem-type <type>   posix, cpu, peermem, dmabuf, npu or npu-staged (default: dmabuf)\n");
 	printf("                          posix:   staged path, data in HBM copied to a host\n");
 	printf("                                   staging buffer per I/O (HBM->host->NIC);\n");
 	printf("                                   copy time printed separately\n");
 	printf("                          cpu:     plain host memory, no CUDA (old posix)\n");
 	printf("                          peermem: GPU memory via nvidia_p2p peer-memory path\n");
 	printf("                          dmabuf:  GPU memory via CUDA dmabuf export\n");
+	printf("                          npu:     NPU HBM via URMA peer-memory path (needs the\n");
+	printf("                                   Phase 2 kernel NPU bridge; AscendCL runtime)\n");
+	printf("                          npu-staged: staged path with NPU HBM shadow buffer\n");
+	printf("                                   (HBM->host->NIC via aclrtMemcpy)\n");
 	printf("      --require-dmabuf    fail if any timed GPU registration uses peer-memory fallback\n");
 	printf("  -h, --help              show this help\n");
 }
@@ -1077,7 +1141,8 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			break;
 		case 'M':
 			/* Modified By Yida: 内存路线四选一（cpu = 原 posix 行为；
-			 * posix 改为 HBM→host 暂存的分级路线） */
+			 * posix 改为 HBM→host 暂存的分级路线）。
+			 * Modified By NDS: 新增 npu / npu-staged 两条 NPU 路线。 */
 			if (strcasecmp(optarg, "posix") == 0) {
 				g_mem_type = URMA_PERF_MEM_POSIX;
 			} else if (strcasecmp(optarg, "cpu") == 0) {
@@ -1086,8 +1151,12 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 				g_mem_type = URMA_PERF_MEM_PEERMEM;
 			} else if (strcasecmp(optarg, "dmabuf") == 0) {
 				g_mem_type = URMA_PERF_MEM_DMABUF;
+			} else if (strcasecmp(optarg, "npu") == 0) {
+				g_mem_type = URMA_PERF_MEM_NPU;
+			} else if (strcasecmp(optarg, "npu-staged") == 0) {
+				g_mem_type = URMA_PERF_MEM_NPU_STAGED;
 			} else {
-				fprintf(stderr, "Unknown mem type \"%s\" (expected posix, cpu, peermem or dmabuf)\n",
+				fprintf(stderr, "Unknown mem type \"%s\" (expected posix, cpu, peermem, dmabuf, npu or npu-staged)\n",
 					optarg);
 				return -EINVAL;
 			}
@@ -1184,7 +1253,9 @@ prepare_workers(void)
 		/* Modified By Yida: cpu（原 posix）模式用 host 大页内存（4K 对齐，满足
 		 * UMMU Table mode 的注册对齐要求），完全不碰 CUDA；
 		 * posix(新语义) host 暂存缓冲同样 4K 对齐注册，另加 cuMemAlloc 的
-		 * HBM 影子缓冲做分级拷贝；peermem/dmabuf 照旧整个缓冲就是 GPU 内存。 */
+		 * HBM 影子缓冲做分级拷贝；peermem/dmabuf 照旧整个缓冲就是 GPU 内存。
+		 * Modified By NDS: npu 整块缓冲就是 NPU HBM（aclrtMalloc）；npu-staged
+		 * 与 posix 同构——host 暂存 + NPU HBM 影子缓冲。 */
 		if (g_mem_type == URMA_PERF_MEM_CPU) {
 			worker->allocation.dmabuf_fd = -1;
 			worker->allocation.used_size = (size_t)g_io_size * g_batch_size;
@@ -1207,6 +1278,34 @@ prepare_workers(void)
 					      (size_t)g_io_size * g_batch_size) != 0) {
 				return -ENOMEM;
 			}
+		} else if (g_mem_type == URMA_PERF_MEM_NPU) {
+			struct npu_allocation npu;
+
+			if (npu_alloc_buffer(&npu, (size_t)g_io_size * g_batch_size) != 0) {
+				return -ENOMEM;
+			}
+			worker->allocation.addr = npu.addr;
+			worker->allocation.used_size = npu.used_size;
+			worker->allocation.alloc_size = npu.alloc_size;
+			worker->allocation.dmabuf_fd = -1;
+		} else if (g_mem_type == URMA_PERF_MEM_NPU_STAGED) {
+			struct npu_allocation npu;
+
+			worker->allocation.dmabuf_fd = -1;
+			worker->allocation.used_size = (size_t)g_io_size * g_batch_size;
+			worker->allocation.alloc_size = (size_t)g_io_size * g_batch_size;
+			worker->allocation.addr = spdk_dma_zmalloc(worker->allocation.alloc_size,
+						   4096, NULL);
+			if (worker->allocation.addr == NULL) {
+				return -ENOMEM;
+			}
+			if (npu_alloc_buffer(&npu, (size_t)g_io_size * g_batch_size) != 0) {
+				return -ENOMEM;
+			}
+			worker->gpu_alloc.addr = npu.addr;
+			worker->gpu_alloc.used_size = npu.used_size;
+			worker->gpu_alloc.alloc_size = npu.alloc_size;
+			worker->gpu_alloc.dmabuf_fd = -1;
 		} else if (cuda_alloc_buffer(&worker->allocation,
 					     (size_t)g_io_size * g_batch_size) != 0) {
 			return -ENOMEM;
@@ -1221,25 +1320,44 @@ prepare_workers(void)
 
 	/* Modified By Yida: cpu / posix(新语义) 注册的都是 host 缓冲 —— 不建 cuda
 	 * memory domain 也不注册 provider，tasks 的 io_opts.memory_domain 保持 NULL
-	 * → 传输层 nvme_urma_req_memory_type() 返回 MEM_HOST，走普通 host 注册路线。 */
-	if (g_mem_type == URMA_PERF_MEM_CPU || g_mem_type == URMA_PERF_MEM_POSIX) {
+	 * → 传输层 nvme_urma_req_memory_type() 返回 MEM_HOST，走普通 host 注册路线。
+	 * Modified By NDS: npu/npu-staged（非 host 缓冲直传的 npu）走 NPU domain
+	 * + NPU provider；npu-staged 的 I/O 缓冲是 host 暂存，同样不建 domain。 */
+	if (g_mem_type == URMA_PERF_MEM_CPU || g_mem_type == URMA_PERF_MEM_POSIX ||
+	    g_mem_type == URMA_PERF_MEM_NPU_STAGED) {
 		return 0;
 	}
 	domain_ctx.size = sizeof(domain_ctx);
-	domain_ctx.user_ctx = &g_cuda;
-	/* Modified by Yin: user_ctx_size 应为整个 struct 大小，而非指针大小 */
-	domain_ctx.user_ctx_size = sizeof(g_cuda);
-	rc = spdk_memory_domain_create(&g_cuda_domain, SPDK_DMA_DEVICE_VENDOR_SPECIFIC_TYPE_START,
-				       &domain_ctx, "cuda:spdk-urma-perf");
+	if (using_npu()) {
+		/* Modified By NDS: id 必须含 "npu"/"ascend" 才会被
+		 * nvme_urma_req_memory_type() 识别为 SPDK_NVME_URMA_MEM_NPU。 */
+		domain_ctx.user_ctx = NULL;
+		domain_ctx.user_ctx_size = 0;
+		rc = spdk_memory_domain_create(&g_npu_domain,
+					       SPDK_DMA_DEVICE_VENDOR_SPECIFIC_TYPE_START,
+					       &domain_ctx, "npu:spdk-urma-perf");
+	} else {
+		domain_ctx.user_ctx = &g_cuda;
+		/* Modified by Yin: user_ctx_size 应为整个 struct 大小，而非指针大小 */
+		domain_ctx.user_ctx_size = sizeof(g_cuda);
+		rc = spdk_memory_domain_create(&g_cuda_domain,
+					       SPDK_DMA_DEVICE_VENDOR_SPECIFIC_TYPE_START,
+					       &domain_ctx, "cuda:spdk-urma-perf");
+	}
 	if (rc != 0) {
 		return rc;
 	}
 	for (i = 0; i < g_num_workers; i++) {
 		for (j = 0; j < g_batch_size; j++) {
-			g_workers[i].tasks[j].io_opts.memory_domain = g_cuda_domain;
+			g_workers[i].tasks[j].io_opts.memory_domain =
+				using_npu() ? g_npu_domain : g_cuda_domain;
 		}
 	}
-	rc = spdk_nvme_urma_register_memory_provider(cuda_provider_for_mode());
+	if (using_npu()) {
+		rc = npu_provider_register();
+	} else {
+		rc = spdk_nvme_urma_register_memory_provider(cuda_provider_for_mode());
+	}
 	if (rc == 0) {
 		g_provider_registered = true;
 	}
@@ -1252,8 +1370,17 @@ cleanup_workers(void)
 	uint32_t i;
 
 	if (g_provider_registered) {
-		spdk_nvme_urma_unregister_memory_provider(SPDK_NVME_URMA_MEM_CUDA);
+		/* Modified By NDS: provider 类型随内存路线分流 */
+		if (using_npu()) {
+			npu_provider_unregister();
+		} else {
+			spdk_nvme_urma_unregister_memory_provider(SPDK_NVME_URMA_MEM_CUDA);
+		}
 		g_provider_registered = false;
+	}
+	if (g_npu_domain != NULL) {
+		spdk_memory_domain_destroy(g_npu_domain);
+		g_npu_domain = NULL;
 	}
 	if (g_cuda_domain != NULL) {
 		spdk_memory_domain_destroy(g_cuda_domain);
@@ -1264,12 +1391,19 @@ cleanup_workers(void)
 	}
 	for (i = 0; i < g_num_workers; i++) {
 		/* Modified By Yida: cpu/posix 的 host 缓冲是 spdk_dma 分配的；
-		 * posix 另有 HBM 影子缓冲；peermem/dmabuf 整个缓冲是 GPU 内存 */
+		 * posix 另有 HBM 影子缓冲；peermem/dmabuf 整个缓冲是 GPU 内存。
+		 * Modified By NDS: npu 整块是 NPU HBM；npu-staged = host 暂存 +
+		 * NPU HBM 影子缓冲。 */
 		if (g_mem_type == URMA_PERF_MEM_CPU) {
 			spdk_dma_free(g_workers[i].allocation.addr);
 		} else if (g_mem_type == URMA_PERF_MEM_POSIX) {
 			spdk_dma_free(g_workers[i].allocation.addr);
 			cuda_free_buffer(&g_workers[i].gpu_alloc);
+		} else if (g_mem_type == URMA_PERF_MEM_NPU) {
+			npu_free_buffer(g_workers[i].allocation.addr);
+		} else if (g_mem_type == URMA_PERF_MEM_NPU_STAGED) {
+			spdk_dma_free(g_workers[i].allocation.addr);
+			npu_free_buffer(g_workers[i].gpu_alloc.addr);
 		} else {
 			cuda_free_buffer(&g_workers[i].allocation);
 		}
@@ -1331,8 +1465,14 @@ main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 	/* Modified By Yida: cpu 模式完全不初始化 CUDA（无 GPU 的机器也能跑普通路径）；
-	 * posix(新语义) 要做 cuMemcpy，同样需要初始化 */
-	if (g_mem_type != URMA_PERF_MEM_CPU && cuda_driver_init(g_gpu_id) != 0) {
+	 * posix(新语义) 要做 cuMemcpy，同样需要初始化。
+	 * Modified By NDS: npu/npu-staged 改初始化 AscendCL（CANN 运行时）。 */
+	if (using_npu()) {
+		if (npu_driver_init((int32_t)g_gpu_id) != 0) {
+			rc = EXIT_FAILURE;
+			goto out_env;
+		}
+	} else if (g_mem_type != URMA_PERF_MEM_CPU && cuda_driver_init(g_gpu_id) != 0) {
 		rc = EXIT_FAILURE;
 		goto out_env;
 	}
@@ -1369,7 +1509,10 @@ out_ctrlr:
 		spdk_nvme_detach_poll(detach_ctx);
 	}
 out_cuda:
-	if (g_mem_type != URMA_PERF_MEM_CPU) {
+	/* Modified By NDS: NPU 路线释放 AscendCL，CUDA 路线照旧 */
+	if (using_npu()) {
+		npu_driver_fini();
+	} else if (g_mem_type != URMA_PERF_MEM_CPU) {
 		cuda_driver_fini();
 	}
 out_env:
