@@ -13,6 +13,7 @@
 #   NODES="node2=141.61.84.245 node3=141.61.84.149" ./urma_numa_check.sh
 #   NODES="141.61.84.245 141.61.84.149" ./urma_numa_check.sh   # 名字取自对端 hostname
 #   SEEDS="ip1 ip2" ./urma_numa_check.sh                # 自动发现的种子 IP
+#   URMA_DEV=udmacXXXXX ./urma_numa_check.sh            # SPDK_URMA_DEV_NAME 对应的设备名
 #   SSH_PORT=2222 SSH_USER=root ./urma_numa_check.sh
 # 前提：执行机对各节点已配好 SSH 密钥免密登录（不用 sshpass）。
 # =============================================================================
@@ -22,6 +23,7 @@ set -u
 # ======================== 配置区 ========================
 SEEDS="${SEEDS:-141.61.84.245 141.61.84.247 141.61.84.149 141.61.84.151}"
 NODES="${NODES:-}"                                   # 留空 = 自动发现
+URMA_DEV="${URMA_DEV:-udmac0d1e2}"                   # SPDK_URMA_DEV_NAME，换设备名就覆盖
 SSH_PORT="${SSH_PORT:-22}"
 SSH_USER="${SSH_USER:-root}"
 TIMEOUT="${TIMEOUT:-180}"                            # 单台收集超时(秒)
@@ -118,18 +120,23 @@ node_diag() {
 
     echo ""
     echo "#### [2] 设备 → NUMA + PCIe 链路 (NIC / NVMe / urma|udma|ubc 驱动)"
-    local pd cls drv numa keep lcp spd wdt
+    local pd cls drv numa keep lcp spd wdt lnk
     for pd in /sys/bus/pci/devices/*; do
         [ -d "$pd" ] || continue
         cls=$(cat "$pd/class" 2>/dev/null); drv="-"
         [ -e "$pd/driver" ] && drv=$(basename "$(readlink -f "$pd/driver")")
         numa=$(cat "$pd/numa_node" 2>/dev/null)
         keep=""
-        case "$drv" in *urma*|*udma*|*ubc*|*hinic*|*mlx5*) keep="y" ;; esac
+        case "$drv" in *urma*|*udma*|*ubc*|*cdma*|*unic*|*hinic*|*mlx5*) keep="y" ;; esac
         case "$cls" in 0x02*|0x0108*) keep="y" ;; esac
         [ -n "$keep" ] || continue
         lcp=$(cat "$pd/local_cpulist" 2>/dev/null)
         spd=$(cat "$pd/current_speed" 2>/dev/null); wdt=$(cat "$pd/current_width" 2>/dev/null)
+        if [ -z "$spd" ] && command -v lspci >/dev/null 2>&1; then
+            lnk=$(lspci -vvv -s "$(basename "$pd")" 2>/dev/null \
+                | awk '/LnkSta:/{if(match($0,/Speed [^ ,]*/))s=substr($0,RSTART+6,RLENGTH-6); if(match($0,/Width [^ ,]*/))w=substr($0,RSTART+6,RLENGTH-6); print s"+"w; exit}')
+            case "$lnk" in "+"|"") : ;; *) spd="${lnk%+*}"; wdt="${lnk#*+}" ;; esac
+        fi
         printf "  %-13s numa=%-3s drv=%-12s cls=%-8s link=%-9s cpus=%s\n" "$(basename "$pd")" "$numa" "$drv" "$cls" "${spd:-?}x${wdt:-?}" "$lcp"
         echo "@DEV|$(basename "$pd")|numa=${numa}|drv=${drv}|cls=${cls}|speed=${spd:-?}|width=${wdt:-?}|cpus=${lcp}"
     done | sort
@@ -148,14 +155,41 @@ node_diag() {
     done
 
     echo ""
-    echo "#### [4] URMA 栈 (设备节点 / 模块版本 —— 四台对齐用)"
+    echo "#### [4] URMA 栈 (逻辑设备真身 / 模块指纹 —— 四台对齐用)"
+    local bdf c dd tgt p2 d2
     ls -l /dev/udmac* 2>/dev/null | sed 's/^/  /' | head -20
     ls /dev 2>/dev/null | grep -iE 'urma|udma' | sort -u | sed 's/^/  dev: /' | head -20
-    for m in ubcore uburma udma hinic3 mlx5_core; do
+    # URMA/UB 逻辑设备 → 物理设备反查（sysfs class 里 udmac/urma/ub/cdma 类）
+    for c in /sys/class/*; do
+        case "$(basename "$c")" in *urma*|*udma*|*ubc*|*cdma*|*unic*|*ub_*) ;; *) continue ;; esac
+        for dd in "$c"/*; do
+            [ -e "$dd" ] || continue
+            tgt=$(readlink -f "$dd" 2>/dev/null)
+            case "$tgt" in */devices/*) ;; *) continue ;; esac
+            p2="$(dirname "$tgt")"
+            d2="-"; [ -e "$p2/driver" ] && d2=$(basename "$(readlink -f "$p2/driver")")
+            echo "  ${dd##*/} → $(basename "$p2") drv=${d2} numa=$(cat "$p2/numa_node" 2>/dev/null)"
+        done
+    done | head -30
+    # SPDK_URMA_DEV_NAME → 按 BDF 直查（udmac0d1e2 → 0000:0d:1e.2）
+    bdf=$(printf '%s' "${URMA_DEV}" | sed -n 's/^udmac\([0-9a-fA-F][0-9a-fA-F]\)\([0-9a-fA-F][0-9a-fA-F]\)\([0-9a-fA-F]\)$/0000:\1:\2.\3/p')
+    if [ -n "$bdf" ] && [ -d "/sys/bus/pci/devices/$bdf" ]; then
+        d2="-"; [ -e "/sys/bus/pci/devices/$bdf/driver" ] && d2=$(basename "$(readlink -f "/sys/bus/pci/devices/$bdf/driver")")
+        echo "  ${URMA_DEV} → ${bdf}: drv=${d2} numa=$(cat "/sys/bus/pci/devices/$bdf/numa_node" 2>/dev/null) cls=$(cat "/sys/bus/pci/devices/$bdf/class" 2>/dev/null)"
+    elif [ -n "$bdf" ]; then
+        echo "  ${URMA_DEV} → 猜测 BDF ${bdf} 不在 PCI 树上（名字不编码 BDF，或该机没这设备）"
+    fi
+    # 华为系 (19e5) PCI 设备全清单带内核驱动 —— UDMAC/CDMA 卡在这里现形
+    command -v lspci >/dev/null 2>&1 && lspci -nnk -d '19e5:' 2>/dev/null \
+        | grep -vE '^Subsystem|^Control:|^Region|^Capabilities|^Kernel modules' | sed 's/^/  /' | head -40
+    # 模块指纹：版本号 + .ko md5（判断四台是不是同一份二进制）
+    for m in ubcore uburma udma ubase cdma unic hinic3 mlx5_core; do
         v=""
         [ -r "/sys/module/$m/version" ] && v=$(cat "/sys/module/$m/version" 2>/dev/null)
-        if [ -z "$v" ] && command -v modinfo >/dev/null 2>&1; then v=$(modinfo -F version "$m" 2>/dev/null); fi
-        [ -n "$v" ] && echo "  $m: $v"
+        f=$(modinfo -n "$m" 2>/dev/null)
+        h=""
+        [ -n "$f" ] && [ -r "$f" ] && h=$(md5sum "$f" 2>/dev/null | cut -c1-8)
+        echo "  $m: ver=${v:-?} ko_md5=${h:-?}"
     done
 
     echo ""
@@ -167,7 +201,7 @@ node_diag() {
 
     echo ""
     echo "#### [6] 线索"
-    lsmod 2>/dev/null | grep -iE 'urma|udma' | head -8
+    lsmod 2>/dev/null | grep -iE 'urma|udma|ub|cdma|unic|ummu|obmm|cis|fwctl|hinic|mlx5|metax|nvidia|nvme' | head -15
     dmesg 2>/dev/null | grep -iE 'hugepage|alloc.*fail|out of memory' | tail -3
 }
 
@@ -230,7 +264,7 @@ getf() {  # $1=a=1|b=2 形式串  $2=字段名 → 值
 }
 
 dev_kind() {  # $1=drv $2=cls
-    case "$1" in *urma*|*udma*|*ubc*) echo "URMA"; return ;; esac
+    case "$1" in *urma*|*udma*|*ubc*|*cdma*|*unic*) echo "URMA"; return ;; esac
     case "$2" in
         0x02*)   echo "NIC" ;;
         0x0108*) echo "NVMe" ;;
