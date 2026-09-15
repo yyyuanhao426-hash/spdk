@@ -1,9 +1,11 @@
 # NOF/URMA GPU 存储性能测试
 
-基于 SPDK fork（urma_modified_v3 分支）的 URMA 传输 + GPU 显存路线验证：把远端 NVMe
+基于 SPDK fork（urma_modified_v6/v7 分支）的 URMA 传输 + GPU 显存路线验证：把远端 NVMe
 经 NOF/URMA 暴露给 GPU 节点，用 urma_perf 对比不同内存路线（GDR 直达 vs 分级拷贝 vs 纯
-CPU）的带宽/延迟，并用两侧分阶段打点定位瓶颈。部署与操作细节见 docs/spdk_urma_deploment.md
-（不在本仓库内），本文件只收录这个域的语言。
+CPU）的带宽/延迟，并用两侧分阶段打点定位瓶颈。另一条工作线在 149/247（node3↔node2，
+hinic3 网卡）上做 cpu 路线的吞吐差距定位：SPDK 栈带宽追不上裸工具，本文件同样收录这条
+线沉淀的语言。部署与操作细节见 docs/spdk_urma_deploment.md（不在本仓库内），本文件只收
+录这个域的语言。
 
 ## Language
 
@@ -32,6 +34,11 @@ _Avoid_: 脏盘、遗留设备
 **URMA 设备名**:
 两端必须显式统一（`SPDK_URMA_DEV_NAME`，如 udmac0d1e2）的 URMA 设备标识；重启后枚举可能重排。
 _Avoid_: 网卡名、dev 名
+
+**NUMA 错位（NUMA mismatch）**:
+进程的核与内存在一个 NUMA node、而它驱动的 DMA 设备或盘在另一个 node 的部署形状（本机跨
+socket distance 20）；如 target 上 reactor 核与大页在 node0、控制网卡与半数 SSD 在 node2。
+_Avoid_: 跨路访问、绑错核
 
 ### 内存路线（urma_perf 的 `-M`，四选一）
 
@@ -96,6 +103,16 @@ _Avoid_: 队列深度（那是单连接的配置上限，不是实际在网数�
 聚合带宽 ~10.7 GiB/s 上限的来源；加大 I/O 是摊薄它的唯一杠杆，加盘/加连接无效。
 _Avoid_: RTT（往返是端到端延迟、含排队，别与固定开销混用）
 
+**供给速率（supply rate）**:
+稳态下闭环管道持续吐数的速率 R：平均端到端时延 T = 在飞窗口 × I/O 大小 ÷ R。加大在飞
+只等比放大排队（W8 占比上升），R 不变；它是墙的数值本体。
+_Avoid_: 服务率、IOPS 上限
+
+**墙（wall）**:
+加大在飞窗口也抬不高的带宽平台期；target 侧表现为 W8（pull 排队）占比 90% 以上、逐
+I/O 延迟随窗口线性膨胀，其高度由供给速率决定。
+_Avoid_: 瓶颈、极限（该词有三种含义：调参到头 / 栈的物理极限 / 线速，混用必歧义）
+
 ### 计时打点
 
 **轮（round）**:
@@ -122,3 +139,13 @@ _Avoid_: 自检、验证（太泛）
 **对比三线**:
 同参数跑 `cpu` / `posix` / `peermem` 各一次的标准实验组：三者之差分别隔离出"GPU 参与 +
 拷贝"与"拷贝本身"的开销。
+
+**裸工具（bare tool）**:
+不经 SPDK/NVMe 栈、直接把 urma_perftest（write_bw/read_bw）打在 URMA 数据管道上的测量方式。
+_Avoid_: 裸测
+
+**裸锚点（bare anchor）**:
+同链路、同消息尺寸下裸工具的带宽读数，是该硬件链路可达上限的参照（400G 线速 ≈ 46.5
+GiB/s，64KB 裸值已到其 99.6%）；解释 SPDK 带宽时唯一的对照物——"48 GiB/s"目标超线速、
+永不成立。
+_Avoid_: 基线（urma_size_sweep 的 BASELINE_MBPS 只是 64KB 裸锚点这一特例）
