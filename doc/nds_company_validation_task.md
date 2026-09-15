@@ -267,6 +267,75 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 10. 外部 AI 指令区
 
+### 回执导入 2026-09-15 #2（批次 1 结果，用户带回）
+
+**197 体检七项全绿**：A 4× Ascend950PR（128GB HBM/卡）；B CANN 系统级安装
+（多版本并存）；C 10+ udmac 设备（拓扑成立）；**D 内核存在 vdavinci_pin_pages /
+vdavinci_unpin_pages / hw_vdavinci_pin_page_range（drv_vascend 模块）——Phase 2
+内核桥接可行性确认**；E CANN 有 aclrtMemExportToShareableHandle 等导出接口
+（是否等价 dma-buf fd 待查证）；F openEuler SP4 aarch64，与 151 延迟 0.3ms。
+
+**编译失败根因**：197 系统 liburma/头文件是标准版，缺 gds 扩展
+（urma_seg_cfg_t.is_gpu_seg / urma_register_seg_dmabuf）→ make 失败。
+197 可直接 GitHub clone（无 CRLF 问题）；245 的 gds 版 UMDK 树
+（/home/yin/gdr/UMDK_netlab）含所需扩展。
+
+**决策**：编译/测试全部改在 197 进行，245 退出（CRLF 问题不再处理）；
+gds UMDK 从 245 拷贝到 197 自家目录隔离使用（不动系统库）。
+
+### 指令 2026-09-15 #4：解锁批次 2（在 197 搭建 gds 编译环境）
+
+前置：批次 1 已确认。本批全部在 **197** 上操作，遵守 0.5 节隔离守则。
+245 上的 CRLF 修复任务作废。
+
+**2a. 从 245 拷贝 gds 版 UMDK 树到自家目录（只读 245）：**
+
+```bash
+# 在 197 上执行（若 197 与 245 ssh 不通，改由用户中转拷贝）
+mkdir -p /home/l00955908/nds
+scp -r /home/yin/gdr/UMDK_netlab /home/l00955908/nds/UMDK_netlab
+```
+
+**2b. 验证拷贝物含 gds 扩展（只读）：**
+
+```bash
+# 头文件应有 is_gpu_seg 字段
+timeout 30 find /home/l00955908/nds/UMDK_netlab -name "urma_api.h" | head -3
+grep -rn "is_gpu_seg" /home/l00955908/nds/UMDK_netlab/src/urma/lib/urma/core/include/ | head -5
+# 库应有 urma_register_seg_dmabuf 导出
+nm -D /home/l00955908/nds/UMDK_netlab/lib/liburma.so | grep -E "register_seg"
+```
+
+**2c. 重新 configure + make（197 上 GitHub clone 的 spdk 目录）：**
+
+```bash
+cd /home/l00955908/nds/spdk   # 或实际 clone 目录
+git log --oneline -3           # 应看到 cc53791/3bf02d6/e1b585f/ddbd44a 系列
+./configure --with-urma=/home/l00955908/nds/UMDK_netlab 2>&1 | tail -20
+nice -n 10 make -j16 2>&1 | tail -50
+ls -l build/examples/urma_perf
+./build/examples/urma_perf -h 2>&1 | grep -A3 -- '-M'
+```
+
+**2d. 【新增，只读】补齐 D/E 两项的细节（Phase 2 设计输入）：**
+
+```bash
+# D 细节：drv_vascend 模块的 pin 符号是否对外导出（T=导出 / t=局部）
+timeout 60 find /lib/modules/$(uname -r) -name 'drv_vascend*' 2>/dev/null | head -3
+nm <上面找到的 .ko 路径> 2>/dev/null | grep -i vdavinci | head -10
+# E 细节：CANN 导出接口完整签名线索
+nm -D /usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so 2>/dev/null \
+  | grep -iE "Export|Shareable|MallocPhysical|ImportFrom" | head -20
+#（若 latest 链接不存在，用批次 1 找到的实际版本路径）
+```
+
+**完成标志**：urma_perf 编出且帮助文本含 npu/npu-staged → 回传注明
+「批次 2 完毕，等待解锁批次 3」。若 make 仍失败，完整报错回传等待指令。
+
+**提示**：之后所有 urma_perf 运行都带
+`LD_LIBRARY_PATH=/home/l00955908/nds/UMDK_netlab/lib`（隔离加载 gds liburma，
+不动系统库）；gds liburma 与 197 内核驱动的兼容性将在批次 3 首次连接时验证。
+
 ### 指令 2026-09-15 #3：改分批制，本轮只做批次 1
 
 外部确认：任务粒度太大，改为**分批执行、每批回传、确认后解锁下一批**。
