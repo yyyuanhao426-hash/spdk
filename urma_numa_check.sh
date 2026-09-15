@@ -94,7 +94,8 @@ node_diag() {
     local nn cpus model d n cp seg atseg hp sz t f
     nn=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
     cpus=$(nproc 2>/dev/null)
-    model=$(grep -m1 -i 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ *//')
+    model=$(lscpu 2>/dev/null | awk -F: '/^Model name/{gsub(/^ +/,"",$2); print $2; exit}')
+    [ -z "$model" ] && model=$(uname -m 2>/dev/null)
     echo "  ${nn} 个 NUMA node / ${cpus} cpu / ${model}"
     echo "@TOPO|nodes=${nn}|cpus=${cpus}|model=${model}"
     for d in /sys/devices/system/node/node[0-9]*; do
@@ -116,20 +117,21 @@ node_diag() {
     echo "@DIST|$(cat /sys/devices/system/node/node0/distance 2>/dev/null | tr -s ' \n' ' ')"
 
     echo ""
-    echo "#### [2] 设备 → NUMA (NIC / NVMe / urma|udma 驱动)"
-    local pd cls drv numa keep lcp
+    echo "#### [2] 设备 → NUMA + PCIe 链路 (NIC / NVMe / urma|udma|ubc 驱动)"
+    local pd cls drv numa keep lcp spd wdt
     for pd in /sys/bus/pci/devices/*; do
         [ -d "$pd" ] || continue
         cls=$(cat "$pd/class" 2>/dev/null); drv="-"
         [ -e "$pd/driver" ] && drv=$(basename "$(readlink -f "$pd/driver")")
         numa=$(cat "$pd/numa_node" 2>/dev/null)
         keep=""
-        case "$drv" in *urma*|*udma*) keep="y" ;; esac
+        case "$drv" in *urma*|*udma*|*ubc*|*hinic*|*mlx5*) keep="y" ;; esac
         case "$cls" in 0x02*|0x0108*) keep="y" ;; esac
         [ -n "$keep" ] || continue
         lcp=$(cat "$pd/local_cpulist" 2>/dev/null)
-        printf "  %-13s numa=%-3s drv=%-12s cls=%-8s cpus=%s\n" "$(basename "$pd")" "$numa" "$drv" "$cls" "$lcp"
-        echo "@DEV|$(basename "$pd")|numa=${numa}|drv=${drv}|cls=${cls}|cpus=${lcp}"
+        spd=$(cat "$pd/current_speed" 2>/dev/null); wdt=$(cat "$pd/current_width" 2>/dev/null)
+        printf "  %-13s numa=%-3s drv=%-12s cls=%-8s link=%-9s cpus=%s\n" "$(basename "$pd")" "$numa" "$drv" "$cls" "${spd:-?}x${wdt:-?}" "$lcp"
+        echo "@DEV|$(basename "$pd")|numa=${numa}|drv=${drv}|cls=${cls}|speed=${spd:-?}|width=${wdt:-?}|cpus=${lcp}"
     done | sort
 
     echo ""
@@ -139,20 +141,33 @@ node_diag() {
         pd="/sys/class/net/$dev/device"
         drv="-"; [ -e "$pd/driver" ] && drv=$(basename "$(readlink -f "$pd/driver")")
         numa=$(cat "$pd/numa_node" 2>/dev/null); lcp=$(cat "$pd/local_cpulist" 2>/dev/null)
-        echo "  ${addr} → ${dev}: numa=${numa} cpus=${lcp} drv=${drv}"
-        echo "@NET|${addr}|dev=${dev}|numa=${numa}|drv=${drv}|cpus=${lcp}"
+        espeed=$(ethtool "$dev" 2>/dev/null | awk -F': *' '/Speed:/{print $2}')
+        elink=$(ethtool "$dev" 2>/dev/null | awk '/Link detected:/{print $3}')
+        echo "  ${addr} → ${dev}: numa=${numa} cpus=${lcp} drv=${drv} speed=${espeed:-?} link=${elink:-?}"
+        echo "@NET|${addr}|dev=${dev}|numa=${numa}|drv=${drv}|speed=${espeed:-?}|link=${elink:-?}|cpus=${lcp}"
     done
 
     echo ""
-    echo "#### [4] 进程落点"
+    echo "#### [4] URMA 栈 (设备节点 / 模块版本 —— 四台对齐用)"
+    ls -l /dev/udmac* 2>/dev/null | sed 's/^/  /' | head -20
+    ls /dev 2>/dev/null | grep -iE 'urma|udma' | sort -u | sed 's/^/  dev: /' | head -20
+    for m in ubcore uburma udma hinic3 mlx5_core; do
+        v=""
+        [ -r "/sys/module/$m/version" ] && v=$(cat "/sys/module/$m/version" 2>/dev/null)
+        if [ -z "$v" ] && command -v modinfo >/dev/null 2>&1; then v=$(modinfo -F version "$m" 2>/dev/null); fi
+        [ -n "$v" ] && echo "  $m: $v"
+    done
+
+    echo ""
+    echo "#### [5] 进程落点"
     proc_diag "nvmf_tgt" "nvmf_tgt"
     proc_diag "urma_perf" "urma_perf"
     pgrep -f 'nvmf_tgt|urma_perf' >/dev/null 2>&1 || \
         echo "  (nvmf_tgt / urma_perf 都未在跑 —— 起来后再跑一遍本脚本才看得到内存落点)"
 
     echo ""
-    echo "#### [5] 线索"
-    lsmod 2>/dev/null | grep -iE 'urma|udma' | head -5
+    echo "#### [6] 线索"
+    lsmod 2>/dev/null | grep -iE 'urma|udma' | head -8
     dmesg 2>/dev/null | grep -iE 'hugepage|alloc.*fail|out of memory' | tail -3
 }
 
@@ -215,7 +230,7 @@ getf() {  # $1=a=1|b=2 形式串  $2=字段名 → 值
 }
 
 dev_kind() {  # $1=drv $2=cls
-    case "$1" in *urma*|*udma*) echo "URMA"; return ;; esac
+    case "$1" in *urma*|*udma*|*ubc*) echo "URMA"; return ;; esac
     case "$2" in
         0x02*)   echo "NIC" ;;
         0x0108*) echo "NVMe" ;;
