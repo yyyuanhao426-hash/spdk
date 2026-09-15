@@ -1460,19 +1460,23 @@ main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 	env_opts.name = "nvme_urma_gpu_perf";
+	/* Modified By NDS: npu 初始化提前到 spdk_env_init 之前——批次 3 实测
+	 * aclrtSetDevice 在 DPDK EAL 初始化之后必失败（aclError 507033），
+	 * Python 独立进程正常，疑似 EAL 干扰 CANN 设备映射，提前初始化规避。
+	 * cuda 初始化保持 env 之后（同事B 原行为不变）。 */
+	if (using_npu() && npu_driver_init((int32_t)g_gpu_id) != 0) {
+		return EXIT_FAILURE;	/* init 失败路径内部已自清理 */
+	}
 	if (spdk_env_init(&env_opts) < 0) {
 		fprintf(stderr, "Unable to initialize the SPDK environment\n");
+		if (using_npu()) {
+			npu_driver_fini();
+		}
 		return EXIT_FAILURE;
 	}
 	/* Modified By Yida: cpu 模式完全不初始化 CUDA（无 GPU 的机器也能跑普通路径）；
-	 * posix(新语义) 要做 cuMemcpy，同样需要初始化。
-	 * Modified By NDS: npu/npu-staged 改初始化 AscendCL（CANN 运行时）。 */
-	if (using_npu()) {
-		if (npu_driver_init((int32_t)g_gpu_id) != 0) {
-			rc = EXIT_FAILURE;
-			goto out_env;
-		}
-	} else if (g_mem_type != URMA_PERF_MEM_CPU && cuda_driver_init(g_gpu_id) != 0) {
+	 * posix(新语义) 要做 cuMemcpy，同样需要初始化。npu 已提前初始化。 */
+	if (!using_npu() && g_mem_type != URMA_PERF_MEM_CPU && cuda_driver_init(g_gpu_id) != 0) {
 		rc = EXIT_FAILURE;
 		goto out_env;
 	}
