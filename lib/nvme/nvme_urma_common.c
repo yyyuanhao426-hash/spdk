@@ -72,7 +72,7 @@ spdk_urma_parse_mode(const char *value)
 	return URMA_TM_RM;
 }
 
-static uint32_t
+uint32_t
 spdk_urma_env_u32(const char *name, uint32_t default_value)
 {
 	const char *value = getenv(name);
@@ -134,6 +134,13 @@ spdk_urma_opts_init(struct spdk_urma_transport_opts *opts)
 	opts->jetty_depth = spdk_urma_env_u32("SPDK_URMA_JETTY_DEPTH",
 			    SPDK_URMA_DEFAULT_JETTY_DEPTH);
 	opts->max_io_size = spdk_urma_env_u32("SPDK_URMA_MAX_IO_SIZE", 131072);
+	opts->capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
+	value = getenv("SPDK_URMA_CAPSULE_TRANSPORT");
+	if (value != NULL && value[0] != '\0' &&
+	    spdk_urma_parse_capsule_transport(value, &opts->capsule_transport) != 0) {
+		SPDK_WARNLOG("Ignoring invalid SPDK_URMA_CAPSULE_TRANSPORT=%s\n", value);
+		opts->capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
+	}
 	opts->bonding_balance = spdk_urma_env_bool("SPDK_URMA_BONDING_BALANCE",
 				"MC_URMA_BONDING_BALANCE", false);
 	opts->bonding_multipath = spdk_urma_env_bool("SPDK_URMA_BONDING_MULTIPATH_ENABLE",
@@ -153,6 +160,39 @@ spdk_urma_opts_init(struct spdk_urma_transport_opts *opts)
 	value = getenv("SPDK_URMA_DEV_NAME");
 	if (value != NULL) {
 		snprintf(opts->dev_name, sizeof(opts->dev_name), "%s", value);
+	}
+}
+
+int
+spdk_urma_parse_capsule_transport(const char *value,
+				   enum spdk_urma_capsule_transport *transport)
+{
+	if (value == NULL || transport == NULL) {
+		return -EINVAL;
+	}
+	if (strcasecmp(value, "tcp") == 0) {
+		*transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
+		return 0;
+	}
+	if (strcasecmp(value, "sendrecv") == 0 ||
+	    strcasecmp(value, "send_recv") == 0 ||
+	    strcasecmp(value, "urma") == 0) {
+		*transport = SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+const char *
+spdk_urma_capsule_transport_name(enum spdk_urma_capsule_transport transport)
+{
+	switch (transport) {
+	case SPDK_URMA_CAPSULE_TRANSPORT_TCP:
+		return "tcp";
+	case SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV:
+		return "sendrecv";
+	default:
+		return "unknown";
 	}
 }
 
@@ -192,6 +232,80 @@ spdk_nvme_urma_unregister_memory_provider(enum spdk_nvme_urma_memory_type type)
 	}
 	pthread_mutex_unlock(&g_provider_mutex);
 	return rc;
+}
+
+/* Modified By Yida(v7): 整池注册表 —— 仅由应用侧 spdk_nvme_urma_register_memory_for_qpair
+ * （预注册整块连续缓冲）填充；I/O 提交路径用 find() 采纳覆盖本 I/O 缓冲的 region，
+ * 跳过 per-I/O register，capsule 携带全区 seg，对端可整池 import 一次。
+ * 按 urma_context 键控：每 qpair 独立 device/context，注册只对同 context 的 I/O 生效。 */
+#define NVME_URMA_REGION_REGISTRY_SIZE 64
+
+struct nvme_urma_region_entry {
+	void *context;
+	uintptr_t start;
+	uintptr_t end;   /* start + length */
+	struct spdk_nvme_urma_memory_region *region;
+	bool used;
+};
+
+static struct nvme_urma_region_entry g_region_registry[NVME_URMA_REGION_REGISTRY_SIZE];
+static pthread_mutex_t g_region_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void
+nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
+			      struct spdk_nvme_urma_memory_region *region)
+{
+	pthread_mutex_lock(&g_region_registry_mutex);
+	for (int i = 0; i < NVME_URMA_REGION_REGISTRY_SIZE; i++) {
+		struct nvme_urma_region_entry *e = &g_region_registry[i];
+
+		if (!e->used) {
+			e->context = urma_context;
+			e->start = (uintptr_t)addr;
+			e->end = (uintptr_t)addr + length;
+			e->region = region;
+			e->used = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_region_registry_mutex);
+}
+
+void
+nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region)
+{
+	if (region == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&g_region_registry_mutex);
+	for (int i = 0; i < NVME_URMA_REGION_REGISTRY_SIZE; i++) {
+		struct nvme_urma_region_entry *e = &g_region_registry[i];
+
+		if (e->used && e->region == region) {
+			e->used = false;
+			e->region = NULL;
+		}
+	}
+	pthread_mutex_unlock(&g_region_registry_mutex);
+}
+
+struct spdk_nvme_urma_memory_region *
+nvme_urma_region_registry_find(void *urma_context, uint64_t addr, size_t length)
+{
+	struct spdk_nvme_urma_memory_region *found = NULL;
+
+	pthread_mutex_lock(&g_region_registry_mutex);
+	for (int i = 0; i < NVME_URMA_REGION_REGISTRY_SIZE; i++) {
+		struct nvme_urma_region_entry *e = &g_region_registry[i];
+
+		if (e->used && e->context == urma_context &&
+		    addr >= e->start && addr + length <= e->end) {
+			found = e->region;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_region_registry_mutex);
+	return found;
 }
 
 int
@@ -265,6 +379,20 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 	/* The current UMDK gds branch uses is_gpu_seg for peer-memory pinning.
 	 * dma-buf registration may return ENOTSUP until the kernel provider lands. */
 	if (region->target_seg == NULL) {
+		/* Modified By Yida (v3): UMMU Table mode 要求注册区间从 4K 对齐的
+		 * base 起始并覆盖完整页。应用 buffer 可能位于子页偏移（Mooncake
+		 * ClientBufferAllocator 仅保证 64B 对齐，torch tensor 是 caching
+		 * allocator 大块显存的子区间），因此对常规/peer-memory 注册路径把
+		 * base 向下对齐到 4K、grant 长度向上扩展覆盖 (offset + length) 的
+		 * 完整页区间。wire capsule 仍携带原始 I/O 地址（nvme_urma.c 的
+		 * capsule.data.address），远端访问的 [addr, addr+length) 完整落在
+		 * 注册区间内即可。
+		 * 注意：dma-buf 路径不走此对齐——cfg.va 与 export_dmabuf 返回的
+		 * offset 一一对应，移位 base 会错位映射，故保持 v2 行为（精确 va）。 */
+		uintptr_t base = SPDK_ALIGN_FLOOR((uintptr_t)addr, (uintptr_t)4096);
+		cfg.va = (uint64_t)base;
+		cfg.len = SPDK_ALIGN_CEIL(((uintptr_t)addr - base) + length,
+					  (size_t)4096);
 		region->target_seg = urma_register_seg(urma_context, &cfg);
 		if (region->target_seg != NULL && type != SPDK_NVME_URMA_MEM_HOST) {
 			SPDK_URMA_STAT_INC(peer_memory_registrations);
@@ -306,6 +434,8 @@ spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 	if (region == NULL) {
 		return;
 	}
+	/* Modified By Yida(v7): 整池 region 注销时同步移出注册表，防悬垂采纳 */
+	nvme_urma_region_registry_remove(region);
 	if (region->target_seg != NULL) {
 		urma_unregister_seg(region->target_seg);
 	}
@@ -401,6 +531,7 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		return -EINVAL;
 	}
 	if (spdk_urma_runtime_get() != 0) {
+		SPDK_ERRLOG("urma device open '%s': runtime init failed\n", opts->dev_name);
 		return -EIO;
 	}
 	device = calloc(1, sizeof(*device));
@@ -417,10 +548,13 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		}
 	}
 	if (selected == NULL) {
+		SPDK_ERRLOG("urma device open: device '%s' not found in device list\n",
+			    opts->dev_name);
 		goto fail;
 	}
 	eids = urma_get_eid_list(selected, &eid_count);
 	if (eids == NULL || eid_count == 0) {
+		SPDK_ERRLOG("urma device open '%s': no eid list\n", selected->name);
 		goto fail;
 	}
 	for (uint32_t i = 0; i < eid_count; i++) {
@@ -437,6 +571,10 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 	}
 	device->context = urma_create_context(selected, device->eid_index);
 	if (device->context == NULL || urma_query_device(selected, &device->attr) != URMA_SUCCESS) {
+		/* Modified By Yida(v6): 原本静默返回——失败后只剩 transport.c 一行兜底，
+		 * 卡 ~5s 才报 = 驱动层超时，这里标出设备名与 eid 便于定位 */
+		SPDK_ERRLOG("urma device open '%s' eid%u: create_context/query failed (~5s delay means driver timeout)\n",
+			    selected->name, (unsigned)device->eid_index);
 		rc = -EIO;
 		goto fail;
 	}
@@ -455,6 +593,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		};
 		urma_user_ctl_out_t out = {};
 		if (urma_user_ctl(device->context, &in, &out) != URMA_SUCCESS) {
+			SPDK_ERRLOG("urma device open '%s': set bonding mode failed\n",
+				    selected->name);
 			rc = -EIO;
 			goto fail;
 		}
@@ -472,6 +612,7 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			}
 		}
 		if (!found && device->attr.port_cnt != 0) {
+			SPDK_ERRLOG("urma device open '%s': no active port\n", selected->name);
 			rc = -ENETDOWN;
 			goto fail;
 		}
@@ -483,6 +624,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 	}
 	device->jfcs = calloc(device->jfc_count, sizeof(*device->jfcs));
 	if (device->jfcs == NULL) {
+		SPDK_ERRLOG("urma device open '%s': alloc jfc table (n=%u) failed\n",
+			    selected->name, device->jfc_count);
 		rc = -ENOMEM;
 		goto fail;
 	}
@@ -492,6 +635,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 				     (uint32_t)device->attr.dev_cap.max_jfc_depth);
 		device->jfcs[i] = urma_create_jfc(device->context, &cfg);
 		if (device->jfcs[i] == NULL) {
+			SPDK_ERRLOG("urma device open '%s': create jfc %u (depth %u) failed\n",
+				    selected->name, i, cfg.depth);
 			rc = -EIO;
 			goto fail;
 		}
@@ -520,6 +665,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		jfr_cfg.jfc = device->jfcs[0];
 		device->jfr = urma_create_jfr(device->context, &jfr_cfg);
 		if (device->jfr == NULL) {
+			SPDK_ERRLOG("urma device open '%s': create shared jfr (depth %u) failed\n",
+				    selected->name, jfr_cfg.depth);
 			rc = -EIO;
 			goto fail;
 		}
@@ -535,6 +682,8 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		snprintf(id, sizeof(id), "SPDK_URMA_DMA_DEVICE:%s", selected->name);
 		if (spdk_memory_domain_create(&device->memory_domain,
 				SPDK_DMA_DEVICE_VENDOR_SPECIFIC_TYPE_START, &domain_ctx, id) != 0) {
+			SPDK_ERRLOG("urma device open '%s': memory domain create failed\n",
+				    selected->name);
 			rc = -ENOMEM;
 			goto fail;
 		}

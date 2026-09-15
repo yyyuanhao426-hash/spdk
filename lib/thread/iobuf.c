@@ -24,6 +24,16 @@
 #define IOBUF_DEFAULT_LARGE_BUFSIZE	(132 * 1024)
 #define IOBUF_MAX_CHANNELS		64
 #define IOBUF_POPULATE_BATCH_SIZE	64
+/* The large pool is allocated in chunks rather than one contiguous block: a
+ * multi-GB single allocation needs an equally long IOVA-contiguous run, which
+ * reliably fails on 2MB hugepage systems (e.g. 512 x 4MB = 2GB). Buffers are
+ * enqueued into the pool ring individually, so pool-wide contiguity is never
+ * used. Chunks are capped in bytes as well, so an oversized bufsize cannot
+ * defeat the chunking. On allocation failure a chunk is halved and retried,
+ * down to the minimum. */
+#define IOBUF_LARGE_POOL_CHUNK_SIZE		64
+#define IOBUF_LARGE_POOL_CHUNK_MAX_BYTES	(256 * 1024 * 1024)
+#define IOBUF_LARGE_POOL_MIN_CHUNK_SIZE		4
 
 SPDK_STATIC_ASSERT(sizeof(struct spdk_iobuf_buffer) <= IOBUF_MIN_SMALL_BUFSIZE,
 		   "Invalid data offset");
@@ -49,7 +59,8 @@ struct iobuf_node {
 	struct spdk_ring		*small_pool;
 	struct spdk_ring		*large_pool;
 	void				*small_pool_base;
-	void				*large_pool_base;
+	void				**large_pool_chunks;
+	uint32_t			large_pool_chunk_count;
 };
 
 struct iobuf {
@@ -113,6 +124,83 @@ iobuf_channel_destroy_cb(void *io_device, void *ctx)
 	}
 }
 
+static void
+iobuf_large_chunks_free(struct iobuf_node *node)
+{
+	uint32_t i;
+
+	if (node->large_pool_chunks == NULL) {
+		return;
+	}
+
+	for (i = 0; i < node->large_pool_chunk_count; i++) {
+		spdk_free(node->large_pool_chunks[i]);
+	}
+
+	spdk_free(node->large_pool_chunks);
+	node->large_pool_chunks = NULL;
+	node->large_pool_chunk_count = 0;
+}
+
+static int
+iobuf_large_chunks_alloc(struct iobuf_node *node, uint32_t numa_id)
+{
+	struct spdk_iobuf_opts *opts = &g_iobuf.opts;
+	struct spdk_iobuf_buffer *buf;
+	uint32_t chunk_bufs;
+	uint32_t want;
+	uint64_t num_chunks;
+	uint64_t allocated = 0;
+	uint64_t remaining = opts->large_pool_count;
+	uint64_t j;
+
+	/* Cap the chunk in bytes too, so an oversized bufsize can't defeat the chunking. */
+	chunk_bufs = spdk_min(IOBUF_LARGE_POOL_CHUNK_SIZE,
+			      spdk_max(1U, (uint32_t)(IOBUF_LARGE_POOL_CHUNK_MAX_BYTES / opts->large_bufsize)));
+
+	/* Size the chunk table for the worst case: every chunk shrunk to the minimum. */
+	num_chunks = SPDK_CEIL_DIV(opts->large_pool_count, IOBUF_LARGE_POOL_MIN_CHUNK_SIZE);
+	node->large_pool_chunks = spdk_malloc(num_chunks * sizeof(void *), IOBUF_ALIGNMENT,
+					      NULL, numa_id, SPDK_MALLOC_DMA);
+	if (node->large_pool_chunks == NULL) {
+		SPDK_ERRLOG("Unable to allocate large iobuf chunk table\n");
+		return -ENOMEM;
+	}
+
+	while (remaining > 0) {
+		void *chunk;
+
+		want = (uint32_t)spdk_min((uint64_t)chunk_bufs, remaining);
+		chunk = spdk_malloc((uint64_t)want * opts->large_bufsize, IOBUF_ALIGNMENT,
+				    NULL, numa_id, SPDK_MALLOC_DMA);
+		while (chunk == NULL && chunk_bufs > IOBUF_LARGE_POOL_MIN_CHUNK_SIZE) {
+			/* Contiguity ceiling hit - shrink the chunk and retry. */
+			chunk_bufs = spdk_max(chunk_bufs / 2, IOBUF_LARGE_POOL_MIN_CHUNK_SIZE);
+			want = (uint32_t)spdk_min((uint64_t)chunk_bufs, remaining);
+			chunk = spdk_malloc((uint64_t)want * opts->large_bufsize, IOBUF_ALIGNMENT,
+					    NULL, numa_id, SPDK_MALLOC_DMA);
+		}
+		if (chunk == NULL) {
+			SPDK_ERRLOG("Unable to allocate large iobuf pool chunk of %u x %" PRIu32 " bytes\n",
+				    want, opts->large_bufsize);
+			iobuf_large_chunks_free(node);
+			return -ENOMEM;
+		}
+
+		node->large_pool_chunks[allocated++] = chunk;
+		node->large_pool_chunk_count = allocated;
+
+		for (j = 0; j < want; j++) {
+			buf = chunk + j * opts->large_bufsize;
+			spdk_ring_enqueue(node->large_pool, (void **)&buf, 1, NULL);
+		}
+
+		remaining -= want;
+	}
+
+	return 0;
+}
+
 static int
 iobuf_node_initialize(struct iobuf_node *node, uint32_t numa_id)
 {
@@ -149,11 +237,8 @@ iobuf_node_initialize(struct iobuf_node *node, uint32_t numa_id)
 		goto error;
 	}
 
-	node->large_pool_base = spdk_malloc(opts->large_bufsize * opts->large_pool_count, IOBUF_ALIGNMENT,
-					    NULL, numa_id, SPDK_MALLOC_DMA);
-	if (node->large_pool_base == NULL) {
-		SPDK_ERRLOG("Unable to allocate requested large iobuf pool size\n");
-		rc = -ENOMEM;
+	rc = iobuf_large_chunks_alloc(node, numa_id);
+	if (rc) {
 		goto error;
 	}
 
@@ -162,17 +247,12 @@ iobuf_node_initialize(struct iobuf_node *node, uint32_t numa_id)
 		spdk_ring_enqueue(node->small_pool, (void **)&buf, 1, NULL);
 	}
 
-	for (i = 0; i < opts->large_pool_count; i++) {
-		buf = node->large_pool_base + i * opts->large_bufsize;
-		spdk_ring_enqueue(node->large_pool, (void **)&buf, 1, NULL);
-	}
-
 	return 0;
 
 error:
 	spdk_free(node->small_pool_base);
 	spdk_ring_free(node->small_pool);
-	spdk_free(node->large_pool_base);
+	iobuf_large_chunks_free(node);
 	spdk_ring_free(node->large_pool);
 	memset(node, 0, sizeof(*node));
 
@@ -202,8 +282,7 @@ iobuf_node_free(struct iobuf_node *node)
 	spdk_ring_free(node->small_pool);
 	node->small_pool = NULL;
 
-	spdk_free(node->large_pool_base);
-	node->large_pool_base = NULL;
+	iobuf_large_chunks_free(node);
 	spdk_ring_free(node->large_pool);
 	node->large_pool = NULL;
 }
