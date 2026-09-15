@@ -26,28 +26,25 @@ NPU 内存路线），代码在同事B 的 GitHub 仓的 `nds_v1` 分支。
 
 | 节点 | IP | 角色 | 关键信息 |
 |------|-----|------|---------|
-| **197** | 141.61.41.197 | Initiator + 编译机 | 4× Ascend950PR（128GB HBM/卡）、CANN 系统级安装、10+ udmac 设备、openEuler 24.03 SP4 aarch64 内核 6.6.0-159。**多人共用，严守隔离守则** |
-| **151** | 141.61.84.151 | Target | Tesla V100 + 12× NVMe 7.68T；系统盘 nvme9n1 绝对不能碰；md0 成员盘不能接管；空闲盘 nvme4n1（BDF 0000:a2:00.0）是当前测试盘 |
-| 245 | 141.61.84.245 | （已退出） | 曾当编译机，现在不用；仅在需要 GPU 路线回归时可能回归 |
+| **197** | 141.61.41.197 | Initiator + 编译机 | 4× Ascend950PR（128GB HBM/卡）、CANN 系统级安装（**多版本并存** 8.5.0/9.0.1/9.1.0/9.0.T500，注意别混用）、10+ udmac 设备、openEuler 24.03 SP4 aarch64 内核 6.6.0-159。**多人共用，严守隔离守则** |
+| **151** | 141.61.84.151 | Target | Tesla V100 + 12× NVMe 7.68T；系统盘 nvme9n1 绝对不能碰；md0 成员盘不能接管；空闲盘 nvme4n1（BDF 0000:a2:00.0）是当前测试盘。**已用 nds_v1 重建 target**（/home/l00955908/nds/spdk） |
+| 245 | 141.61.84.245 | （已退出） | 曾当编译机与 gds UMDK 源，现不用；仅在需要 GPU 路线回归时可能回归 |
 
 **连接方式**：用户会给你 SSH 通道（root + 端口 22），你通过用户中转操作，
 **不要**自行扫描/尝试连接其他机器。
 
-**外网限制（重要）**：197 连不了外网。代码更新统一走这个流程：
-
-```
-1. 外部有网机器（用户电脑或指定节点）：git pull origin nds_v1
-2. scp/rsync 整个代码目录（或增量 diff）上传到 197 的 /home/lx/nds/spdk
-3. 禁止用 Windows 工具直接文本传输（会引入 CRLF，见第 6 节教训）
-```
+**外网情况（已更新）**：197 已可联网（git fetch/clone 实测可用，151 走代理
+http://141.1.74.169:3128/ 也可达 GitHub）。代码更新首选 git pull；若某台
+临时断网，备用流程：外部有网机器 pull 后 scp 上传（禁止 Windows 文本直传，
+防 CRLF）。
 
 ## 3. 现有环境（已就绪，不要重建）
 
-**197 上（用户目录 /home/lx/nds/）：**
+**197 上：**
 
 | 路径 | 内容 |
 |------|------|
-| `/home/lx/nds/spdk` | nds_v1 代码 + 已编译产物（build/examples/urma_perf 含 -M npu/npu-staged） |
+| `/home/lx/spdk` | nds_v1 代码（已同步至 0f4bfaf）+ 已编译产物（urma_perf 含 -M npu/npu-staged） |
 | `/home/lx/nds/UMDK_netlab` | gds 版 UMDK（含 is_gpu_seg/urma_register_seg_dmabuf 扩展，从 245 拷来） |
 
 **运行 urma_perf 的固定姿势**（gds liburma 必须隔离加载，不能动系统库）：
@@ -60,7 +57,8 @@ SPDK_URMA_MAX_IO_SIZE=4194304 \
   -M <cpu|npu|npu-staged|posix|peermem|dmabuf> -t 5
 ```
 
-**151 上：** target 尚未用 nds_v1 重建（这正是当前任务，见第 5 节）；
+**151 上：** target 已用 nds_v1 重建（/home/l00955908/nds/spdk，
+UMDK 在 /home/l00955908/nds/UMDK_netlab），批次 3R-1 实测 HELLO 通过；
 旧的 /home/xxx/spdk（同事B 早期构建）已确认协议过时，退役。
 
 ## 4. 工作机制（对话文件 + 分批制）
@@ -74,26 +72,21 @@ SPDK_URMA_MAX_IO_SIZE=4194304 \
 
 ## 5. 当前任务（进行到哪里了）
 
-进度：批次 1（197 体检）✅ → 批次 2（gds 编译环境）✅ → 批次 3（首测）
-❌ 暴露两个阻塞 → **指令 #7「批次 3R-1」待执行 ← 你从这里开始**
+进度：批次 1（197 体检）✅ → 批次 2（gds 编译环境）✅ → 批次 3 ❌两个阻塞 →
+批次 3R-1 ✅ **metadata 问题关闭**（151 重建 target 生效）→ 暴露两个新问题 →
+**指令 #8「批次 4 诊断」待执行 ← 你从这里开始**
 
-两个阻塞及外部已给的修复（都已提交，你需要拉最新代码）：
+两个新问题及当前怀疑（详细命令在对话文件第 10 节「指令 2026-09-15 #8」）：
 
-1. **URMA metadata 不兼容**（151 旧 target 与 nds_v1 协议不匹配）→
-   修复 = 在 151 用 nds_v1 重建 target（7a）
-2. **aclrtSetDevice 在 SPDK 进程内失败 507033**（DPDK EAL 干扰 CANN）→
-   修复已改代码：npu 初始化提前到 spdk_env_init 之前（7c 验证）
+1. **LOC_ACCESS_ERR**（URMA pull 阶段被拒，-M cpu 也报）：重点怀疑 197 的
+   发行版标准内核（6.6.0-159）URMA 驱动与 gds 定制内核行为有差异 →
+   诊断：驱动 modinfo 对比 + 标准库对照实验 + dmesg 抓取
+2. **aclrtSetDevice 507033**（顺序修复无效）：主嫌疑改为**多版本 CANN
+   混用**（197 有 4 个版本）→ 诊断：CANN 调试日志 + 实际加载路径确认
+   （新代码会打印 CANN runtime loaded: ...）
 
-**执行指令 #7**（详细命令在对话文件第 10 节「指令 2026-09-15 #7」）：
-
-- 7a：151 上 clone nds_v1 + 拷 gds UMDK + 编译（`nice -n 10 make -j16`）
-- 7b：151 用新树 `./target_nvme_takeover.sh -d nvme4n1` 起 target →
-  197 重跑 `-M cpu` 回归（判定 metadata 问题是否关闭）
-- 7c：197 跑 `-M npu-staged -t 1` 验证 507033 是否消失
-  （若预检通过 = **NDS 全链路首测通过**，这是里程碑）
-- 7d：恢复现场（151 还原盘/hugepages，197 还原 hugepages）
-
-成功/失败都原样记录回传，注明「批次 3R-1 完毕」。
+**执行指令 #8**（只读诊断为主，风险低），成功/失败都原样记录回传，
+注明「批次 4 完毕」。
 
 ## 6. 已知问题与教训（前任踩过的坑）
 

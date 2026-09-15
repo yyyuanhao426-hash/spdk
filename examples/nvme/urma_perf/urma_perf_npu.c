@@ -138,6 +138,17 @@ npu_driver_init(int32_t device_id)
 		fprintf(stderr, "Unable to load %s: %s\n", lib_name, dlerror());
 		return -ENODEV;
 	}
+	/* Modified By NDS: 打印实际加载的 CANN 库路径——197 上多版本 CANN
+	 * 并存（8.5.0/9.0.1/9.1.0/9.0.T500），507033 排查需确认进程真实加载的是
+	 * 哪一份 libascendcl（独立程序正常而 urma_perf 失败，可能是版本混用） */
+	{
+		Dl_info info;
+
+		if (dladdr(dlsym(g_npu.library, "aclInit"), &info) != 0 &&
+		    info.dli_fname != NULL) {
+			printf("CANN runtime loaded: %s\n", info.dli_fname);
+		}
+	}
 	NPU_LOAD_REQUIRED(init, "aclInit");
 	NPU_LOAD_REQUIRED(set_device, "aclrtSetDevice");
 	NPU_LOAD_REQUIRED(create_context, "aclrtCreateContext");

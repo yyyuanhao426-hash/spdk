@@ -267,6 +267,94 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 10. 外部 AI 指令区
 
+### 回执导入 2026-09-15 #5（批次 3R-1 结果，用户带回）
+
+- 环境变更：197 已可联网；197 代码在 /home/lx/spdk（fetch+reset 至 0f4bfaf）；
+  151 重新 clone（/home/l00955908/nds/spdk），两台 HEAD 一致
+- 7a ✅：151 部署 nds_v1 target（7 个 submodule 全部拉取，configure +
+  make -j16 成功，nvmf_tgt/urma_perf 就绪，-h 含 npu/npu-staged）
+- 7b ✅ **metadata 问题关闭**：Invalid URMA host metadata 消失，HELLO 通过，
+  进入 NVMe Fabrics Connect 数据路径；151 旧 target 正式退役
+- 7b 新问题 ⚠️：Connect 失败 **LOC_ACCESS_ERR（status=4）**——target
+  pull initiator 内存时 local access error（ureq state=2 PULLING）；target
+  侧 timing 显示 W6 register 9.5ms（首次 miss）→ 拉数据失败；显式指定
+  DEV_NAME 重试无效
+- 7c ❌：507033 未消失——顺序修复无效；测试 agent 诊断：独立 C 程序正常、
+  urma_perf 进程内失败，且代码确认修复已生效 → **根因非 main() 内顺序，
+  而是 DPDK 链接期构造函数级别的干扰；外部接受此修正**
+- 7d ✅：两台现场全部还原
+
+**外部分析（新）：**
+1. LOC_ACCESS_ERR 重点怀疑 197 的**发行版标准内核**（6.6.0-159）URMA 驱动
+   与同事B 的 gdr 定制内核（6.6.0-gdr_w00921547+，151 在用）行为差异——
+   pull 被拒指向 initiator 侧 ummu grant/映射未真正生效
+2. 507033 主嫌疑改为**多版本 CANN 混用**（197 有 8.5.0/9.0.1/9.1.0/9.0.T500
+   四个版本），独立程序与 urma_perf 可能加载了不同组合；外部已加打印：
+   urma_perf 启动时会输出实际加载的 libascendcl 路径
+   （CANN runtime loaded: ...）
+
+### 指令 2026-09-15 #8：批次 4（只读诊断批）
+
+前置：批次 3R-1 已回执。本批以只读诊断为主（仅 D1-b/D1-c 需要短暂起
+target 复现），遵守隔离守则。197 代码先 git pull 拉取含诊断打印的最新版
+并增量重编（nice -n 10 make -j16）。
+
+**D1. LOC_ACCESS_ERR 排查**
+
+a. 驱动版本对比（两台都跑，只读）：
+```bash
+for m in ubcore uburma udma ummu ummu_core ubus ubase; do \
+  echo "== $m =="; modinfo $m 2>/dev/null | grep -E "^(filename|version|srcversion)"; done
+```
+→ 判断 197（标准内核 6.6.0-159）与 151（gdr 定制内核）的 URMA 模块是否同一套
+
+b. 标准库对照实验（197；需先在 151 用 7b 命令起 target）：
+```bash
+# 不带 LD_LIBRARY_PATH，强制用系统标准 liburma
+# （lazy binding 下 -M cpu 不调 gds 独有符号应能运行；
+#  若报 undefined symbol: urma_register_seg_dmabuf 则记录回传——这本身是数据）
+SPDK_URMA_MAX_IO_SIZE=4194304 \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M cpu -t 5
+```
+→ LOC_ACCESS_ERR 消失 = 锁定「gds liburma × 197 内核」组合问题；
+  仍在 = 排除 liburma 因素，矛头指向 197 内核驱动
+c. 内核日志（复现 LOC_ACCESS_ERR 的那次）：
+```bash
+# 151（起 target 后）与 197（跑完测试立即）各抓一次
+dmesg | tail -60
+```
+→ 关注 ummu/udma/ubcore 的 grant/access/map 相关报错
+
+**D2. 507033 排查**
+
+a. 开 CANN 调试日志重跑（最关键，CANN 会自己说出失败原因）：
+```bash
+ASCEND_GLOBAL_LOG_LEVEL=0 ASCEND_SLOG_PRINT_TO_STDOUT=1 \
+LD_LIBRARY_PATH=<与之前完全相同> \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M npu-staged -t 1 2>&1 | head -80
+```
+b. 实际加载库路径与版本确认：
+```bash
+ldconfig -p | grep ascendcl          # 系统注册了哪些 CANN
+ldd build/examples/urma_perf | grep -iE "ascend|runtime|drv|cann"
+# 重编后启动输出会含 "CANN runtime loaded: <路径>" —— 与独立程序用的版本对比
+```
+c. 加载链核查（如 a/b 仍无头绪）：
+```bash
+LD_DEBUG=libs ./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M npu-staged -t 1 2>&1 | grep -iE "ascendcl|runtime|libdrv" | head -30
+```
+
+**D3. 完成标志**
+
+所有输出原样追加第 9 节，注明「批次 4 完毕」。本批不做任何修复尝试，
+外部将根据诊断数据定下批方案。
+
 ### 回执导入 2026-09-15 #4（批次 3 结果，用户带回）
 
 - 3a target 启动 ✅：nvme4n1 接管 + nvmf_tgt + RPC 配置完成（脚本从 245 中转
