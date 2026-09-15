@@ -98,8 +98,8 @@ node_diag() {
     cpus=$(nproc 2>/dev/null)
     model=$(lscpu 2>/dev/null | awk -F: '/^Model name/{gsub(/^ +/,"",$2); print $2; exit}')
     [ -z "$model" ] && model=$(uname -m 2>/dev/null)
-    echo "  ${nn} 个 NUMA node / ${cpus} cpu / ${model}"
-    echo "@TOPO|nodes=${nn}|cpus=${cpus}|model=${model}"
+    echo "  ${nn} 个 NUMA node / ${cpus} cpu / ${model} / kernel $(uname -r 2>/dev/null)"
+    echo "@TOPO|nodes=${nn}|cpus=${cpus}|model=${model}|kernel=$(uname -r 2>/dev/null)"
     for d in /sys/devices/system/node/node[0-9]*; do
         [ -d "$d" ] || continue
         n=$(basename "$d"); cp=$(cat "$d/cpulist" 2>/dev/null)
@@ -171,17 +171,32 @@ node_diag() {
             echo "  ${dd##*/} → $(basename "$p2") drv=${d2} numa=$(cat "$p2/numa_node" 2>/dev/null)"
         done
     done | head -30
+    # udmac/bonding 逻辑设备的 PCI 真身：在 PCI 设备树下找同名子目录
+    find /sys/bus/pci/devices/ -maxdepth 3 \( -name 'udmac*' -o -name 'bonding_dev*' \) 2>/dev/null | sort | head -30 \
+    | while read -r f; do
+        b=$(printf '%s' "$f" | grep -o '[0-9a-fA-F]\{4\}:[0-9a-fA-F]\{2\}:[0-9a-fA-F]\{2\}\.[0-9a-fA-F]' | head -1)
+        [ -n "$b" ] || continue
+        p2="/sys/bus/pci/devices/$b"
+        d2="-"; [ -e "$p2/driver" ] && d2=$(basename "$(readlink -f "$p2/driver")")
+        echo "  pci真身: ${f##*/} → ${b} drv=${d2} numa=$(cat "$p2/numa_node" 2>/dev/null) cls=$(cat "$p2/class" 2>/dev/null)"
+      done
     # SPDK_URMA_DEV_NAME → 按 BDF 直查（udmac0d1e2 → 0000:0d:1e.2）
     bdf=$(printf '%s' "${URMA_DEV}" | sed -n 's/^udmac\([0-9a-fA-F][0-9a-fA-F]\)\([0-9a-fA-F][0-9a-fA-F]\)\([0-9a-fA-F]\)$/0000:\1:\2.\3/p')
     if [ -n "$bdf" ] && [ -d "/sys/bus/pci/devices/$bdf" ]; then
         d2="-"; [ -e "/sys/bus/pci/devices/$bdf/driver" ] && d2=$(basename "$(readlink -f "/sys/bus/pci/devices/$bdf/driver")")
         echo "  ${URMA_DEV} → ${bdf}: drv=${d2} numa=$(cat "/sys/bus/pci/devices/$bdf/numa_node" 2>/dev/null) cls=$(cat "/sys/bus/pci/devices/$bdf/class" 2>/dev/null)"
+        command -v lspci >/dev/null 2>&1 && lspci -vvv -s "$bdf" 2>/dev/null | grep -m1 'LnkSta:' | sed 's/^/    /'
     elif [ -n "$bdf" ]; then
         echo "  ${URMA_DEV} → 猜测 BDF ${bdf} 不在 PCI 树上（名字不编码 BDF，或该机没这设备）"
     fi
     # 华为系 (19e5) PCI 设备全清单带内核驱动 —— UDMAC/CDMA 卡在这里现形
     command -v lspci >/dev/null 2>&1 && lspci -nnk -d '19e5:' 2>/dev/null \
-        | grep -vE '^Subsystem|^Control:|^Region|^Capabilities|^Kernel modules' | sed 's/^/  /' | head -40
+        | grep -vE '^Subsystem|^Control:|^Region|^Capabilities|^Kernel modules|^Latency|^Interrupt|^Expansion' | sed 's/^/  /' | head -80
+    # liburma 用户态库指纹（"liburma 成套"坑）
+    for lb in build/lib/liburma* /usr/lib64/liburma* /usr/local/lib/liburma*; do
+        [ -e "$lb" ] || continue
+        echo "  lib: ${lb} md5=$(md5sum "$lb" 2>/dev/null | cut -c1-8)"
+    done
     # 模块指纹：版本号 + .ko md5（判断四台是不是同一份二进制）
     for m in ubcore uburma udma ubase cdma unic hinic3 mlx5_core; do
         v=""
@@ -278,7 +293,7 @@ run_diag() {  # $1=name $2=ip
     echo "============================================================"
     echo " ${name} (${ip})"
     echo "============================================================"
-    if ! out=$( { declare -f node_diag proc_diag; echo node_diag; } \
+    if ! out=$( { printf 'URMA_DEV="%s"\n' "${URMA_DEV}"; declare -f node_diag proc_diag; echo node_diag; } \
             | ssh $SSH_OPTS "${SSH_USER}@${ip}" "timeout ${TIMEOUT} bash -s" 2>&1 ); then
         echo "  ✗ SSH 执行失败（跳过，不影响其它节点）"
         return 1
