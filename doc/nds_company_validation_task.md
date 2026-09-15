@@ -283,6 +283,36 @@ vdavinci_unpin_pages / hw_vdavinci_pin_page_range（drv_vascend 模块）——P
 **决策**：编译/测试全部改在 197 进行，245 退出（CRLF 问题不再处理）；
 gds UMDK 从 245 拷贝到 197 自家目录隔离使用（不动系统库）。
 
+### 回执导入 2026-09-15 #3（批次 2 结果，用户带回）
+
+- gds UMDK 已拷至 197 /home/lx/nds/UMDK_netlab（sshpass 中转），gds 扩展验证
+  齐全（is_gpu_seg 字段 + liburma.so 已导出 urma_register_seg_dmabuf）
+- configure 成功；SPDK 核心库 + 12 个 bin 全部编译成功（is_gpu_seg 错误消失）
+- ❌ urma_perf 编译失败：urma_perf_npu.c 的 npu_driver_init/npu_driver_fini
+  定义为 static，与头文件非 static 声明冲突——**外部开发 bug，已修复**
+  （commit：fix(nds) static 声明冲突）
+- **D 项结论修正（重要）**：vdavinci_pin_pages 等符号在 kallsyms 中均为小写
+  t（模块局部），无 __ksymtab——**未导出，Phase 2 内核桥接不能直接调用**。
+  Phase 2 方向重估：E 项（CANN 导出接口 → dma-buf 注册路线）重要性上升，
+  因 dma-buf 走标准内核框架，无需 davinci 专有符号；待查证点：gds 内核
+  udma 驱动的 urma_register_seg_dmabuf 是否已实现 dma-buf import。
+
+### 指令 2026-09-15 #5：批次 2 补丁（拉修复重编 urma_perf）
+
+前置：批次 2 其余部分已完成。本批全部在 **197** 上，遵守隔离守则。
+
+```bash
+cd /home/lx/nds/spdk          # 或实际 GitHub clone 目录
+git stash list | head -1      # 确认无未保存改动（有则先回传询问）
+git pull origin nds_v1        # 拉取 static 声明修复
+nice -n 10 make -j16 2>&1 | tail -20   # 增量编译，只重编 urma_perf，很快
+ls -l build/examples/urma_perf
+./build/examples/urma_perf -h 2>&1 | grep -A3 -- '-M'
+```
+
+**完成标志**：urma_perf 编出、帮助文本含 npu/npu-staged → 回传注明
+「批次 2 补丁完毕，等待解锁批次 3」。若 make 仍失败，完整报错回传。
+
 ### 指令 2026-09-15 #4：解锁批次 2（在 197 搭建 gds 编译环境）
 
 前置：批次 1 已确认。本批全部在 **197** 上操作，遵守 0.5 节隔离守则。

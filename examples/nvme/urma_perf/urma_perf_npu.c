@@ -118,7 +118,8 @@ npu_load_symbol(const char *name)
 		} \
 	} while (0)
 
-static int
+/* NDS-fix: 非 static——urma_perf.c 经 urma_perf_npu.h 外部调用 */
+int
 npu_driver_init(int32_t device_id)
 {
 	const char *lib_name;
@@ -183,7 +184,7 @@ fail:
 	return -ENODEV;
 }
 
-static void
+void
 npu_driver_fini(void)
 {
 	if (g_npu.library == NULL) {
