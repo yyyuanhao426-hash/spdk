@@ -336,6 +336,11 @@ npu-smi info
 find / -name "libascendcl.so" 2>/dev/null
 ls /usr/local/Ascend 2>/dev/null
 
+# B2. UMDK/liburma 是否可用（编译 urma_perf 必需）
+find / -name "urma_api.h" -not -path "*/spdk*" 2>/dev/null
+ldconfig -p | grep urma
+ls /usr/lib64/liburma* 2>/dev/null
+
 # C. 【决定成败】URMA 网卡是否存在
 find /sys -name '*udmac*' 2>/dev/null | head
 ls /dev | grep -iE "udma|ub"
@@ -359,5 +364,9 @@ ping -c 3 141.61.84.151
 
 **判定标准（写入报告结论）：**
 - A~C 全部正常 → NPU 节点可直接当 Initiator，NDS 全链路测试可排期
+  （拓扑定为 197=Initiator + 151=Target；245 仅在本轮 CPU 回归中当编译机，
+  NDS 正式测试不再需要）
 - C 无 URMA 设备 → 硬件缺口，回报"需协调 URMA 网卡"，其余照常交付
+- B2 无 UMDK/liburma → 编译缺口，可在 197 上装 UMDK 或把 245 编好的
+  二进制拷贝过去，回报时注明选择哪种方式
 - D/E 的输出是 Phase 2 内核桥接模块设计的直接输入，务必原文记录
