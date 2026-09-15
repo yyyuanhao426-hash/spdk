@@ -25,6 +25,33 @@
 外部开发已完成 SPDK 层代码（分支 `nds_v1`），本次上机目标：
 **① 确认环境；② 编译通过；③ 跑通测试；④ 采集三个硬件验证项的数据。**
 
+## 0.5 共享节点隔离守则（197 为多人共用，必须遵守）
+
+197 节点有很多用户共用，所有操作以"不打扰他人"为前提：
+
+1. **产物隔离**：代码、编译产物、临时文件全部放自己 home 目录
+   （如 /home/l00955908/nds/），禁止写入 /home/xxx、/home/yin 等他人目录
+   （可读不可写），禁止写 /tmp 之外的系统目录。
+2. **搜索限域**：禁止 `find /` 全盘搜索；限定路径（/usr/local/Ascend、
+   /usr/lib64、/opt、$HOME）并加超时，如
+   `timeout 60 find <路径...> -name <pattern> 2>/dev/null`。
+3. **编译限核**：`make -j16`（不要 -j$(nproc)），可加 nice 降优先级：
+   `nice -n 10 make -j16`；编译尽量错峰（避开整机高负载时段）。
+4. **SPDK 大页内存**：urma_perf 初始化会消耗 hugepages。跑前先记录现状
+   （`grep -i huge /proc/meminfo`），只做短时测试（-t 5），测完确认大页
+   释放；若需要调大 hugepages，测后必须恢复原值并记录。
+5. **绑核限定**：urma_perf 用 `-m` 显式指定少量核（如 `-m 0x3` 只用头两个核），
+   不要让 SPDK 占满所有核。
+6. **URMA 设备共享**：URMA 网卡/设备是整机共享的，跑测试前确认无他人在用
+   （如问管理员/看是否有其他 URMA 进程），测试窗口尽量短。
+7. **不改系统配置**：不安装/卸载系统包、不改内核参数（除非第 4 条的
+   hugepages 且须恢复）；**严禁**在共享机上 insmod/rmmod 任何内核模块
+   （包括将来 Phase 2 的 .ko，届时单独协调维护窗口）。
+8. **破坏性写保护**：urma_perf 会覆写 target 盘数据——只允许对已确认的
+   空闲盘/专用测试盘进行，且跑前记录、跑后注明。
+
+违反以上任一条导致影响他人时，立即停止操作、原样记录、回传等待指令。
+
 ## 1. 机器角色识别（两台都要跑）
 
 ```bash
@@ -96,8 +123,8 @@ ls examples/nvme/urma_perf/urma_perf_npu.c   # 预期存在
 ## 4. 定位 UMDK 并编译（节点 1）
 
 ```bash
-# 找 UMDK（同事B环境里应已存在）
-find / -name "urma_api.h" -not -path "*/spdk*" 2>/dev/null
+# 找 UMDK（同事B环境里应已存在；限定路径，禁止全盘 find）
+timeout 60 find /usr/local /usr/lib64 /opt /home -name "urma_api.h" -not -path "*/spdk*" 2>/dev/null
 ```
 
 `urma_api.h` 所在路径向上回溯到 UMDK 仓库根目录（其下应有
@@ -106,7 +133,8 @@ find / -name "urma_api.h" -not -path "*/spdk*" 2>/dev/null
 ```bash
 cd spdk-urma
 ./configure --with-urma=<UMDK> 2>&1 | tail -30
-make -j$(nproc) 2>&1 | tail -50
+# 共享机限核编译（守则第 3 条：禁用 -j$(nproc)）
+nice -n 10 make -j16 2>&1 | tail -50
 ls -l build/examples/urma_perf
 ```
 
@@ -292,7 +320,8 @@ find /sys -name '*udmac*' 2>/dev/null | head
 ls /dev | grep -i udma
 ```
 再跑回归（先不带 SPDK_URMA_DEV_NAME 让其自动选第一个设备；如连接失败再
-补上 DEV_NAME 重试）：
+补上 DEV_NAME 重试）。**遵守隔离守则**：跑前记录 hugepages 现状
+（`grep -i huge /proc/meminfo`），默认 -T 1 只绑 1 核无需 -m，勿加大线程数：
 ```bash
 LD_LIBRARY_PATH=<上面存在的 umdk lib 路径> \
 SPDK_URMA_MAX_IO_SIZE=4194304 \
@@ -313,8 +342,10 @@ SPDK_URMA_MAX_IO_SIZE=4194304 \
 
 **任务 4：恢复现场**
 
-测试完成后在 node4 还原 NVMe 盘（脚本有残留还原功能；若不确定还原方法，
-记录盘的当前状态并注明"等待还原指令"，不要自行操作）。
+- node4：测试后还原 NVMe 盘（脚本有残留还原功能；若不确定还原方法，
+  记录盘的当前状态并注明"等待还原指令"，不要自行操作）
+- node1/197：确认 hugepages 恢复到跑前水平（对照任务 2b 的记录），
+  清理自己目录下的临时文件，他人目录与系统目录不动
 
 **回传要求**：全部输出追加到本文件第 9 节新条目，commit
 （`docs(nds-task): CRLF修复+编译+cpu回归+错误路径验证`）并 push；
@@ -332,12 +363,12 @@ Initiator；Target 继续用 node4/151。本轮在完成上一轮指令的同时
 # A. NPU 基础
 npu-smi info
 
-# B. CANN 是否安装（记录确切路径）
-find / -name "libascendcl.so" 2>/dev/null
+# B. CANN 是否安装（限定路径，禁止全盘 find）
+timeout 60 find /usr/local/Ascend /usr/lib64 /opt /home -name "libascendcl.so" 2>/dev/null
 ls /usr/local/Ascend 2>/dev/null
 
-# B2. UMDK/liburma 是否可用（编译 urma_perf 必需）
-find / -name "urma_api.h" -not -path "*/spdk*" 2>/dev/null
+# B2. UMDK/liburma 是否可用（编译 urma_perf 必需；限定路径）
+timeout 60 find /usr/local /usr/lib64 /opt /home -name "urma_api.h" -not -path "*/spdk*" 2>/dev/null
 ldconfig -p | grep urma
 ls /usr/lib64/liburma* 2>/dev/null
 
