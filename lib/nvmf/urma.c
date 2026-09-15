@@ -1179,7 +1179,9 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	if (ureq->req.iovcnt != 1) {
 		return -ENOTSUP;
 	}
-	import_flag.bs.cacheable = URMA_CACHEABLE;
+	/* Match urma_perftest and Mooncake.  This is the provider import attribute;
+	 * the qpair import_cache below still owns and reuses the imported tseg. */
+	import_flag.bs.cacheable = URMA_NON_CACHEABLE;
 	import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
 	import_flag.bs.mapping = URMA_SEG_NOMAP;
 	/* Modified By Yida(v7): W5 — 远端段 import 缓存：seg 相同的 I/O 复用已
