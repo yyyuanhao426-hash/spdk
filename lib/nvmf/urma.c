@@ -2,8 +2,9 @@
  *   Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
 
-/* Experimental independent NVMe/URMA target transport.  The bootstrap socket
- * carries only endpoint descriptors, NVMe capsules and completions. */
+/* Experimental independent NVMe/URMA target transport.  TCP carries endpoint
+ * descriptors and, when configured, NVMe capsules. The alternate capsule path
+ * uses URMA SEND/RECV; payload bytes always use URMA READ/WRITE. */
 
 #include "spdk/stdinc.h"
 #include "spdk/log.h"
@@ -17,10 +18,32 @@
 #include "../nvme/nvme_urma_internal.h"
 
 #include <netdb.h>
+#include <netinet/tcp.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <sys/ioctl.h>
 
 /* Modified By Yida: Target-side memory registration cache */
 #define NVMF_URMA_REG_CACHE_SIZE 128
+
+/* Modified By Yida(v7): 远端段 import 缓存。capsule 每条 I/O 携带 initiator 的
+ * 内存段描述 (urma_seg_t)，同一段反复 import/unimport 是纯开销：按 seg 字节
+ * 缓存 import 结果（urma_target_seg_t），命中则本 I/O 完全不调 import，release
+ * 也不 unimport。配合 initiator 整池注册（spdk_nvme_urma_register_memory_for_qpair
+ * + urma_perf URMA_PERF_REGION_REG=1），capsule 每条 I/O 携带同一全区 seg →
+ * 每 qpair 只剩 1 条 import，所有 I/O 共享同一 UMMU 映射。
+ * 约束：initiator 在 qpair 存活期间不得 unregister 已出现过的 (va,len)——v6 起
+ * reg cache(128 槽) ≥ 工作集，稳态成立。SPDK_URMA_IMPORT_CACHE=0 可关闭。 */
+#define NVMF_URMA_IMPORT_CACHE_SIZE 128
+
+struct nvmf_urma_import_entry {
+	urma_seg_t seg;
+	urma_target_seg_t *tseg;
+	bool used;
+};
+/* Modified By Yida(v4): max capsules parsed per poll round. Bounded so JFC
+ * completions for in-flight data still get polled promptly on bursts. */
+#define NVMF_URMA_CAPSULE_BATCH 64
 
 struct nvmf_urma_reg_entry {
 	void *va;
@@ -28,6 +51,231 @@ struct nvmf_urma_reg_entry {
 	struct spdk_nvme_urma_memory_region *region;
 	bool used;
 };
+
+/* Modified By Yida(v3): target-side staged latency instrumentation, mirrors
+ * lib/nvme/nvme_urma.c g_timing (tick accumulators + printf dump). Stages:
+ * W4a parse capsule / W4b iobuf alloc / W5 import_seg / W6 register_memory /
+ * W7 post WR / W8 JFC wait (pull) / W9 exec->completion (bdev/SSD) /
+ * C2H push JFC wait / W10 send_response / release (unreg+unimport). */
+struct nvmf_urma_tgt_timing {
+	uint64_t capsule_ticks;  /* W4a: read_full hdr+capsule */
+	uint64_t capsule_n;
+	uint64_t buffer_ticks;   /* W4b: capsule parsed -> buffers ready */
+	uint64_t buffer_n;
+	uint64_t import_ticks;   /* W5: urma_import_seg (cache miss only) */
+	uint64_t import_n;
+	uint64_t import_hits;    /* Modified By Yida(v7): W5 import 缓存命中数 */
+	uint64_t reg_ticks;      /* W6: register_memory (cache miss only) */
+	uint64_t reg_misses;
+	uint64_t reg_hits;
+	uint64_t post_ticks;     /* W7: urma_post_jetty_send_wr */
+	uint64_t post_n;
+	uint64_t jfc_ticks;      /* W8: WR posted -> JFC completion (incl. poller latency) */
+	uint64_t jfc_n;
+	uint64_t exec_ticks;     /* W9: spdk_nvmf_request_exec -> req_complete */
+	uint64_t exec_n;
+	uint64_t push_ticks;     /* C2H: push WR posted -> JFC completion */
+	uint64_t push_n;
+	uint64_t rsp_ticks;      /* W10: response TCP write or inline SEND post */
+	uint64_t rsp_n;
+	uint64_t release_ticks;  /* unregister (uncached) + urma_unimport_seg */
+	uint64_t release_n;
+	uint64_t total_ticks;    /* capsule parsed -> rsp written (target service time) */
+	uint64_t total_n;
+	/* Modified By Yida(v4): W4p — capsule queueing before parse. peek = first
+	 * poll round whose MSG_PEEK saw the hdr; parse = t_parse0. Covers rcvbuf
+	 * residency + poller interval. partial_n counts rounds where the hdr was
+	 * visible but the capsule body was still in flight (FIONREAD gate bounced). */
+	uint64_t peek_wait_ticks;
+	uint64_t peek_wait_n;
+	uint64_t partial_n;
+};
+
+static struct nvmf_urma_tgt_timing g_tgt_timing;
+
+#define NVMF_URMA_TGT_ADD(field, val) \
+	__atomic_add_fetch(&g_tgt_timing.field, (uint64_t)(val), __ATOMIC_RELAXED)
+#define NVMF_URMA_TGT_INC(field) \
+	__atomic_add_fetch(&g_tgt_timing.field, 1, __ATOMIC_RELAXED)
+#define NVMF_URMA_TGT_STAGE(field, ticks) do { \
+	NVMF_URMA_TGT_ADD(field ## _ticks, (ticks)); \
+	NVMF_URMA_TGT_INC(field ## _n); \
+} while (0)
+
+/* Modified By Yida(v4): per-I/O receive trace for cross-machine correlation.
+ * In TCP mode, peek is the first observation of the header and parse means the
+ * complete capsule is read. In SEND/RECV mode both are the receive completion
+ * processing tick. rsp is the response write/post return tick. Joined with the
+ * initiator's send records by (qid, cid); comparing hosts requires clock sync.
+ * Ring keeps the most recent N records; outstanding requests are far below N
+ * so a wrapped record can never belong to an in-flight request. */
+struct nvmf_urma_rx_trace {
+	uint64_t peek_tick;
+	uint64_t parse_tick;
+	uint64_t rsp_tick;
+	uint32_t length;
+	uint16_t qid;
+	uint16_t cid;
+	uint8_t opcode;
+	uint8_t xfer;
+};
+
+#define NVMF_URMA_RX_TRACE_SIZE 8192
+static struct nvmf_urma_rx_trace g_rx_trace[NVMF_URMA_RX_TRACE_SIZE];
+static uint64_t g_rx_trace_idx;
+
+static void
+nvmf_urma_timing_dump(void)
+{
+	uint64_t hz = spdk_get_ticks_hz();
+	uint64_t capsule = __atomic_load_n(&g_tgt_timing.capsule_ticks, __ATOMIC_RELAXED);
+	uint64_t cap_n = __atomic_load_n(&g_tgt_timing.capsule_n, __ATOMIC_RELAXED);
+	uint64_t buffer = __atomic_load_n(&g_tgt_timing.buffer_ticks, __ATOMIC_RELAXED);
+	uint64_t buf_n = __atomic_load_n(&g_tgt_timing.buffer_n, __ATOMIC_RELAXED);
+	uint64_t imp = __atomic_load_n(&g_tgt_timing.import_ticks, __ATOMIC_RELAXED);
+	uint64_t imp_n = __atomic_load_n(&g_tgt_timing.import_n, __ATOMIC_RELAXED);
+	uint64_t reg = __atomic_load_n(&g_tgt_timing.reg_ticks, __ATOMIC_RELAXED);
+	uint64_t miss = __atomic_load_n(&g_tgt_timing.reg_misses, __ATOMIC_RELAXED);
+	uint64_t hit = __atomic_load_n(&g_tgt_timing.reg_hits, __ATOMIC_RELAXED);
+	uint64_t post = __atomic_load_n(&g_tgt_timing.post_ticks, __ATOMIC_RELAXED);
+	uint64_t post_n = __atomic_load_n(&g_tgt_timing.post_n, __ATOMIC_RELAXED);
+	uint64_t jfc = __atomic_load_n(&g_tgt_timing.jfc_ticks, __ATOMIC_RELAXED);
+	uint64_t jfc_n = __atomic_load_n(&g_tgt_timing.jfc_n, __ATOMIC_RELAXED);
+	uint64_t exec = __atomic_load_n(&g_tgt_timing.exec_ticks, __ATOMIC_RELAXED);
+	uint64_t exec_n = __atomic_load_n(&g_tgt_timing.exec_n, __ATOMIC_RELAXED);
+	uint64_t push = __atomic_load_n(&g_tgt_timing.push_ticks, __ATOMIC_RELAXED);
+	uint64_t push_n = __atomic_load_n(&g_tgt_timing.push_n, __ATOMIC_RELAXED);
+	uint64_t rsp = __atomic_load_n(&g_tgt_timing.rsp_ticks, __ATOMIC_RELAXED);
+	uint64_t rsp_n = __atomic_load_n(&g_tgt_timing.rsp_n, __ATOMIC_RELAXED);
+	uint64_t rel = __atomic_load_n(&g_tgt_timing.release_ticks, __ATOMIC_RELAXED);
+	uint64_t rel_n = __atomic_load_n(&g_tgt_timing.release_n, __ATOMIC_RELAXED);
+	uint64_t tot = __atomic_load_n(&g_tgt_timing.total_ticks, __ATOMIC_RELAXED);
+	uint64_t tot_n = __atomic_load_n(&g_tgt_timing.total_n, __ATOMIC_RELAXED);
+	/* Modified By Yida(v4): W4p queueing before parse */
+	uint64_t peek_wait = __atomic_load_n(&g_tgt_timing.peek_wait_ticks, __ATOMIC_RELAXED);
+	uint64_t peek_n = __atomic_load_n(&g_tgt_timing.peek_wait_n, __ATOMIC_RELAXED);
+	uint64_t partial = __atomic_load_n(&g_tgt_timing.partial_n, __ATOMIC_RELAXED);
+
+	/* printf instead of SPDK_NOTICELOG, same reason as the initiator dump:
+	 * nvmf_tgt's default log level filters NOTICE, printf always shows. */
+	/* Modified By Yida: avg 一律先除 n 再乘系数，避免 ticks×1e9 溢出 uint64
+	 * （64K/128K 的 W9 累计 2.3e10~1.1e11 ticks，旧式先乘后除打印出错的 avg） */
+	printf("==== URMA target timing breakdown (hz=%lu) ====\n", hz);
+	printf("  W4p peek->parse:     %lu ticks, n=%lu, avg=%lu ns (rcvbuf/poll queueing)\n",
+	       peek_wait, peek_n, peek_n ? peek_wait / peek_n * 1000000000ULL / hz : 0);
+	printf("  capsule splits (hdr seen, body pending): n=%lu\n", partial);
+	printf("  W4a parse capsule:   %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       capsule, cap_n, cap_n ? capsule / cap_n * 1000000000ULL / hz : 0,
+	       capsule * 1000 / hz);
+	printf("  W4b iobuf alloc:     %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       buffer, buf_n, buf_n ? buffer / buf_n * 1000000000ULL / hz : 0,
+	       buffer * 1000 / hz);
+	printf("  W5 import_seg:       %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       imp, imp_n, imp_n ? imp / imp_n * 1000000000ULL / hz : 0,
+	       imp * 1000 / hz);
+	printf("  W5 cache_hit:        n=%lu, miss=%lu\n",
+	       __atomic_load_n(&g_tgt_timing.import_hits, __ATOMIC_RELAXED), imp_n);
+	printf("  W6 register (miss):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       reg, miss, miss ? reg / miss * 1000000000ULL / hz : 0,
+	       reg * 1000 / hz);
+	printf("  W6 cache_hit:        n=%lu, miss=%lu\n", hit, miss);
+	printf("  W7 post WR:          %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       post, post_n, post_n ? post / post_n * 1000000000ULL / hz : 0,
+	       post * 1000 / hz);
+	printf("  W8 JFC wait (pull):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       jfc, jfc_n, jfc_n ? jfc / jfc_n * 1000000000ULL / hz : 0,
+	       jfc * 1000 / hz);
+	printf("  W9 exec->cpl (SSD):  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       exec, exec_n, exec_n ? exec / exec_n * 1000000000ULL / hz : 0,
+	       exec * 1000 / hz);
+	printf("  push JFC wait (C2H): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       push, push_n, push_n ? push / push_n * 1000000000ULL / hz : 0,
+	       push * 1000 / hz);
+	printf("  W10 send rsp:        %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       rsp, rsp_n, rsp_n ? rsp / rsp_n * 1000000000ULL / hz : 0,
+	       rsp * 1000 / hz);
+	printf("  release (unreg+unimport): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       rel, rel_n, rel_n ? rel / rel_n * 1000000000ULL / hz : 0,
+	       rel * 1000 / hz);
+	printf("  TOTAL (parse->rsp):  %lu ticks, n=%lu, avg=%lu us, total=%lu ms\n",
+	       tot, tot_n, tot_n ? tot / tot_n * 1000000ULL / hz : 0,
+	       tot * 1000 / hz);
+	if (tot > 0) {
+		printf("  breakdown: parse=%.1f%% buf=%.1f%% import=%.1f%% reg=%.1f%% post=%.1f%% jfc=%.1f%% exec=%.1f%% push=%.1f%% rsp=%.1f%% release=%.1f%%\n",
+		       100.0 * capsule / tot, 100.0 * buffer / tot, 100.0 * imp / tot,
+		       100.0 * reg / tot, 100.0 * post / tot, 100.0 * jfc / tot,
+		       100.0 * exec / tot, 100.0 * push / tot, 100.0 * rsp / tot,
+		       100.0 * rel / tot);
+	}
+	fflush(stdout);
+}
+
+static int
+nvmf_urma_timing_dump_poller(void *ctx)
+{
+	nvmf_urma_timing_dump();
+	return SPDK_POLLER_IDLE;
+}
+
+/* Modified By Yida(v6): per-I/O rx trace CSV 默认关闭（每轮最多 8192 行，刷屏）；
+ * SPDK_URMA_TRACE=1 时才采集并 dump，聚合 breakdown 不受影响。 */
+static int
+nvmf_urma_trace_enabled(void)
+{
+	static int enabled = -1;
+
+	if (enabled == -1) {
+		const char *v = getenv("SPDK_URMA_TRACE");
+
+		enabled = (v != NULL && v[0] == '1');
+	}
+	return enabled;
+}
+
+/* Modified By Yida(v4): dump the per-I/O receive trace as CSV. Called only at
+ * round end (new connection resets) and transport destroy — never from the
+ * periodic poller dump, which would flood the log. */
+static void
+nvmf_urma_rx_trace_dump(void)
+{
+	uint64_t total = __atomic_load_n(&g_rx_trace_idx, __ATOMIC_RELAXED);
+	uint64_t n = total < NVMF_URMA_RX_TRACE_SIZE ? total : NVMF_URMA_RX_TRACE_SIZE;
+	uint64_t start = total - n;
+
+	if (!nvmf_urma_trace_enabled() || n == 0) {
+		return;
+	}
+	printf("==== URMA rx trace (most recent %lu of %lu; peek/parse/rsp are target-local TSC) ====\n",
+	       n, total);
+	printf("seq,qid,cid,opcode,length,peek_tick,parse_tick,rsp_tick,peek_to_parse_ticks\n");
+	for (uint64_t i = 0; i < n; i++) {
+		const struct nvmf_urma_rx_trace *rec = &g_rx_trace[(start + i) % NVMF_URMA_RX_TRACE_SIZE];
+
+		printf("%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu\n",
+		       start + i, rec->qid, rec->cid, rec->opcode, rec->length,
+		       rec->peek_tick, rec->parse_tick, rec->rsp_tick,
+		       rec->parse_tick - rec->peek_tick);
+	}
+	fflush(stdout);
+}
+
+/* Modified By Yida(v3): target 是长驻进程，计数自启动起一直累加，多轮 urma_perf
+ * （不同 iosize）的数据会混在一起没法按轮分析。每接受一条新连接（新一轮
+ * urma_perf 开始）时，先把上一轮的最终累计 dump 出来再清零——日志里每轮独立成块。
+ * urma_perf 的一轮会连续建 1 admin + N IO 条连接，工作 I/O 在全部连接就绪后才开始，
+ * 所以 burst 内的多次 reset 都发生在测量之前，最后那次生效，setup 噪音也被清掉。 */
+static void
+nvmf_urma_timing_reset(void)
+{
+	if (__atomic_load_n(&g_tgt_timing.total_n, __ATOMIC_RELAXED) > 0) {
+		printf("---- 新连接进入：以下为上一轮（自上次清零以来）的最终计时 ----\n");
+		nvmf_urma_timing_dump();
+	}
+	/* Modified By Yida(v4): per-round per-I/O trace, cleared with the aggregates */
+	nvmf_urma_rx_trace_dump();
+	__atomic_store_n(&g_rx_trace_idx, 0, __ATOMIC_RELAXED);
+	memset(&g_tgt_timing, 0, sizeof(g_tgt_timing));
+}
 
 enum nvmf_urma_req_state {
 	NVMF_URMA_REQ_FREE = 0,
@@ -39,17 +287,46 @@ enum nvmf_urma_req_state {
 
 struct nvmf_urma_transport;
 struct nvmf_urma_poll_group;
+struct nvmf_urma_qpair;
+
+enum nvmf_urma_cqe_type {
+	NVMF_URMA_CQE_DATA = 1,
+	NVMF_URMA_CQE_CAPSULE_RX,
+	NVMF_URMA_CQE_CAPSULE_TX,
+};
+
+struct nvmf_urma_cqe_ctx {
+	enum nvmf_urma_cqe_type type;
+	void *owner;
+};
+
+struct nvmf_urma_cmd_rx_slot {
+	struct nvmf_urma_cqe_ctx cqe;
+	struct nvmf_urma_qpair *qpair;
+	struct spdk_urma_capsule_cmd_frame frame;
+	urma_sge_t sge;
+	urma_jfr_wr_t wr;
+};
 
 struct nvmf_urma_req {
+	struct nvmf_urma_cqe_ctx cqe;
 	struct spdk_nvmf_request req;
 	union nvmf_h2c_msg cmd;
 	union nvmf_c2h_msg rsp;
 	struct spdk_urma_data_desc remote_data;
 	urma_target_seg_t *remote_seg;
+	/* Modified By Yida(v7): remote_seg 保活于 qpair import_cache——release 不得 unimport */
+	bool remote_seg_cached;
 	struct spdk_nvme_urma_memory_region *local_region;
 	/* Modified By Yida: cache entry when local_region is cached (NULL if uncached) */
 	struct nvmf_urma_reg_entry *cache_entry; /* NULL if uncached */
 	enum nvmf_urma_req_state state;
+	/* Modified By Yida(v3): staged latency instrumentation */
+	uint64_t start_tick;   /* capsule parsed; 0 = not a timed data request */
+	uint64_t post_tick;    /* data WR posted (JFC wait start) */
+	uint64_t exec_tick;    /* spdk_nvmf_request_exec called; 0 = not timed */
+	/* Modified By Yida(v4): index into g_rx_trace for this I/O's per-I/O record */
+	uint32_t trace_idx;
 	TAILQ_ENTRY(nvmf_urma_req) link;
 };
 
@@ -66,9 +343,20 @@ struct nvmf_urma_qpair {
 	char service[SPDK_NVMF_TRSVCID_MAX_LEN + 1];
 	uint32_t resource_count;
 	uint32_t max_io_size;
+	enum spdk_urma_capsule_transport capsule_transport;
+	struct nvmf_urma_cqe_ctx capsule_tx_cqe;
+	struct nvmf_urma_cmd_rx_slot *capsule_rx_slots;
+	struct spdk_nvme_urma_memory_region *capsule_rx_region;
+	uint32_t capsule_rx_count;
 	struct nvmf_urma_req *reqs;
+	/* Modified By Yida(v4): tick of the poll round that first MSG_PEEK'd the
+	 * hdr currently at the head of rcvbuf; 0 = none. Kept across rounds while
+	 * the capsule body is still in flight so peek->parse covers real queueing. */
+	uint64_t pending_peek_tick;
 	/* Modified By Yida: target-side registration cache */
 	struct nvmf_urma_reg_entry reg_cache[NVMF_URMA_REG_CACHE_SIZE];
+	/* Modified By Yida(v7): 远端段 import 缓存（见 NVMF_URMA_IMPORT_CACHE_SIZE 注释） */
+	struct nvmf_urma_import_entry import_cache[NVMF_URMA_IMPORT_CACHE_SIZE];
 	TAILQ_HEAD(, nvmf_urma_req) free_reqs;
 	TAILQ_HEAD(, nvmf_urma_req) working_reqs;
 	TAILQ_ENTRY(nvmf_urma_qpair) link;
@@ -93,6 +381,8 @@ struct nvmf_urma_transport {
 	struct spdk_urma_transport_opts urma_opts;
 	struct spdk_urma_device *device;
 	struct spdk_poller *accept_poller;
+	/* Modified By Yida(v3): optional periodic staged-latency dump */
+	struct spdk_poller *dump_poller;
 	TAILQ_HEAD(, nvmf_urma_port) ports;
 	TAILQ_HEAD(, nvmf_urma_poll_group) poll_groups;
 };
@@ -100,6 +390,7 @@ struct nvmf_urma_transport {
 struct nvmf_urma_json_opts {
 	char *dev_name;
 	char *trans_mode;
+	char *capsule_transport;
 	int32_t active_port;
 	uint32_t eid_index;
 	uint32_t jfc_count;
@@ -113,6 +404,8 @@ struct nvmf_urma_json_opts {
 static const struct spdk_json_object_decoder g_urma_opts_decoder[] = {
 	{"dev_name", offsetof(struct nvmf_urma_json_opts, dev_name), spdk_json_decode_string, true},
 	{"trans_mode", offsetof(struct nvmf_urma_json_opts, trans_mode), spdk_json_decode_string, true},
+	{"capsule_transport", offsetof(struct nvmf_urma_json_opts, capsule_transport),
+	 spdk_json_decode_string, true},
 	{"active_port", offsetof(struct nvmf_urma_json_opts, active_port), spdk_json_decode_int32, true},
 	{"eid_index", offsetof(struct nvmf_urma_json_opts, eid_index), spdk_json_decode_uint32, true},
 	{"jfc_count", offsetof(struct nvmf_urma_json_opts, jfc_count), spdk_json_decode_uint32, true},
@@ -177,11 +470,23 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 	struct spdk_urma_device *device = uqpair->device;
 	urma_jfs_cfg_t jfs = {};
 	urma_jetty_cfg_t cfg = {};
+	uint32_t capsule_inline_size = sizeof(struct spdk_urma_capsule_cmd_frame);
 
 	jfs.depth = device->opts.jetty_depth;
 	jfs.trans_mode = device->opts.transport_mode;
-	jfs.priority = SPDK_URMA_DEFAULT_PRIORITY;
+	/* Modified By Yida(v7): priority 可 env 覆盖——liburma 提示 CTP 建议 6，
+	 * SPDK 默认 15（裸工具未设置），用于判别引擎按 priority 调度的差异 */
+	jfs.priority = spdk_urma_env_u32("SPDK_URMA_JETTY_PRIORITY",
+					 SPDK_URMA_DEFAULT_PRIORITY);
 	jfs.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
+	if (device->opts.capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+		if (device->attr.dev_cap.max_jfs_inline_len < capsule_inline_size) {
+			SPDK_ERRLOG("URMA capsule SEND requires %u inline bytes, device supports %u\n",
+				    capsule_inline_size, device->attr.dev_cap.max_jfs_inline_len);
+			return -EMSGSIZE;
+		}
+		jfs.max_inline_data = capsule_inline_size;
+	}
 	jfs.rnr_retry = SPDK_URMA_DEFAULT_RNR_RETRY;
 	jfs.err_timeout = SPDK_URMA_DEFAULT_ERR_TIMEOUT;
 	jfs.jfc = device->jfcs[0];
@@ -195,12 +500,78 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 }
 
 static int
+nvmf_urma_post_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot)
+{
+	urma_jfr_wr_t *bad_wr = NULL;
+
+	return urma_post_jetty_recv_wr(slot->qpair->jetty, &slot->wr, &bad_wr) ==
+	       URMA_SUCCESS ? 0 : -EIO;
+}
+
+static int
+nvmf_urma_capsule_resources_init(struct nvmf_urma_qpair *uqpair)
+{
+	urma_target_seg_t *tseg;
+	int rc;
+
+	if (uqpair->capsule_transport != SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+		return 0;
+	}
+	uqpair->capsule_rx_count = uqpair->qpair.sq_head_max + 1;
+	if (uqpair->capsule_rx_count == 0 ||
+	    uqpair->capsule_rx_count > uqpair->device->jfr->jfr_cfg.depth) {
+		return -EINVAL;
+	}
+	uqpair->capsule_rx_slots = calloc(uqpair->capsule_rx_count,
+					  sizeof(*uqpair->capsule_rx_slots));
+	if (uqpair->capsule_rx_slots == NULL) {
+		return -ENOMEM;
+	}
+	rc = spdk_nvme_urma_register_memory(uqpair->device->context,
+			uqpair->capsule_rx_slots,
+			uqpair->capsule_rx_count * sizeof(*uqpair->capsule_rx_slots),
+			SPDK_NVME_URMA_MEM_HOST, &uqpair->capsule_rx_region);
+	if (rc != 0) {
+		return rc;
+	}
+	tseg = spdk_urma_memory_region_get_tseg(uqpair->capsule_rx_region);
+	for (uint32_t i = 0; i < uqpair->capsule_rx_count; i++) {
+		struct nvmf_urma_cmd_rx_slot *slot = &uqpair->capsule_rx_slots[i];
+
+		slot->cqe.type = NVMF_URMA_CQE_CAPSULE_RX;
+		slot->cqe.owner = slot;
+		slot->qpair = uqpair;
+		slot->sge.addr = (uint64_t)&slot->frame;
+		slot->sge.len = sizeof(slot->frame);
+		slot->sge.tseg = tseg;
+		slot->wr.src.sge = &slot->sge;
+		slot->wr.src.num_sge = 1;
+		slot->wr.user_ctx = (uint64_t)&slot->cqe;
+		if (nvmf_urma_post_cmd_receive(slot) != 0) {
+			return -EIO;
+		}
+	}
+	return 0;
+}
+
+static void
+nvmf_urma_capsule_resources_fini(struct nvmf_urma_qpair *uqpair)
+{
+	spdk_nvme_urma_unregister_memory(uqpair->capsule_rx_region);
+	uqpair->capsule_rx_region = NULL;
+	free(uqpair->capsule_rx_slots);
+	uqpair->capsule_rx_slots = NULL;
+	uqpair->capsule_rx_count = 0;
+}
+
+static int
 nvmf_urma_handshake(struct nvmf_urma_qpair *uqpair)
 {
 	struct spdk_urma_device *device = uqpair->device;
 	struct spdk_urma_msg_hdr hdr = {};
 	struct spdk_urma_endpoint_desc local = {}, remote = {};
 	urma_rjetty_t rjetty = {};
+	uint32_t max_queue_depth;
 	int rc;
 
 	rc = nvmf_urma_read_full(uqpair->fd, &hdr, sizeof(hdr));
@@ -213,13 +584,25 @@ nvmf_urma_handshake(struct nvmf_urma_qpair *uqpair)
 	    remote.transport_mode != device->opts.transport_mode) {
 		return -EPROTONOSUPPORT;
 	}
-	if (remote.max_queue_depth == 0 || remote.max_io_size == 0) {
+	if (remote.max_queue_depth < 2 || remote.max_io_size == 0) {
 		return -EPROTO;
 	}
+	max_queue_depth = spdk_min(remote.max_queue_depth,
+				   spdk_min(uqpair->transport->transport.opts.max_queue_depth,
+					    device->jfr->jfr_cfg.depth));
+	if (max_queue_depth < 2) {
+		return -EINVAL;
+	}
 	uqpair->qpair.qid = hdr.qid;
-	uqpair->qpair.sq_head_max = spdk_min(remote.max_queue_depth,
-					      uqpair->transport->transport.opts.max_queue_depth) - 1;
+	uqpair->qpair.sq_head_max = max_queue_depth - 1;
 	uqpair->max_io_size = spdk_min(device->opts.max_io_size, remote.max_io_size);
+	if (remote.capsule_transport != device->opts.capsule_transport) {
+		SPDK_ERRLOG("URMA handshake capsule mode mismatch: local=%s remote=%s\n",
+			    spdk_urma_capsule_transport_name(device->opts.capsule_transport),
+			    spdk_urma_capsule_transport_name(remote.capsule_transport));
+		return -EPROTONOSUPPORT;
+	}
+	uqpair->capsule_transport = device->opts.capsule_transport;
 	rjetty.jetty_id.eid = remote.eid;
 	rjetty.jetty_id.id = remote.jetty_id;
 	rjetty.trans_mode = remote.transport_mode;
@@ -239,13 +622,18 @@ nvmf_urma_handshake(struct nvmf_urma_qpair *uqpair)
 			return -EIO;
 		}
 	}
+	rc = nvmf_urma_capsule_resources_init(uqpair);
+	if (rc != 0) {
+		return rc;
+	}
 	hdr.type = SPDK_URMA_MSG_HELLO_RSP;
 	hdr.length = sizeof(local);
 	local.eid = device->eid;
 	local.jetty_id = uqpair->jetty->jetty_id.id;
 	local.transport_mode = device->opts.transport_mode;
-	local.max_queue_depth = uqpair->transport->transport.opts.max_queue_depth;
+	local.max_queue_depth = max_queue_depth;
 	local.max_io_size = uqpair->transport->transport.opts.max_io_size;
+	local.capsule_transport = uqpair->capsule_transport;
 	rc = nvmf_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
 	return rc == 0 ? nvmf_urma_write_full(uqpair->fd, &local, sizeof(local)) : rc;
 }
@@ -287,6 +675,11 @@ nvmf_urma_accept(void *arg)
 			if (fd < 0) {
 				break;
 			}
+			/* Keep the bootstrap and optional TCP capsule path low latency. */
+			{
+				int flag = 1;
+				setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+			}
 			uqpair = calloc(1, sizeof(*uqpair));
 			if (uqpair == NULL) {
 				close(fd);
@@ -296,6 +689,8 @@ nvmf_urma_accept(void *arg)
 			uqpair->transport = transport;
 			uqpair->qpair.transport = &transport->transport;
 			uqpair->qpair.state = SPDK_NVMF_QPAIR_UNINITIALIZED;
+			uqpair->capsule_tx_cqe.type = NVMF_URMA_CQE_CAPSULE_TX;
+			uqpair->capsule_tx_cqe.owner = uqpair;
 			TAILQ_INIT(&uqpair->free_reqs);
 			TAILQ_INIT(&uqpair->working_reqs);
 			/* Modified by Yin: 拆分 accept 复合条件为独立 rc，逐阶段打错误日志便于定位 */
@@ -319,11 +714,14 @@ nvmf_urma_accept(void *arg)
 				if (uqpair->jetty != NULL) {
 					urma_delete_jetty(uqpair->jetty);
 				}
+				nvmf_urma_capsule_resources_fini(uqpair);
 				spdk_urma_device_close(uqpair->device);
 				close(fd);
 				free(uqpair);
 				continue;
 			}
+			/* Modified By Yida(v3): 每条新连接视作新一轮测量的开始 */
+			nvmf_urma_timing_reset();
 			spdk_nvmf_tgt_new_qpair(transport->transport.tgt, &uqpair->qpair);
 			accepted++;
 		}
@@ -370,6 +768,7 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 					    SPDK_COUNTOF(g_urma_opts_decoder), &json_opts) != 0) {
 		free(json_opts.dev_name);
 		free(json_opts.trans_mode);
+		free(json_opts.capsule_transport);
 		free(transport);
 		return NULL;
 	}
@@ -387,9 +786,21 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 		} else {
 			free(json_opts.dev_name);
 			free(json_opts.trans_mode);
+			free(json_opts.capsule_transport);
 			free(transport);
 			return NULL;
 		}
+	}
+	if (json_opts.capsule_transport != NULL &&
+	    spdk_urma_parse_capsule_transport(json_opts.capsule_transport,
+					      &transport->urma_opts.capsule_transport) != 0) {
+		SPDK_ERRLOG("Invalid URMA capsule_transport '%s' (expected 'tcp' or 'sendrecv')\n",
+			    json_opts.capsule_transport);
+		free(json_opts.dev_name);
+		free(json_opts.trans_mode);
+		free(json_opts.capsule_transport);
+		free(transport);
+		return NULL;
 	}
 	transport->urma_opts.active_port = json_opts.active_port;
 	transport->urma_opts.eid_index = json_opts.eid_index;
@@ -401,14 +812,30 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	transport->urma_opts.bonding_multipath = json_opts.bonding_multipath;
 	free(json_opts.dev_name);
 	free(json_opts.trans_mode);
+	free(json_opts.capsule_transport);
 	transport->urma_opts.max_io_size = opts->max_io_size;
 	if (spdk_urma_device_open(&transport->urma_opts, &transport->device) != 0) {
+		/* Modified By Yida(v6): 具体失败阶段由 device_open 内部日志给出，这里带设备名兜底 */
+		SPDK_ERRLOG("urma transport create: device open failed for '%s'\n",
+			    transport->urma_opts.dev_name);
 		free(transport);
 		return NULL;
 	}
 	TAILQ_INIT(&transport->ports);
 	TAILQ_INIT(&transport->poll_groups);
 	transport->accept_poller = SPDK_POLLER_REGISTER(nvmf_urma_accept, transport, 1000);
+	/* Modified By Yida(v3): optional periodic staged-latency dump, e.g.
+	 * SPDK_URMA_TARGET_DUMP_SEC=10 ./build/bin/nvmf_tgt ... */
+	const char *dump_sec = getenv("SPDK_URMA_TARGET_DUMP_SEC");
+
+	if (dump_sec != NULL) {
+		uint64_t period_us = (uint64_t)atoi(dump_sec) * 1000000ULL;
+
+		if (period_us > 0) {
+			transport->dump_poller = SPDK_POLLER_REGISTER(nvmf_urma_timing_dump_poller,
+							transport, period_us);
+		}
+	}
 	return &transport->transport;
 }
 
@@ -421,6 +848,9 @@ nvmf_urma_dump_opts(struct spdk_nvmf_transport *base, struct spdk_json_write_ctx
 
 	spdk_json_write_named_string(w, "dev_name", transport->device->context->dev->name);
 	spdk_json_write_named_string(w, "trans_mode", mode);
+	spdk_json_write_named_string(w, "capsule_transport",
+				     spdk_urma_capsule_transport_name(
+					     transport->urma_opts.capsule_transport));
 	spdk_json_write_named_int32(w, "active_port", transport->device->active_port);
 	spdk_json_write_named_uint32(w, "jfc_count", transport->device->jfc_count);
 	spdk_json_write_named_uint32(w, "jfc_depth", transport->urma_opts.jfc_depth);
@@ -437,6 +867,11 @@ nvmf_urma_destroy(struct spdk_nvmf_transport *base,
 	struct nvmf_urma_port *port, *tmp;
 
 	spdk_poller_unregister(&transport->accept_poller);
+	/* Modified By Yida(v3): stop periodic dump and print final staged latencies */
+	spdk_poller_unregister(&transport->dump_poller);
+	nvmf_urma_timing_dump();
+	/* Modified By Yida(v4): final per-I/O rx trace for the last round */
+	nvmf_urma_rx_trace_dump();
 	TAILQ_FOREACH_SAFE(port, &transport->ports, link, tmp) {
 		TAILQ_REMOVE(&transport->ports, port, link);
 		close(port->fd);
@@ -548,6 +983,8 @@ nvmf_urma_poll_group_add(struct spdk_nvmf_transport_poll_group *base, struct spd
 	}
 	for (uint32_t i = 0; i < uqpair->resource_count; i++) {
 		struct nvmf_urma_req *ureq = &uqpair->reqs[i];
+		ureq->cqe.type = NVMF_URMA_CQE_DATA;
+		ureq->cqe.owner = ureq;
 		ureq->req.qpair = qpair;
 		ureq->req.cmd = &ureq->cmd;
 		ureq->req.rsp = &ureq->rsp;
@@ -578,18 +1015,76 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 	struct spdk_urma_msg_hdr hdr = {};
 	struct spdk_urma_capsule_rsp rsp = {.cpl = ureq->rsp.nvme_cpl};
 	int rc;
+	uint64_t t_rsp0 = spdk_get_ticks(); /* Modified By Yida(v3): W10 start */
 
 	hdr.magic = SPDK_URMA_WIRE_MAGIC;
 	hdr.version = SPDK_URMA_WIRE_VERSION;
 	hdr.type = SPDK_URMA_MSG_CAPSULE_RSP;
 	hdr.length = sizeof(rsp);
 	hdr.qid = uqpair->qpair.qid;
-	rc = nvmf_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
-	if (rc == 0) {
-		rc = nvmf_urma_write_full(uqpair->fd, &rsp, sizeof(rsp));
+	/* Keep the wire frame contiguous. TCP emits it with one write; SEND/RECV
+	 * copies the same bytes inline into the WQE before this stack frame goes
+	 * out of scope. */
+	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+		struct spdk_urma_capsule_rsp_frame frame = {
+			.hdr = hdr,
+			.capsule = rsp,
+		};
+		urma_sge_t sge = {
+			.addr = (uint64_t)&frame,
+			.len = sizeof(frame),
+		};
+		urma_jfs_wr_t wr = {}, *bad_wr = NULL;
+
+		wr.opcode = URMA_OPC_SEND;
+		wr.flag.bs.complete_enable = 1;
+		wr.flag.bs.inline_flag = 1;
+		wr.tjetty = uqpair->target_jetty;
+		wr.user_ctx = (uint64_t)&uqpair->capsule_tx_cqe;
+		wr.send.src.sge = &sge;
+		wr.send.src.num_sge = 1;
+		rc = urma_post_jetty_send_wr(uqpair->jetty, &wr, &bad_wr) ==
+		     URMA_SUCCESS ? 0 : -EIO;
+	} else {
+		uint8_t msg[sizeof(hdr) + sizeof(rsp)];
+
+		memcpy(msg, &hdr, sizeof(hdr));
+		memcpy(msg + sizeof(hdr), &rsp, sizeof(rsp));
+		rc = nvmf_urma_write_full(uqpair->fd, msg, sizeof(msg));
+	}
+	/* Modified By Yida(v3): W10 send rsp + target service total (parse -> rsp written) */
+	if (ureq->start_tick != 0) {
+		uint64_t t_rsp1 = spdk_get_ticks();
+
+		NVMF_URMA_TGT_STAGE(rsp, t_rsp1 - t_rsp0);
+		NVMF_URMA_TGT_STAGE(total, t_rsp1 - ureq->start_tick);
+		ureq->start_tick = 0;
+	}
+	/* Modified By Yida(v4): close this I/O's rx trace record with the response
+	 * completion tick (per-I/O target service time, even for un-timed reqs). */
+	if (ureq->trace_idx != UINT32_MAX) {
+		uint64_t idx = ureq->trace_idx % NVMF_URMA_RX_TRACE_SIZE;
+
+		__atomic_store_n(&g_rx_trace[idx].rsp_tick, spdk_get_ticks(), __ATOMIC_RELAXED);
+		ureq->trace_idx = UINT32_MAX;
 	}
 	nvmf_urma_release_req(ureq);
 	return rc;
+}
+
+/* Modified By Yida(v7): 远端段 import 缓存默认开启；SPDK_URMA_IMPORT_CACHE=0
+ * 恢复 per-I/O import/unimport 旧路径（回归对比用）。 */
+static int
+nvmf_urma_import_cache_enabled(void)
+{
+	static int enabled = -1;
+
+	if (enabled == -1) {
+		const char *v = getenv("SPDK_URMA_IMPORT_CACHE");
+
+		enabled = !(v != NULL && v[0] == '0');
+	}
+	return enabled;
 }
 
 static int
@@ -606,13 +1101,48 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	if (ureq->req.iovcnt != 1) {
 		return -ENOTSUP;
 	}
-	import_flag.bs.cacheable = URMA_NON_CACHEABLE;
+	import_flag.bs.cacheable = URMA_CACHEABLE;
 	import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
 	import_flag.bs.mapping = URMA_SEG_NOMAP;
-	ureq->remote_seg = urma_import_seg(device->context, &ureq->remote_data.seg,
-					    &token, 0, import_flag);
+	/* Modified By Yida(v7): W5 — 远端段 import 缓存：seg 相同的 I/O 复用已
+	 * import 的 tseg，只有首次见到的 seg 才真正调 urma_import_seg。
+	 * initiator 整池注册时所有 I/O 共享同一 seg → 每 qpair 仅 1 次 import。 */
+	ureq->remote_seg_cached = false;
+	if (nvmf_urma_import_cache_enabled()) {
+		for (int i = 0; i < NVMF_URMA_IMPORT_CACHE_SIZE; i++) {
+			struct nvmf_urma_import_entry *e = &uqpair->import_cache[i];
+
+			if (e->used && memcmp(&e->seg, &ureq->remote_data.seg,
+					      sizeof(urma_seg_t)) == 0) {
+				ureq->remote_seg = e->tseg;
+				ureq->remote_seg_cached = true;
+				NVMF_URMA_TGT_INC(import_hits);
+				break;
+			}
+		}
+	}
 	if (ureq->remote_seg == NULL) {
-		return -EIO;
+		/* Modified By Yida(v3): W5 — urma_import_seg (cache miss only) */
+		uint64_t t_import0 = spdk_get_ticks();
+
+		ureq->remote_seg = urma_import_seg(device->context, &ureq->remote_data.seg,
+						   &token, 0, import_flag);
+		if (ureq->remote_seg == NULL) {
+			return -EIO;
+		}
+		NVMF_URMA_TGT_STAGE(import, spdk_get_ticks() - t_import0);
+		/* 缓存满（>128 个不同 seg）时该 I/O 走旧路径：release 时 unimport */
+		for (int i = 0; i < NVMF_URMA_IMPORT_CACHE_SIZE; i++) {
+			struct nvmf_urma_import_entry *e = &uqpair->import_cache[i];
+
+			if (!e->used) {
+				e->seg = ureq->remote_data.seg;
+				e->tseg = ureq->remote_seg;
+				e->used = true;
+				ureq->remote_seg_cached = true;
+				break;
+			}
+		}
 	}
 	/* Modified By Yida: check target-side registration cache before registering */
 	ureq->cache_entry = NULL;
@@ -625,11 +1155,16 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 		}
 	}
 	if (ureq->cache_entry == NULL) {
+		/* Modified By Yida(v3): W6 — register_memory (cache miss only) */
+		uint64_t t_reg0 = spdk_get_ticks();
+
 		rc = spdk_nvme_urma_register_memory(device->context, ureq->req.iov[0].iov_base,
 				ureq->req.length, SPDK_NVME_URMA_MEM_HOST, &ureq->local_region);
 		if (rc != 0) {
 			return rc;
 		}
+		NVMF_URMA_TGT_ADD(reg_ticks, spdk_get_ticks() - t_reg0);
+		NVMF_URMA_TGT_INC(reg_misses);
 		/* Insert into cache */
 		for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
 			struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
@@ -642,6 +1177,8 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 				break;
 			}
 		}
+	} else {
+		NVMF_URMA_TGT_INC(reg_hits);
 	}
 	local_sge.addr = (uint64_t)ureq->req.iov[0].iov_base;
 	local_sge.len = ureq->req.length;
@@ -649,7 +1186,7 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	remote_sge.addr = ureq->remote_data.address;
 	remote_sge.len = ureq->req.length;
 	remote_sge.tseg = ureq->remote_seg;
-	wr.user_ctx = (uint64_t)ureq;
+	wr.user_ctx = (uint64_t)&ureq->cqe;
 	wr.opcode = push ? URMA_OPC_WRITE : URMA_OPC_READ;
 	wr.rw.src.sge = push ? &local_sge : &remote_sge;
 	wr.rw.src.num_sge = 1;
@@ -658,20 +1195,38 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	wr.flag.bs.complete_enable = 1;
 	wr.tjetty = uqpair->target_jetty;
 	ureq->state = push ? NVMF_URMA_REQ_PUSHING : NVMF_URMA_REQ_PULLING;
-	return urma_post_jetty_send_wr(uqpair->jetty, &wr, &bad_wr) == URMA_SUCCESS ? 0 : -EIO;
+	/* Modified By Yida(v3): W7 post WR; tick doubles as JFC wait start */
+	ureq->post_tick = spdk_get_ticks();
+	if (urma_post_jetty_send_wr(uqpair->jetty, &wr, &bad_wr) == URMA_SUCCESS) {
+		uint64_t t_post1 = spdk_get_ticks();
+
+		NVMF_URMA_TGT_STAGE(post, t_post1 - ureq->post_tick);
+		ureq->post_tick = t_post1;
+		return 0;
+	}
+	return -EIO;
 }
 
 static void
 nvmf_urma_buffers_ready(struct nvmf_urma_req *ureq)
 {
+	/* Modified By Yida(v3): W4b — capsule parsed -> buffers ready */
+	if (ureq->start_tick != 0) {
+		NVMF_URMA_TGT_STAGE(buffer, spdk_get_ticks() - ureq->start_tick);
+	}
 	if (ureq->req.xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
 		if (nvmf_urma_post_data(ureq, false) != 0) {
+			struct spdk_nvmf_qpair *qpair = ureq->req.qpair;
+
 			ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 			ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-			nvmf_urma_send_response(ureq);
+			if (nvmf_urma_send_response(ureq) != 0) {
+				qpair->state = SPDK_NVMF_QPAIR_ERROR;
+			}
 		}
 	} else {
 		ureq->state = NVMF_URMA_REQ_EXECUTING;
+		ureq->exec_tick = spdk_get_ticks(); /* Modified By Yida(v3): W9 start (C2H, no pull) */
 		spdk_nvmf_request_exec(&ureq->req);
 	}
 }
@@ -683,41 +1238,15 @@ nvmf_urma_req_get_buffers_done(struct spdk_nvmf_request *req)
 }
 
 static int
-nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
+nvmf_urma_handle_capsule(struct nvmf_urma_qpair *uqpair,
+			 const struct spdk_urma_msg_hdr *hdr,
+			 const struct spdk_urma_capsule_cmd *capsule,
+			 uint64_t t_peek, uint64_t t_parse0)
 {
-	struct spdk_urma_msg_hdr hdr;
-	struct spdk_urma_capsule_cmd capsule;
 	struct nvmf_urma_req *ureq;
-	ssize_t rc;
 
-	rc = recv(uqpair->fd, &hdr, sizeof(hdr), MSG_PEEK | MSG_DONTWAIT);
-	if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-		return 0;
-	}
-	if (rc <= 0) {
-		return -ECONNRESET;
-	}
-	if ((size_t)rc < sizeof(hdr)) {
-		return 0;
-	}
-	{
-		int available = 0;
-
-		if (ioctl(uqpair->fd, FIONREAD, &available) != 0) {
-			return -errno;
-		}
-		if ((size_t)available < sizeof(hdr) + hdr.length) {
-			return 0;
-		}
-	}
-	if (nvmf_urma_read_full(uqpair->fd, &hdr, sizeof(hdr)) != 0 ||
-	    hdr.magic != SPDK_URMA_WIRE_MAGIC || hdr.version != SPDK_URMA_WIRE_VERSION ||
-	    hdr.type != SPDK_URMA_MSG_CAPSULE_CMD || hdr.length != sizeof(capsule) ||
-	    nvmf_urma_read_full(uqpair->fd, &capsule, sizeof(capsule)) != 0) {
-		return -EPROTO;
-	}
-	if (capsule.data.length > uqpair->max_io_size) {
-		return -EMSGSIZE;
+	if (capsule->data.length > uqpair->max_io_size || hdr->qid != uqpair->qpair.qid) {
+		return capsule->data.length > uqpair->max_io_size ? -EMSGSIZE : -EPROTO;
 	}
 	ureq = TAILQ_FIRST(&uqpair->free_reqs);
 	if (ureq == NULL) {
@@ -726,12 +1255,30 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 	TAILQ_REMOVE(&uqpair->free_reqs, ureq, link);
 	TAILQ_INSERT_TAIL(&uqpair->working_reqs, ureq, link);
 	memset(&ureq->rsp, 0, sizeof(ureq->rsp));
-	ureq->cmd.nvme_cmd = capsule.cmd;
-	ureq->remote_data = capsule.data;
+	ureq->start_tick = 0;
+	ureq->exec_tick = 0;
+	ureq->trace_idx = UINT32_MAX;
+	NVMF_URMA_TGT_STAGE(peek_wait, t_parse0 - t_peek);
+	if (nvmf_urma_trace_enabled()) {
+		uint64_t idx = __atomic_fetch_add(&g_rx_trace_idx, 1, __ATOMIC_RELAXED) %
+			       NVMF_URMA_RX_TRACE_SIZE;
+		struct nvmf_urma_rx_trace *rec = &g_rx_trace[idx];
+
+		rec->peek_tick = t_peek;
+		rec->parse_tick = t_parse0;
+		rec->rsp_tick = 0;
+		rec->length = capsule->data.length;
+		rec->qid = hdr->qid;
+		rec->cid = capsule->cmd.cid;
+		rec->opcode = capsule->cmd.opc;
+		ureq->trace_idx = idx;
+	}
+	ureq->cmd.nvme_cmd = capsule->cmd;
+	ureq->remote_data = capsule->data;
 	ureq->req.raw = 0;
 	ureq->req.zcopy_phase = NVMF_ZCOPY_PHASE_NONE;
 	ureq->req.xfer = spdk_nvmf_req_get_xfer(&ureq->req);
-	ureq->req.length = capsule.data.length;
+	ureq->req.length = capsule->data.length;
 	uqpair->qpair.queue_depth++;
 	if (ureq->req.xfer == SPDK_NVME_DATA_NONE || ureq->req.length == 0) {
 		ureq->state = NVMF_URMA_REQ_EXECUTING;
@@ -739,11 +1286,95 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 		return 1;
 	}
 	ureq->state = NVMF_URMA_REQ_NEED_BUFFER;
+	ureq->start_tick = spdk_get_ticks();
 	if (spdk_nvmf_request_get_buffers(&ureq->req, &uqpair->group->group,
 					  &uqpair->transport->transport, ureq->req.length) == 0) {
 		nvmf_urma_buffers_ready(ureq);
 	}
 	return 1;
+}
+
+static int
+nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
+{
+	struct spdk_urma_msg_hdr hdr;
+	struct spdk_urma_capsule_cmd capsule;
+	ssize_t rc;
+
+	rc = recv(uqpair->fd, &hdr, sizeof(hdr), MSG_PEEK | MSG_DONTWAIT);
+	if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+		return 0;
+	}
+	if (rc <= 0) {
+		uqpair->pending_peek_tick = 0;
+		return -ECONNRESET;
+	}
+	if ((size_t)rc < sizeof(hdr)) {
+		return 0;
+	}
+	/* Modified By Yida(v4): W4p — stamp when the poller FIRST observed this
+	 * capsule in the kernel rcvbuf. If the hdr was already seen on an earlier
+	 * poll round (capsule body still in flight), reuse that tick: the capsule
+	 * has been queueing ever since. */
+	uint64_t t_peek;
+	if (uqpair->pending_peek_tick != 0) {
+		t_peek = uqpair->pending_peek_tick;
+	} else {
+		t_peek = spdk_get_ticks();
+		uqpair->pending_peek_tick = t_peek;
+	}
+	{
+		int available = 0;
+
+		if (ioctl(uqpair->fd, FIONREAD, &available) != 0) {
+			return -errno;
+		}
+		if ((size_t)available < sizeof(hdr) + hdr.length) {
+			/* Capsule split across TCP segments: hdr arrived, body not yet.
+			 * Keep pending_peek_tick and retry on a later poll round. */
+			NVMF_URMA_TGT_INC(partial_n);
+			return 0;
+		}
+	}
+	uqpair->pending_peek_tick = 0; /* full capsule arrived; marker consumed */
+	uint64_t t_parse0 = spdk_get_ticks(); /* Modified By Yida(v3): W4a parse start */
+	if (nvmf_urma_read_full(uqpair->fd, &hdr, sizeof(hdr)) != 0 ||
+	    hdr.magic != SPDK_URMA_WIRE_MAGIC || hdr.version != SPDK_URMA_WIRE_VERSION ||
+	    hdr.type != SPDK_URMA_MSG_CAPSULE_CMD || hdr.length != sizeof(capsule) ||
+	    nvmf_urma_read_full(uqpair->fd, &capsule, sizeof(capsule)) != 0) {
+		return -EPROTO;
+	}
+	NVMF_URMA_TGT_STAGE(capsule, spdk_get_ticks() - t_parse0);
+	return nvmf_urma_handle_capsule(uqpair, &hdr, &capsule, t_peek, t_parse0);
+}
+
+static int
+nvmf_urma_process_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot,
+			      const urma_cr_t *cr)
+{
+	struct nvmf_urma_qpair *uqpair = slot->qpair;
+	struct spdk_urma_capsule_cmd_frame frame = slot->frame;
+	uint64_t t_parse0 = spdk_get_ticks();
+	int rc;
+
+	if (cr->flag.bs.s_r == 0 || cr->opcode != URMA_CR_OPC_SEND ||
+	    cr->completion_len != (uint32_t)sizeof(frame)) {
+		return -EPROTO;
+	}
+	rc = nvmf_urma_post_cmd_receive(slot);
+	if (rc != 0) {
+		return rc;
+	}
+	if (frame.hdr.magic != SPDK_URMA_WIRE_MAGIC ||
+	    frame.hdr.version != SPDK_URMA_WIRE_VERSION ||
+	    frame.hdr.type != SPDK_URMA_MSG_CAPSULE_CMD ||
+	    frame.hdr.length != sizeof(frame.capsule) ||
+	    frame.hdr.qid != uqpair->qpair.qid) {
+		return -EPROTO;
+	}
+	NVMF_URMA_TGT_STAGE(capsule, spdk_get_ticks() - t_parse0);
+	return nvmf_urma_handle_capsule(uqpair, &frame.hdr, &frame.capsule,
+				       t_parse0, t_parse0);
 }
 
 static int
@@ -761,34 +1392,85 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 				return -EIO;
 			}
 			for (int i = 0; i < count; i++) {
-				struct nvmf_urma_req *ureq = (void *)completions[i].user_ctx;
-				if (ureq == NULL) {
+				struct nvmf_urma_cqe_ctx *ctx = (void *)completions[i].user_ctx;
+				struct nvmf_urma_req *ureq;
+
+				if (ctx == NULL) {
 					continue;
 				}
 				if (completions[i].status != URMA_CR_SUCCESS) {
-					/* Modified by Yin: 打印 JFC completion 错误（含 status=4 LOC_ACCESS_ERR），便于定位 */
-					SPDK_ERRLOG("poll_group: completion error status=%d, ureq->state=%d, opcode=%d, user_ctx=%p\n",
-						    completions[i].status, ureq->state,
-						    ureq->state == NVMF_URMA_REQ_PULLING ? 1 : 0,
-						    completions[i].user_ctx);
+					SPDK_ERRLOG("poll_group: completion error status=%d type=%d user_ctx=%p\n",
+						    completions[i].status, ctx->type,
+						    (void *)completions[i].user_ctx);
+					if (ctx->type != NVMF_URMA_CQE_DATA) {
+						uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+						continue;
+					}
+					ureq = ctx->owner;
 					ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 					ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-					nvmf_urma_send_response(ureq);
-				} else if (ureq->state == NVMF_URMA_REQ_PULLING) {
+					if (nvmf_urma_send_response(ureq) != 0) {
+						uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+					}
+					continue;
+				}
+				if (ctx->type == NVMF_URMA_CQE_CAPSULE_TX) {
+					if (completions[i].flag.bs.s_r != 0) {
+						uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+					}
+					total++;
+					continue;
+				}
+				if (ctx->type == NVMF_URMA_CQE_CAPSULE_RX) {
+					int rc = nvmf_urma_process_cmd_receive(ctx->owner, &completions[i]);
+
+					if (rc < 0) {
+						uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+					} else {
+						total += rc;
+					}
+					continue;
+				}
+				if (ctx->type != NVMF_URMA_CQE_DATA) {
+					uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+					continue;
+				}
+				ureq = ctx->owner;
+				if (ureq->state == NVMF_URMA_REQ_PULLING) {
+					/* Modified By Yida(v3): W8 — WR posted -> JFC completion
+					 * (includes poller scheduling latency) */
+					NVMF_URMA_TGT_STAGE(jfc, spdk_get_ticks() - ureq->post_tick);
+					ureq->exec_tick = spdk_get_ticks();
 					ureq->state = NVMF_URMA_REQ_EXECUTING;
 					spdk_nvmf_request_exec(&ureq->req);
 				} else if (ureq->state == NVMF_URMA_REQ_PUSHING) {
-					nvmf_urma_send_response(ureq);
+					/* Modified By Yida(v3): C2H push — WR posted -> JFC completion */
+					NVMF_URMA_TGT_STAGE(push, spdk_get_ticks() - ureq->post_tick);
+					if (nvmf_urma_send_response(ureq) != 0) {
+						uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+					}
 				}
 				total++;
 			}
 		}
-		int rc = nvmf_urma_receive_capsule(uqpair);
-		if (rc < 0) {
-			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
-			continue;
+		/* Modified By Yida(v4): drain every fully-arrived capsule instead of
+		 * one per poll round — bursty submitters used to back up one capsule
+		 * per round in the rcvbuf. Capped at NVMF_URMA_CAPSULE_BATCH so JFC
+		 * completions for in-flight data still get polled promptly. */
+		for (int n = 0;
+		     uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_TCP &&
+		     n < NVMF_URMA_CAPSULE_BATCH; n++) {
+			int rc = nvmf_urma_receive_capsule(uqpair);
+
+			if (rc < 0) {
+				uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+				break;
+			}
+			if (rc == 0) {
+				break;
+			}
+			total += rc;
 		}
-		total += rc;
 	}
 	return total;
 }
@@ -797,16 +1479,21 @@ static void
 nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 {
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
+	uint64_t t_rel0 = spdk_get_ticks(); /* Modified By Yida(v3): release start */
 	/* Modified By Yida: if local_region was cached, keep it cached for future I/O reuse */
 	if (ureq->local_region != NULL && ureq->cache_entry == NULL) {
 		spdk_nvme_urma_unregister_memory(ureq->local_region);
 	}
 	ureq->local_region = NULL;
 	ureq->cache_entry = NULL;
-	if (ureq->remote_seg != NULL) {
+	/* Modified By Yida(v7): import 缓存保活的段留在缓存里，不 unimport */
+	if (ureq->remote_seg != NULL && !ureq->remote_seg_cached) {
 		urma_unimport_seg(ureq->remote_seg);
-		ureq->remote_seg = NULL;
 	}
+	ureq->remote_seg = NULL;
+	ureq->remote_seg_cached = false;
+	/* Modified By Yida(v3): release — unregister (uncached) + urma_unimport_seg */
+	NVMF_URMA_TGT_STAGE(release, spdk_get_ticks() - t_rel0);
 	if (ureq->req.data_from_pool) {
 		spdk_nvmf_request_free_buffers(&ureq->req, &uqpair->group->group,
 					       &uqpair->transport->transport);
@@ -830,6 +1517,12 @@ nvmf_urma_req_complete(struct spdk_nvmf_request *req)
 	struct nvmf_urma_req *ureq = nvmf_urma_req(req);
 	struct spdk_nvmf_qpair *qpair = req->qpair;
 
+	/* Modified By Yida(v3): W9 — spdk_nvmf_request_exec -> completion (bdev/SSD) */
+	if (ureq->exec_tick != 0) {
+		NVMF_URMA_TGT_STAGE(exec, spdk_get_ticks() - ureq->exec_tick);
+		ureq->exec_tick = 0;
+	}
+
 	ureq->rsp.nvme_cpl.cid = ureq->cmd.nvme_cmd.cid;
 	ureq->rsp.nvme_cpl.sqid = qpair->qid;
 	if (qpair->ctrlr == NULL || !qpair->ctrlr->sq_flow_control_disabled) {
@@ -844,7 +1537,9 @@ nvmf_urma_req_complete(struct spdk_nvmf_request *req)
 		ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 		ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
-	nvmf_urma_send_response(ureq);
+	if (nvmf_urma_send_response(ureq) != 0) {
+		qpair->state = SPDK_NVMF_QPAIR_ERROR;
+	}
 }
 
 static void
@@ -865,6 +1560,7 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 	if (uqpair->jetty != NULL) {
 		urma_delete_jetty(uqpair->jetty);
 	}
+	nvmf_urma_capsule_resources_fini(uqpair);
 	/* Modified By Yida: unregister all cached target-side memory regions before freeing qpair */
 	for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {
 		struct nvmf_urma_reg_entry *e = &uqpair->reg_cache[i];
@@ -872,6 +1568,15 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 			spdk_nvme_urma_unregister_memory(e->region);
 			e->used = false;
 			e->region = NULL;
+		}
+	}
+	/* Modified By Yida(v7): 释放 import 缓存里保活的远端段 */
+	for (int i = 0; i < NVMF_URMA_IMPORT_CACHE_SIZE; i++) {
+		struct nvmf_urma_import_entry *e = &uqpair->import_cache[i];
+		if (e->used) {
+			urma_unimport_seg(e->tseg);
+			e->used = false;
+			e->tseg = NULL;
 		}
 	}
 	spdk_urma_device_close(uqpair->device);
