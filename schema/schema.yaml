@@ -184,6 +184,12 @@ enums:
         value: SPDK_NVMF_SUBSYSTEM_DUP_HOST_POLICY_ALLOW
       - name: restrict_per_listener
         value: SPDK_NVMF_SUBSYSTEM_DUP_HOST_POLICY_RESTRICT_PER_LISTENER
+  - name: nvmf_urma_capsule_transport
+    fields:
+      - name: tcp
+        value: 0
+      - name: sendrecv
+        value: 1
   - name: oncs_feature
     fields:
       - name: nvmcmps
@@ -2962,6 +2968,10 @@ methods:
       - name: data_wr_pool_size
         type: uint32
         description: RDMA data WR pool size (RDMA only)
+      - name: capsule_transport
+        type: enum
+        class: nvmf_urma_capsule_transport
+        description: NVMe capsule transport (URMA only)
       - name: disable_command_passthru
         type: boolean
         description: Disallow forwarding unrecognized I/O opcodes and the Identify Namespace admin command to the underlying bdev. Passthrough subsystems and admin_cmd_passthru are unaffected
