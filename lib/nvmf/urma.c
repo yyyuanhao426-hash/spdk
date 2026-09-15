@@ -599,7 +599,12 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 	 * SPDK 默认 15（裸工具未设置），用于判别引擎按 priority 调度的差异 */
 	jfs.priority = spdk_urma_env_u32("SPDK_URMA_JETTY_PRIORITY",
 					 SPDK_URMA_DEFAULT_PRIORITY);
-	jfs.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
+	jfs.max_sge = spdk_min(spdk_urma_env_u32("SPDK_URMA_JFS_MAX_SGE",
+						    SPDK_URMA_DEFAULT_MAX_SGE),
+			       (uint32_t)UINT8_MAX);
+	jfs.max_rsge = spdk_min(spdk_urma_env_u32("SPDK_URMA_JFS_MAX_RSGE", 0),
+				(uint32_t)UINT8_MAX);
+	jfs.flag.bs.multi_path = spdk_urma_env_u32("SPDK_URMA_JFS_MULTIPATH", 0) != 0;
 	jfs.rnr_retry = SPDK_URMA_DEFAULT_RNR_RETRY;
 	jfs.err_timeout = SPDK_URMA_DEFAULT_ERR_TIMEOUT;
 	jfs.jfc = device->jfcs[0];
@@ -1179,9 +1184,7 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	if (ureq->req.iovcnt != 1) {
 		return -ENOTSUP;
 	}
-	/* Match urma_perftest and Mooncake.  This is the provider import attribute;
-	 * the qpair import_cache below still owns and reuses the imported tseg. */
-	import_flag.bs.cacheable = URMA_NON_CACHEABLE;
+	import_flag.bs.cacheable = URMA_CACHEABLE;
 	import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
 	import_flag.bs.mapping = URMA_SEG_NOMAP;
 	/* Modified By Yida(v7): W5 — 远端段 import 缓存：seg 相同的 I/O 复用已

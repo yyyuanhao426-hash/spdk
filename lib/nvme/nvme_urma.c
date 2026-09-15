@@ -383,7 +383,12 @@ nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 	 * SPDK 默认 15（裸工具未设置），用于判别引擎按 priority 调度的差异 */
 	jfs.priority = spdk_urma_env_u32("SPDK_URMA_JETTY_PRIORITY",
 					 SPDK_URMA_DEFAULT_PRIORITY);
-	jfs.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
+	jfs.max_sge = spdk_min(spdk_urma_env_u32("SPDK_URMA_JFS_MAX_SGE",
+						    SPDK_URMA_DEFAULT_MAX_SGE),
+			       (uint32_t)UINT8_MAX);
+	jfs.max_rsge = spdk_min(spdk_urma_env_u32("SPDK_URMA_JFS_MAX_RSGE", 0),
+				(uint32_t)UINT8_MAX);
+	jfs.flag.bs.multi_path = spdk_urma_env_u32("SPDK_URMA_JFS_MULTIPATH", 0) != 0;
 	jfs.rnr_retry = SPDK_URMA_DEFAULT_RNR_RETRY;
 	jfs.err_timeout = SPDK_URMA_DEFAULT_ERR_TIMEOUT;
 	jfs.jfc = uqpair->device->jfcs[0];
