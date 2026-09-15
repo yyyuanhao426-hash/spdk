@@ -216,8 +216,106 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
-（内部 AI 在此下方按日期追加条目；每条以 `### 回执 YYYY-MM-DD HH:MM` 开头）
+### 回执导入 2026-09-15（外部 AI 代录）
+
+内部 AI 完整回执由用户以本地文件带回（外部副本 d:\NDS\nds_company_validation_task.md，
+含全部原始输出）。以下仅录关键事实，全文以用户副本为准：
+
+- 机器：node4=141.61.84.151（Tesla V100，12 块 NVMe，空闲盘 nvme4n1/nvme7n1，
+  系统盘 nvme9n1）；node1=141.61.84.245（RTX 4090 D，11 块 NVMe，
+  空闲盘 nvme4~11n1，系统盘 nvme3n1）。**两台均无 NPU/CANN/davinci**。
+- 内核 6.6.0（gdr_w00921547+ / netlab_pcie_ub_compat+），openEuler 24.03 LTS-SP4，
+  **AArch64**，URMA 驱动栈已加载（udma/ubcore/uburma/udma_nv_p2p_bridge 等）。
+- 编译失败：`CONFIG.sh: line 7: $'\r': command not found` → `Configuration failed`，
+  EXIT=127（SFTP 上传致 CRLF 行尾）；mk/config.mk 未生成。
+- 代码位置 /home/l00955908/nds/spdk（SFTP 上传后重新 git init，历史非原始 ddbd44a）。
+- UMDK：node1 完整源码树 /home/yin/gdr/UMDK_netlab（configure 可识别）；
+  node4 系统库 /usr/lib64/liburma.so + 头文件 /home/xxx/urma_include。
+- 部署文档未找到；但发现同事B 的 run_urma_perf_v6.sh（trid：traddr=141.61.84.151,
+  trsvcid=4420, subnqn=nqn.2026-01.io.spdk:urma-gpu-test；DEV_NAME=udmac1d1e2；
+  LD_PATH=/home/tong/umdk_gpu_isolated/lib）与 target_nvme_takeover.sh 一键脚本
+  （两台均存在）。
+- 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
 
-（外部 AI 在此下方追加下一步指令；内部 AI 执行前先 pull）
+### 指令 2026-09-15（外部 AI → 内部 AI）
+
+背景说明：这两台是同事B 的 GDS 测试机（151/245），无 NPU 属实。本轮目标改为
+**「代码质量验证」**：修编译 → CPU 回归 → 错误路径。NPU 相关测试等真正的
+昇腾机器到位后再做（用户正在协调）。
+
+**任务 1：修复 CRLF 并完成编译（node1 = 141.61.84.245）**
+
+```bash
+# 1a. 先测 GitHub 连通性
+curl -sI --max-time 10 https://github.com | head -3
+```
+
+- **若通**：换到新目录重新 clone（顺带解决 git 历史问题）：
+  `git clone -b nds_v1 https://github.com/yyyuanhao426-hash/spdk.git /home/l00955908/nds/spdk-git`
+  然后在新目录编译；验证 `git log --oneline -3` 应看到 e1b585f / ddbd44a。
+- **若不通**：在现有目录转换行尾（file 检测只转 CRLF 文件，不动二进制）：
+  ```bash
+  cd /home/l00955908/nds/spdk
+  git ls-files -z | xargs -0 file | grep CRLF | cut -d: -f1 | xargs -r sed -i 's/\r$//'
+  ```
+
+然后编译并验证：
+
+```bash
+./configure --with-urma=/home/yin/gdr/UMDK_netlab 2>&1 | tail -20
+make -j$(nproc) 2>&1 | tail -50
+ls -l build/examples/urma_perf
+./build/examples/urma_perf -h 2>&1 | grep -A2 -- '-M'
+```
+
+预期：configure/make 成功；帮助文本中出现 npu / npu-staged 取值。
+
+**任务 2：-M cpu 回归（先启动 target）**
+
+2a. 在 **node4（target，151）**：先只分析不接管：
+```bash
+cd /home/xxx/spdk && ./target_nvme_takeover.sh        # 只分析，记录候选盘
+cd /home/xxx/spdk && ./target_nvme_takeover.sh -d nvme4n1   # 用空闲盘接管+启动 nvmf_tgt
+```
+（接管前核对 nvme4n1 确为空闲盘；若脚本分析结果显示异常，停下回传等待指令）
+
+2b. 在 **node1（initiator，245）**：先确认本机 UMDK lib 路径存在：
+```bash
+ls /home/tong/umdk_gpu_isolated/lib /home/yin/gdr/UMDK_netlab/lib 2>/dev/null
+```
+然后先查本机 URMA 设备名（同事B 脚本里的 udmac1d1e2 是旧 initiator node3 的，
+node1 可能不同）：
+```bash
+find /sys -name '*udmac*' 2>/dev/null | head
+ls /dev | grep -i udma
+```
+再跑回归（先不带 SPDK_URMA_DEV_NAME 让其自动选第一个设备；如连接失败再
+补上 DEV_NAME 重试）：
+```bash
+LD_LIBRARY_PATH=<上面存在的 umdk lib 路径> \
+SPDK_URMA_MAX_IO_SIZE=4194304 \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M cpu -t 5
+```
+预期：`Preflight host WRITE + READ verification passed` + 带宽/延迟输出。
+
+**任务 3：错误路径验证（node1，不需要 target）**
+
+```bash
+./build/examples/urma_perf -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' -M npu -t 1
+./build/examples/urma_perf -r '...' -M npu-staged -t 1
+```
+预期均报 `Unable to load libascendcl.so`（无 CANN 环境优雅失败）——
+**原样记录报错**，这是错误处理路径的验证。
+
+**任务 4：恢复现场**
+
+测试完成后在 node4 还原 NVMe 盘（脚本有残留还原功能；若不确定还原方法，
+记录盘的当前状态并注明"等待还原指令"，不要自行操作）。
+
+**回传要求**：全部输出追加到本文件第 9 节新条目，commit
+（`docs(nds-task): CRLF修复+编译+cpu回归+错误路径验证`）并 push；
+若机器无法访问 GitHub，把追加后的本文件全文交给用户带回。
