@@ -8,10 +8,10 @@
 
 ## 当前分支实现快照
 
-当前 `urma_enable` 分支已经提供第一版可联调代码，而不是仅有接口占位：
+当前 `urma_sendrec_v3` 分支已经提供可联调代码，而不是仅有接口占位：
 
 - SPDK initiator 与 NVMf target 均注册独立的 `URMA` transport，没有调用 NVMe/RDMA transport。
-- TCP socket 当前只承担 endpoint 描述符、NVMe command capsule 和 completion 的控制面交换；有数据的 command 使用 URMA READ/WRITE 搬运 payload。
+- TCP socket 始终承担 endpoint 描述符交换；NVMe command capsule 和 completion 可配置为 TCP 或 URMA SEND/RECV，有数据的 command 使用 URMA READ/WRITE 搬运 payload。
 - target 继续调用原有 `spdk_nvmf_request_exec()`，因此 NVMe controller 状态机、namespace、bdev 和 SSD 完成路径保持不变；URMA transport 只管理其自身的“拉取数据—执行 bdev—推送数据”阶段。
 - 增加 HOST、CUDA、ROCm、NPU 和 XDS memory provider 抽象。HOST 可直接注册；异构内存由外部 provider 负责 pin/unpin 和可选 DMA-BUF 导出，再由公共层完成 URMA segment 注册。
 - SPDK 增加 `build/examples/urma_perf`，可用 CUDA 显存直接连接 SPDK target，并统计正确性、时延、IOPS 与带宽；UMDK 源码不修改。
@@ -46,8 +46,13 @@ SPDK 使用以下环境变量；为便于与 Mooncake 联调，四个 Mooncake �
 | `SPDK_URMA_JETTY_COUNT` | 无 | `1` |
 | `SPDK_URMA_JETTY_DEPTH` | 无 | `2048` |
 | `SPDK_URMA_MAX_IO_SIZE` | 无 | `131072` |
+| `SPDK_URMA_CAPSULE_TRANSPORT` | 无 | `tcp`；可设为 `sendrecv` |
 
-NVMf target 的 transport-specific JSON 还可覆盖 `dev_name`、`trans_mode`、`active_port`、`eid_index`、`jfc_count`、`jfc_depth`、`jetty_count`、`jetty_depth`、`bonding_balance` 和 `bonding_multipath`。
+NVMf target 的 transport-specific JSON 还可覆盖 `dev_name`、`trans_mode`、`capsule_transport`、`active_port`、`eid_index`、`jfc_count`、`jfc_depth`、`jetty_count`、`jetty_depth`、`bonding_balance` 和 `bonding_multipath`。`capsule_transport` 接受 `tcp` 或 `sendrecv`。initiator 与 target 必须配置成相同模式；握手发现不一致时会拒绝连接。
+
+`tcp` 保持原有 capsule 数据路径，也是默认值。`sendrecv` 只把 command/response capsule 切换到 URMA SEND/RECV：建连握手仍走 TCP，I/O payload 仍走 URMA READ/WRITE。SEND 使用 inline WQE；设备的 `max_jfs_inline_len` 不足以容纳 capsule frame 时，qpair 创建会失败。接收端按协商后的队列深度预投递 receive WR，并在消费 completion 后先补回 receive WR 再交付 NVMe completion。
+
+握手描述符新增 capsule 模式字段，因此 wire version 更新为 2；新旧版本会在握手阶段明确拒绝，而不会继续使用不一致的帧布局。
 
 ### 最小联调示例
 
@@ -57,6 +62,13 @@ target 侧在创建 bdev 与 subsystem 后创建 URMA transport 和 listener：
 scripts/rpc.py nvmf_create_transport -t URMA
 scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 \
     -t URMA -a 0.0.0.0 -s 4420
+~~~
+
+启用 URMA SEND/RECV capsule 时，target 与 initiator 分别配置：
+
+~~~bash
+scripts/rpc.py nvmf_create_transport -t URMA --capsule-transport sendrecv
+export SPDK_URMA_CAPSULE_TRANSPORT=sendrecv
 ~~~
 
 initiator 测试侧：

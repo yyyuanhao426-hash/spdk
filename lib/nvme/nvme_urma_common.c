@@ -134,6 +134,13 @@ spdk_urma_opts_init(struct spdk_urma_transport_opts *opts)
 	opts->jetty_depth = spdk_urma_env_u32("SPDK_URMA_JETTY_DEPTH",
 			    SPDK_URMA_DEFAULT_JETTY_DEPTH);
 	opts->max_io_size = spdk_urma_env_u32("SPDK_URMA_MAX_IO_SIZE", 131072);
+	opts->capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
+	value = getenv("SPDK_URMA_CAPSULE_TRANSPORT");
+	if (value != NULL && value[0] != '\0' &&
+	    spdk_urma_parse_capsule_transport(value, &opts->capsule_transport) != 0) {
+		SPDK_WARNLOG("Ignoring invalid SPDK_URMA_CAPSULE_TRANSPORT=%s\n", value);
+		opts->capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
+	}
 	opts->bonding_balance = spdk_urma_env_bool("SPDK_URMA_BONDING_BALANCE",
 				"MC_URMA_BONDING_BALANCE", false);
 	opts->bonding_multipath = spdk_urma_env_bool("SPDK_URMA_BONDING_MULTIPATH_ENABLE",
@@ -153,6 +160,39 @@ spdk_urma_opts_init(struct spdk_urma_transport_opts *opts)
 	value = getenv("SPDK_URMA_DEV_NAME");
 	if (value != NULL) {
 		snprintf(opts->dev_name, sizeof(opts->dev_name), "%s", value);
+	}
+}
+
+int
+spdk_urma_parse_capsule_transport(const char *value,
+				   enum spdk_urma_capsule_transport *transport)
+{
+	if (value == NULL || transport == NULL) {
+		return -EINVAL;
+	}
+	if (strcasecmp(value, "tcp") == 0) {
+		*transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
+		return 0;
+	}
+	if (strcasecmp(value, "sendrecv") == 0 ||
+	    strcasecmp(value, "send_recv") == 0 ||
+	    strcasecmp(value, "urma") == 0) {
+		*transport = SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+const char *
+spdk_urma_capsule_transport_name(enum spdk_urma_capsule_transport transport)
+{
+	switch (transport) {
+	case SPDK_URMA_CAPSULE_TRANSPORT_TCP:
+		return "tcp";
+	case SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV:
+		return "sendrecv";
+	default:
+		return "unknown";
 	}
 }
 

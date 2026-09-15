@@ -24,7 +24,12 @@
 #define SPDK_URMA_DEFAULT_TOKEN 0xACFE
 
 #define SPDK_URMA_WIRE_MAGIC 0x41524d55u /* "URMA", little endian */
-#define SPDK_URMA_WIRE_VERSION 1
+#define SPDK_URMA_WIRE_VERSION 2
+
+enum spdk_urma_capsule_transport {
+	SPDK_URMA_CAPSULE_TRANSPORT_TCP = 0,
+	SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV = 1,
+};
 
 enum spdk_urma_msg_type {
 	SPDK_URMA_MSG_HELLO = 1,
@@ -34,13 +39,15 @@ enum spdk_urma_msg_type {
 	SPDK_URMA_MSG_DISCONNECT,
 };
 
+#pragma pack(push, 1)
+
 struct spdk_urma_msg_hdr {
 	uint32_t magic;
 	uint16_t version;
 	uint16_t type;
 	uint32_t length;
 	uint32_t qid;
-} __attribute__((packed));
+};
 
 struct spdk_urma_endpoint_desc {
 	urma_eid_t eid;
@@ -48,23 +55,36 @@ struct spdk_urma_endpoint_desc {
 	uint32_t transport_mode;
 	uint32_t max_queue_depth;
 	uint32_t max_io_size;
-} __attribute__((packed));
+	uint32_t capsule_transport;
+};
 
 struct spdk_urma_data_desc {
 	urma_seg_t seg;
 	uint64_t address;
 	uint32_t length;
 	uint32_t reserved;
-} __attribute__((packed));
+};
 
 struct spdk_urma_capsule_cmd {
 	struct spdk_nvme_cmd cmd;
 	struct spdk_urma_data_desc data;
-} __attribute__((packed));
+};
 
 struct spdk_urma_capsule_rsp {
 	struct spdk_nvme_cpl cpl;
-} __attribute__((packed));
+};
+
+struct spdk_urma_capsule_cmd_frame {
+	struct spdk_urma_msg_hdr hdr;
+	struct spdk_urma_capsule_cmd capsule;
+};
+
+struct spdk_urma_capsule_rsp_frame {
+	struct spdk_urma_msg_hdr hdr;
+	struct spdk_urma_capsule_rsp capsule;
+};
+
+#pragma pack(pop)
 
 struct spdk_urma_transport_opts {
 	char dev_name[URMA_MAX_NAME];
@@ -76,6 +96,7 @@ struct spdk_urma_transport_opts {
 	uint32_t jetty_count;
 	uint32_t jetty_depth;
 	uint32_t max_io_size;
+	enum spdk_urma_capsule_transport capsule_transport;
 	bool bonding_balance;
 	bool bonding_multipath;
 };
@@ -95,6 +116,9 @@ struct spdk_urma_device {
 };
 
 void spdk_urma_opts_init(struct spdk_urma_transport_opts *opts);
+int spdk_urma_parse_capsule_transport(const char *value,
+				       enum spdk_urma_capsule_transport *transport);
+const char *spdk_urma_capsule_transport_name(enum spdk_urma_capsule_transport transport);
 int spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			  struct spdk_urma_device **device);
 void spdk_urma_device_close(struct spdk_urma_device *device);
