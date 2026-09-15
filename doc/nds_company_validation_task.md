@@ -319,3 +319,45 @@ SPDK_URMA_MAX_IO_SIZE=4194304 \
 **回传要求**：全部输出追加到本文件第 9 节新条目，commit
 （`docs(nds-task): CRLF修复+编译+cpu回归+错误路径验证`）并 push；
 若机器无法访问 GitHub，把追加后的本文件全文交给用户带回。
+
+### 指令 2026-09-15 #2（外部 AI → 内部 AI）：新增 NPU 节点体检
+
+背景：用户确认公司有一台昇腾 NPU 节点（唯一一台），计划作为 NDS 的
+Initiator；Target 继续用 node4/151。本轮在完成上一轮指令的同时，
+**优先**对这台 NPU 节点做环境体检（它能回答 Phase 2 的两个关键问题）。
+
+**NPU 节点体检清单（在该节点上逐条执行并原样记录）：**
+
+```bash
+# A. NPU 基础
+npu-smi info
+
+# B. CANN 是否安装（记录确切路径）
+find / -name "libascendcl.so" 2>/dev/null
+ls /usr/local/Ascend 2>/dev/null
+
+# C. 【决定成败】URMA 网卡是否存在
+find /sys -name '*udmac*' 2>/dev/null | head
+ls /dev | grep -iE "udma|ub"
+lsmod | grep -E "udma|urma|ubus|ubcore|ubase"
+
+# D. 【Phase 2 关键】内核 davinci pin 符号
+cat /proc/kallsyms | grep -i davinci | head -50
+cat /proc/kallsyms | grep -iE "hmm_|davinci.*pin|pin.*davinci" | head -30
+
+# E. 【Phase 2 关键】CANN dmabuf 导出能力（用 B 的路径代入）
+nm -D <libascendcl.so 路径> | grep -iE "dmabuf|handle|fd|export" | head -40
+
+# F. 内核/系统与网络连通性
+uname -r
+cat /etc/os-release | head -3
+uname -m
+ip a | grep "inet "
+# 与 node4/151 连通性（TCP + ping）
+ping -c 3 141.61.84.151
+```
+
+**判定标准（写入报告结论）：**
+- A~C 全部正常 → NPU 节点可直接当 Initiator，NDS 全链路测试可排期
+- C 无 URMA 设备 → 硬件缺口，回报"需协调 URMA 网卡"，其余照常交付
+- D/E 的输出是 Phase 2 内核桥接模块设计的直接输入，务必原文记录
