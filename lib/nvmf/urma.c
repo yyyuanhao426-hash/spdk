@@ -20,7 +20,6 @@
 #include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/ioctl.h>
 
 /* Modified By Yida: Target-side memory registration cache */
 #define NVMF_URMA_REG_CACHE_SIZE 128
@@ -40,9 +39,14 @@ struct nvmf_urma_import_entry {
 	urma_target_seg_t *tseg;
 	bool used;
 };
-/* Modified By Yida(v4): max capsules parsed per poll round. Bounded so JFC
- * completions for in-flight data still get polled promptly on bursts. */
-#define NVMF_URMA_CAPSULE_BATCH 64
+/* Phase-1 asynchronous target datapath.  Socket RX/TX and JFC completion work
+ * are deliberately budgeted so no one source can monopolize the SPDK reactor.
+ * The environment overrides make 1/4/8/16 comparisons possible without
+ * rebuilding the target. */
+#define NVMF_URMA_DEFAULT_RX_BATCH 8
+#define NVMF_URMA_DEFAULT_JFC_BATCH 8
+#define NVMF_URMA_DEFAULT_TX_BATCH 8
+#define NVMF_URMA_MAX_BATCH 64
 
 struct nvmf_urma_reg_entry {
 	void *va;
@@ -82,16 +86,15 @@ struct nvmf_urma_tgt_timing {
 	uint64_t exec_n;
 	uint64_t push_ticks;     /* C2H: push WR posted -> JFC completion */
 	uint64_t push_n;
-	uint64_t rsp_ticks;      /* W10: send_response write_full hdr+rsp */
+	uint64_t rsp_ticks;      /* W10: response queued -> complete non-blocking send */
 	uint64_t rsp_n;
 	uint64_t release_ticks;  /* unregister (uncached) + urma_unimport_seg */
 	uint64_t release_n;
-	uint64_t total_ticks;    /* capsule parsed -> rsp written (target service time) */
+	uint64_t total_ticks;    /* capsule parsed -> response bytes accepted by TCP */
 	uint64_t total_n;
-	/* Modified By Yida(v4): W4p — capsule queueing before parse. peek = first
-	 * poll round whose MSG_PEEK saw the hdr; parse = t_parse0. Covers rcvbuf
-	 * residency + poller interval. partial_n counts rounds where the hdr was
-	 * visible but the capsule body was still in flight (FIONREAD gate bounced). */
+	/* Phase-1 async W4p — oldest staged socket bytes to capsule parse. Covers
+	 * RX-buffer residency plus poller scheduling. partial_n counts rounds where
+	 * a complete header was staged but the capsule body was still incomplete. */
 	uint64_t peek_wait_ticks;
 	uint64_t peek_wait_n;
 	uint64_t partial_n;
@@ -169,7 +172,7 @@ nvmf_urma_timing_dump(void)
 	/* Modified By Yida: avg 一律先除 n 再乘系数，避免 ticks×1e9 溢出 uint64
 	 * （64K/128K 的 W9 累计 2.3e10~1.1e11 ticks，旧式先乘后除打印出错的 avg） */
 	printf("==== URMA target timing breakdown (hz=%lu) ====\n", hz);
-	printf("  W4p peek->parse:     %lu ticks, n=%lu, avg=%lu ns (rcvbuf/poll queueing)\n",
+	printf("  W4p rx->parse:       %lu ticks, n=%lu, avg=%lu ns (staging/poll queueing)\n",
 	       peek_wait, peek_n, peek_n ? peek_wait / peek_n * 1000000000ULL / hz : 0);
 	printf("  capsule splits (hdr seen, body pending): n=%lu\n", partial);
 	printf("  W4a parse capsule:   %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
@@ -199,7 +202,7 @@ nvmf_urma_timing_dump(void)
 	printf("  push JFC wait (C2H): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
 	       push, push_n, push_n ? push / push_n * 1000000000ULL / hz : 0,
 	       push * 1000 / hz);
-	printf("  W10 send rsp:        %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	printf("  W10 rsp queue->TCP:  %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
 	       rsp, rsp_n, rsp_n ? rsp / rsp_n * 1000000000ULL / hz : 0,
 	       rsp * 1000 / hz);
 	printf("  release (unreg+unimport): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
@@ -318,6 +321,17 @@ struct nvmf_urma_req {
 	TAILQ_ENTRY(nvmf_urma_req) link;
 };
 
+/* A response owns a private wire copy, so the nvmf request and its iobuf can be
+ * released as soon as the response is queued.  offset records a partial
+ * non-blocking send and keeps the TCP stream strictly FIFO. */
+struct nvmf_urma_tx_desc {
+	uint8_t data[sizeof(struct spdk_urma_msg_hdr) + sizeof(struct spdk_urma_capsule_rsp)];
+	size_t offset;
+	uint64_t enqueue_tick;
+	uint64_t start_tick;
+	uint32_t trace_idx;
+};
+
 struct nvmf_urma_qpair {
 	struct spdk_nvmf_qpair qpair;
 	struct nvmf_urma_poll_group *group;
@@ -332,10 +346,19 @@ struct nvmf_urma_qpair {
 	uint32_t resource_count;
 	uint32_t max_io_size;
 	struct nvmf_urma_req *reqs;
-	/* Modified By Yida(v4): tick of the poll round that first MSG_PEEK'd the
-	 * hdr currently at the head of rcvbuf; 0 = none. Kept across rounds while
-	 * the capsule body is still in flight so peek->parse covers real queueing. */
+	/* Phase-1 async RX staging buffer. pending_peek_tick is when the oldest bytes
+	 * currently in the buffer were read from the socket. */
+	uint8_t *rx_buf;
+	size_t rx_offset;
+	size_t rx_len;
+	size_t rx_capacity;
 	uint64_t pending_peek_tick;
+	/* Phase-1 async response ring. */
+	struct nvmf_urma_tx_desc *tx_descs;
+	uint32_t tx_capacity;
+	uint32_t tx_head;
+	uint32_t tx_tail;
+	uint32_t tx_count;
 	/* Modified By Yida: target-side registration cache */
 	struct nvmf_urma_reg_entry reg_cache[NVMF_URMA_REG_CACHE_SIZE];
 	/* Modified By Yida(v7): 远端段 import 缓存（见 NVMF_URMA_IMPORT_CACHE_SIZE 注释） */
@@ -367,6 +390,9 @@ struct nvmf_urma_transport {
 	size_t pool_region_count;
 	size_t pool_region_capacity;
 	uint64_t pool_registered_bytes;
+	uint32_t rx_batch;
+	uint32_t jfc_batch;
+	uint32_t tx_batch;
 	struct spdk_poller *accept_poller;
 	/* Modified By Yida(v3): optional periodic staged-latency dump */
 	struct spdk_poller *dump_poller;
@@ -757,6 +783,14 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	}
 	transport->transport.opts = *opts;
 	spdk_urma_opts_init(&transport->urma_opts);
+	transport->rx_batch = spdk_min(spdk_max(spdk_urma_env_u32("SPDK_URMA_RX_BATCH",
+			      NVMF_URMA_DEFAULT_RX_BATCH), 1U), NVMF_URMA_MAX_BATCH);
+	transport->jfc_batch = spdk_min(spdk_max(spdk_urma_env_u32("SPDK_URMA_JFC_POLL_BATCH",
+			       NVMF_URMA_DEFAULT_JFC_BATCH), 1U), NVMF_URMA_MAX_BATCH);
+	transport->tx_batch = spdk_min(spdk_max(spdk_urma_env_u32("SPDK_URMA_TX_BATCH",
+			      NVMF_URMA_DEFAULT_TX_BATCH), 1U), NVMF_URMA_MAX_BATCH);
+	printf("URMA target async phase1: rx_batch=%u jfc_batch=%u tx_batch=%u\n",
+	       transport->rx_batch, transport->jfc_batch, transport->tx_batch);
 	json_opts.active_port = transport->urma_opts.active_port;
 	json_opts.eid_index = transport->urma_opts.eid_index;
 	json_opts.jfc_count = transport->urma_opts.jfc_count;
@@ -973,6 +1007,20 @@ nvmf_urma_poll_group_add(struct spdk_nvmf_transport_poll_group *base, struct spd
 	if (uqpair->reqs == NULL) {
 		return -ENOMEM;
 	}
+	uqpair->rx_capacity = uqpair->resource_count *
+			      (sizeof(struct spdk_urma_msg_hdr) + sizeof(struct spdk_urma_capsule_cmd));
+	uqpair->rx_buf = calloc(1, uqpair->rx_capacity);
+	uqpair->tx_capacity = uqpair->resource_count;
+	uqpair->tx_descs = calloc(uqpair->tx_capacity, sizeof(*uqpair->tx_descs));
+	if (uqpair->rx_buf == NULL || uqpair->tx_descs == NULL) {
+		free(uqpair->tx_descs);
+		free(uqpair->rx_buf);
+		free(uqpair->reqs);
+		uqpair->tx_descs = NULL;
+		uqpair->rx_buf = NULL;
+		uqpair->reqs = NULL;
+		return -ENOMEM;
+	}
 	for (uint32_t i = 0; i < uqpair->resource_count; i++) {
 		struct nvmf_urma_req *ureq = &uqpair->reqs[i];
 		ureq->req.qpair = qpair;
@@ -998,49 +1046,108 @@ nvmf_urma_poll_group_remove(struct spdk_nvmf_transport_poll_group *base, struct 
 
 static void nvmf_urma_release_req(struct nvmf_urma_req *ureq);
 
+static void
+nvmf_urma_tx_desc_complete(struct nvmf_urma_tx_desc *tx)
+{
+	uint64_t now = spdk_get_ticks();
+
+	if (tx->start_tick != 0) {
+		NVMF_URMA_TGT_STAGE(rsp, now - tx->enqueue_tick);
+		NVMF_URMA_TGT_STAGE(total, now - tx->start_tick);
+	}
+	if (tx->trace_idx != UINT32_MAX) {
+		uint64_t idx = tx->trace_idx % NVMF_URMA_RX_TRACE_SIZE;
+
+		__atomic_store_n(&g_rx_trace[idx].rsp_tick, now, __ATOMIC_RELAXED);
+	}
+}
+
+/* Flush at most one bounded iovec batch. MSG_DONTWAIT guarantees that TCP
+ * backpressure can never stall the SPDK reactor; partial sends remain at the
+ * head of the FIFO and are retried by a later poll round. */
+static int
+nvmf_urma_flush_responses(struct nvmf_urma_qpair *uqpair)
+{
+	struct iovec iovs[NVMF_URMA_MAX_BATCH];
+	struct msghdr msg = {};
+	uint32_t idx = uqpair->tx_head;
+	uint32_t iovcnt;
+	ssize_t rc;
+	int completed = 0;
+
+	if (uqpair->tx_count == 0) {
+		return 0;
+	}
+	iovcnt = spdk_min(uqpair->tx_count, uqpair->transport->tx_batch);
+	for (uint32_t i = 0; i < iovcnt; i++) {
+		struct nvmf_urma_tx_desc *tx = &uqpair->tx_descs[idx];
+
+		iovs[i].iov_base = tx->data + tx->offset;
+		iovs[i].iov_len = sizeof(tx->data) - tx->offset;
+		idx = (idx + 1) % uqpair->tx_capacity;
+	}
+	msg.msg_iov = iovs;
+	msg.msg_iovlen = iovcnt;
+	rc = sendmsg(uqpair->fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+		return 0;
+	}
+	if (rc <= 0) {
+		return rc == 0 ? -ECONNRESET : -errno;
+	}
+
+	while (rc > 0 && uqpair->tx_count > 0) {
+		struct nvmf_urma_tx_desc *tx = &uqpair->tx_descs[uqpair->tx_head];
+		size_t remaining = sizeof(tx->data) - tx->offset;
+
+		if ((size_t)rc < remaining) {
+			tx->offset += (size_t)rc;
+			break;
+		}
+		rc -= (ssize_t)remaining;
+		nvmf_urma_tx_desc_complete(tx);
+		memset(tx, 0, sizeof(*tx));
+		uqpair->tx_head = (uqpair->tx_head + 1) % uqpair->tx_capacity;
+		uqpair->tx_count--;
+		completed++;
+	}
+	return completed;
+}
+
 static int
 nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 {
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
+	struct nvmf_urma_tx_desc *tx;
 	struct spdk_urma_msg_hdr hdr = {};
 	struct spdk_urma_capsule_rsp rsp = {.cpl = ureq->rsp.nvme_cpl};
-	int rc;
-	uint64_t t_rsp0 = spdk_get_ticks(); /* Modified By Yida(v3): W10 start */
+	uint64_t t_rsp0 = spdk_get_ticks();
 
 	hdr.magic = SPDK_URMA_WIRE_MAGIC;
 	hdr.version = SPDK_URMA_WIRE_VERSION;
 	hdr.type = SPDK_URMA_MSG_CAPSULE_RSP;
 	hdr.length = sizeof(rsp);
 	hdr.qid = uqpair->qpair.qid;
-	/* Modified By Yida(v4): hdr+rsp 合并成一次 send，同 initiator 的 cmd 方向：
-	 * 两次小 send 产生两个 TCP 段，initiator 的 FIONREAD 门控要等第二段到齐
-	 * 才能读 rsp（completion_wait 里那次成功读之前全是空转）。单段到达 + 省
-	 * 一次 syscall。线上字节布局不变，新旧版本互通。 */
-	{
-		uint8_t msg[sizeof(hdr) + sizeof(rsp)];
-
-		memcpy(msg, &hdr, sizeof(hdr));
-		memcpy(msg + sizeof(hdr), &rsp, sizeof(rsp));
-		rc = nvmf_urma_write_full(uqpair->fd, msg, sizeof(msg));
+	if (uqpair->tx_count == uqpair->tx_capacity) {
+		SPDK_ERRLOG("send_response: async TX ring is full (qid=%u, capacity=%u)\n",
+			    uqpair->qpair.qid, uqpair->tx_capacity);
+		uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+		nvmf_urma_release_req(ureq);
+		return -ENOBUFS;
 	}
-	/* Modified By Yida(v3): W10 send rsp + target service total (parse -> rsp written) */
-	if (ureq->start_tick != 0) {
-		uint64_t t_rsp1 = spdk_get_ticks();
-
-		NVMF_URMA_TGT_STAGE(rsp, t_rsp1 - t_rsp0);
-		NVMF_URMA_TGT_STAGE(total, t_rsp1 - ureq->start_tick);
-		ureq->start_tick = 0;
-	}
-	/* Modified By Yida(v4): close this I/O's rx trace record with the response
-	 * completion tick (per-I/O target service time, even for un-timed reqs). */
-	if (ureq->trace_idx != UINT32_MAX) {
-		uint64_t idx = ureq->trace_idx % NVMF_URMA_RX_TRACE_SIZE;
-
-		__atomic_store_n(&g_rx_trace[idx].rsp_tick, spdk_get_ticks(), __ATOMIC_RELAXED);
-		ureq->trace_idx = UINT32_MAX;
-	}
+	tx = &uqpair->tx_descs[uqpair->tx_tail];
+	memcpy(tx->data, &hdr, sizeof(hdr));
+	memcpy(tx->data + sizeof(hdr), &rsp, sizeof(rsp));
+	tx->offset = 0;
+	tx->enqueue_tick = t_rsp0;
+	tx->start_tick = ureq->start_tick;
+	tx->trace_idx = ureq->trace_idx;
+	uqpair->tx_tail = (uqpair->tx_tail + 1) % uqpair->tx_capacity;
+	uqpair->tx_count++;
+	ureq->start_tick = 0;
+	ureq->trace_idx = UINT32_MAX;
 	nvmf_urma_release_req(ureq);
-	return rc;
+	return 0;
 }
 
 /* Modified By Yida(v7): 远端段 import 缓存默认开启；SPDK_URMA_IMPORT_CACHE=0
@@ -1217,58 +1324,14 @@ nvmf_urma_req_get_buffers_done(struct spdk_nvmf_request *req)
 }
 
 static int
-nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
+nvmf_urma_handle_capsule(struct nvmf_urma_qpair *uqpair,
+			 const struct spdk_urma_msg_hdr *hdr,
+			 const struct spdk_urma_capsule_cmd *capsule,
+			 uint64_t t_receive, uint64_t t_parse0)
 {
-	struct spdk_urma_msg_hdr hdr;
-	struct spdk_urma_capsule_cmd capsule;
 	struct nvmf_urma_req *ureq;
-	ssize_t rc;
 
-	rc = recv(uqpair->fd, &hdr, sizeof(hdr), MSG_PEEK | MSG_DONTWAIT);
-	if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-		return 0;
-	}
-	if (rc <= 0) {
-		uqpair->pending_peek_tick = 0;
-		return -ECONNRESET;
-	}
-	if ((size_t)rc < sizeof(hdr)) {
-		return 0;
-	}
-	/* Modified By Yida(v4): W4p — stamp when the poller FIRST observed this
-	 * capsule in the kernel rcvbuf. If the hdr was already seen on an earlier
-	 * poll round (capsule body still in flight), reuse that tick: the capsule
-	 * has been queueing ever since. */
-	uint64_t t_peek;
-	if (uqpair->pending_peek_tick != 0) {
-		t_peek = uqpair->pending_peek_tick;
-	} else {
-		t_peek = spdk_get_ticks();
-		uqpair->pending_peek_tick = t_peek;
-	}
-	{
-		int available = 0;
-
-		if (ioctl(uqpair->fd, FIONREAD, &available) != 0) {
-			return -errno;
-		}
-		if ((size_t)available < sizeof(hdr) + hdr.length) {
-			/* Capsule split across TCP segments: hdr arrived, body not yet.
-			 * Keep pending_peek_tick and retry on a later poll round. */
-			NVMF_URMA_TGT_INC(partial_n);
-			return 0;
-		}
-	}
-	uqpair->pending_peek_tick = 0; /* full capsule arrived; marker consumed */
-	uint64_t t_parse0 = spdk_get_ticks(); /* Modified By Yida(v3): W4a parse start */
-	if (nvmf_urma_read_full(uqpair->fd, &hdr, sizeof(hdr)) != 0 ||
-	    hdr.magic != SPDK_URMA_WIRE_MAGIC || hdr.version != SPDK_URMA_WIRE_VERSION ||
-	    hdr.type != SPDK_URMA_MSG_CAPSULE_CMD || hdr.length != sizeof(capsule) ||
-	    nvmf_urma_read_full(uqpair->fd, &capsule, sizeof(capsule)) != 0) {
-		return -EPROTO;
-	}
-	NVMF_URMA_TGT_STAGE(capsule, spdk_get_ticks() - t_parse0);
-	if (capsule.data.length > uqpair->max_io_size) {
+	if (capsule->data.length > uqpair->max_io_size) {
 		return -EMSGSIZE;
 	}
 	ureq = TAILQ_FIRST(&uqpair->free_reqs);
@@ -1284,7 +1347,7 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 	/* Modified By Yida(v4): per-I/O receive trace record (joined with the
 	 * initiator's tx record by qid+cid); also accumulates the W4p stage. */
 	ureq->trace_idx = UINT32_MAX;
-	NVMF_URMA_TGT_STAGE(peek_wait, t_parse0 - t_peek);
+	NVMF_URMA_TGT_STAGE(peek_wait, t_parse0 - t_receive);
 	/* Modified By Yida(v6): SPDK_URMA_TRACE=1 才采集；默认关闭时 trace_idx
 	 * 保持 UINT32_MAX，rsp 闭合记录与本 dump 自然跳过 */
 	if (nvmf_urma_trace_enabled()) {
@@ -1292,21 +1355,21 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 			       NVMF_URMA_RX_TRACE_SIZE;
 		struct nvmf_urma_rx_trace *rec = &g_rx_trace[idx];
 
-		rec->peek_tick = t_peek;
+		rec->peek_tick = t_receive;
 		rec->parse_tick = t_parse0;
 		rec->rsp_tick = 0;
-		rec->length = capsule.data.length;
-		rec->qid = hdr.qid;
-		rec->cid = capsule.cmd.cid;
-		rec->opcode = capsule.cmd.opc;
+		rec->length = capsule->data.length;
+		rec->qid = hdr->qid;
+		rec->cid = capsule->cmd.cid;
+		rec->opcode = capsule->cmd.opc;
 		ureq->trace_idx = idx;
 	}
-	ureq->cmd.nvme_cmd = capsule.cmd;
-	ureq->remote_data = capsule.data;
+	ureq->cmd.nvme_cmd = capsule->cmd;
+	ureq->remote_data = capsule->data;
 	ureq->req.raw = 0;
 	ureq->req.zcopy_phase = NVMF_ZCOPY_PHASE_NONE;
 	ureq->req.xfer = spdk_nvmf_req_get_xfer(&ureq->req);
-	ureq->req.length = capsule.data.length;
+	ureq->req.length = capsule->data.length;
 	uqpair->qpair.queue_depth++;
 	if (ureq->req.xfer == SPDK_NVME_DATA_NONE || ureq->req.length == 0) {
 		ureq->state = NVMF_URMA_REQ_EXECUTING;
@@ -1322,6 +1385,82 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 	return 1;
 }
 
+/* Pull currently available stream bytes into a per-qpair staging buffer, then
+ * parse a bounded number of complete frames in userspace. This replaces four
+ * syscalls per capsule (PEEK, FIONREAD, header recv, body recv) with one
+ * non-blocking recv for a whole batch. */
+static int
+nvmf_urma_receive_capsules(struct nvmf_urma_qpair *uqpair, uint32_t budget)
+{
+	const size_t frame_size = sizeof(struct spdk_urma_msg_hdr) +
+				  sizeof(struct spdk_urma_capsule_cmd);
+	size_t consumed = 0;
+	uint32_t parsed = 0;
+	ssize_t rc;
+
+	if (uqpair->rx_offset + uqpair->rx_len == uqpair->rx_capacity &&
+	    uqpair->rx_offset != 0) {
+		memmove(uqpair->rx_buf, uqpair->rx_buf + uqpair->rx_offset, uqpair->rx_len);
+		uqpair->rx_offset = 0;
+	}
+	if (uqpair->rx_offset + uqpair->rx_len < uqpair->rx_capacity) {
+		uint64_t now = spdk_get_ticks();
+
+		rc = recv(uqpair->fd, uqpair->rx_buf + uqpair->rx_offset + uqpair->rx_len,
+			  uqpair->rx_capacity - uqpair->rx_offset - uqpair->rx_len, MSG_DONTWAIT);
+		if (rc == 0) {
+			return -ECONNRESET;
+		}
+		if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+			return -errno;
+		}
+		if (rc > 0) {
+			if (uqpair->rx_len == 0) {
+				uqpair->pending_peek_tick = now;
+			}
+			uqpair->rx_len += (size_t)rc;
+		}
+	}
+
+	while (parsed < budget && uqpair->rx_len - consumed >= sizeof(struct spdk_urma_msg_hdr)) {
+		struct spdk_urma_msg_hdr hdr;
+		struct spdk_urma_capsule_cmd capsule;
+		uint64_t t_parse0;
+		int hrc;
+
+		memcpy(&hdr, uqpair->rx_buf + uqpair->rx_offset + consumed, sizeof(hdr));
+		if (hdr.magic != SPDK_URMA_WIRE_MAGIC || hdr.version != SPDK_URMA_WIRE_VERSION ||
+		    hdr.type != SPDK_URMA_MSG_CAPSULE_CMD || hdr.length != sizeof(capsule)) {
+			return -EPROTO;
+		}
+		if (uqpair->rx_len - consumed < frame_size) {
+			NVMF_URMA_TGT_INC(partial_n);
+			break;
+		}
+		t_parse0 = spdk_get_ticks();
+		memcpy(&capsule, uqpair->rx_buf + uqpair->rx_offset + consumed + sizeof(hdr),
+		       sizeof(capsule));
+		NVMF_URMA_TGT_STAGE(capsule, spdk_get_ticks() - t_parse0);
+		hrc = nvmf_urma_handle_capsule(uqpair, &hdr, &capsule,
+					       uqpair->pending_peek_tick, t_parse0);
+		if (hrc < 0) {
+			return hrc;
+		}
+		consumed += frame_size;
+		parsed++;
+	}
+
+	if (consumed != 0) {
+		uqpair->rx_offset += consumed;
+		uqpair->rx_len -= consumed;
+		if (uqpair->rx_len == 0) {
+			uqpair->rx_offset = 0;
+			uqpair->pending_peek_tick = 0;
+		}
+	}
+	return parsed;
+}
+
 static int
 nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 {
@@ -1331,8 +1470,25 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 	int total = 0;
 
 	TAILQ_FOREACH(uqpair, &group->qpairs, link) {
+		int rc = nvmf_urma_flush_responses(uqpair);
+
+		if (rc < 0) {
+			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+			continue;
+		}
+		total += rc;
+		/* RX first: commands already waiting in the socket become posted WRs
+		 * before this round spends time completing older requests. */
+		rc = nvmf_urma_receive_capsules(uqpair, uqpair->transport->rx_batch);
+		if (rc < 0) {
+			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+			continue;
+		}
+		total += rc;
+
 		for (uint32_t j = 0; j < uqpair->device->jfc_count; j++) {
-			int count = urma_poll_jfc(uqpair->device->jfcs[j], SPDK_COUNTOF(completions), completions);
+			int count = urma_poll_jfc(uqpair->device->jfcs[j],
+						   uqpair->transport->jfc_batch, completions);
 			if (count < 0) {
 				return -EIO;
 			}
@@ -1365,22 +1521,22 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 				total++;
 			}
 		}
-		/* Modified By Yida(v4): drain every fully-arrived capsule instead of
-		 * one per poll round — bursty submitters used to back up one capsule
-		 * per round in the rcvbuf. Capped at NVMF_URMA_CAPSULE_BATCH so JFC
-		 * completions for in-flight data still get polled promptly. */
-		for (int n = 0; n < NVMF_URMA_CAPSULE_BATCH; n++) {
-			int rc = nvmf_urma_receive_capsule(uqpair);
 
-			if (rc < 0) {
-				uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
-				break;
-			}
-			if (rc == 0) {
-				break;
-			}
-			total += rc;
+		/* Null bdev can enqueue responses synchronously from the JFC loop.
+		 * Flush them once as an iovec batch, then immediately look for the
+		 * replacement capsules produced by those completions. */
+		rc = nvmf_urma_flush_responses(uqpair);
+		if (rc < 0) {
+			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+			continue;
 		}
+		total += rc;
+		rc = nvmf_urma_receive_capsules(uqpair, uqpair->transport->rx_batch);
+		if (rc < 0) {
+			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+			continue;
+		}
+		total += rc;
 	}
 	return total;
 }
@@ -1492,6 +1648,8 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 	if (uqpair->fd >= 0) {
 		close(uqpair->fd);
 	}
+	free(uqpair->tx_descs);
+	free(uqpair->rx_buf);
 	free(uqpair->reqs);
 	free(uqpair);
 	if (cb_fn != NULL) {
