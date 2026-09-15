@@ -135,6 +135,9 @@ struct ns_worker_ctx {
 	uint64_t		number_ios;
 	uint64_t		offset_in_ios;
 	bool			is_draining;
+	/* Experimental URMA A/B: all write tasks owned by this worker may point at
+	 * this one read-only source buffer.  The buffer is freed after its qpairs. */
+	void			*shared_write_buf;
 
 	union {
 		struct {
@@ -174,6 +177,7 @@ struct perf_task {
 	struct ns_worker_ctx	*ns_ctx;
 	struct iovec		*iovs; /* array of iovecs to transfer. */
 	int			iovcnt; /* Number of iovecs in iovs array. */
+	bool			uses_shared_write_buf;
 	struct iovec		md_iov;
 	uint64_t		submit_tsc;
 	bool			is_read;
@@ -208,6 +212,11 @@ struct ns_fn_table {
 };
 
 static uint32_t g_io_unit_size = (UINT32_MAX & (~0x03));
+
+/* Diagnostic-only switch.  It intentionally applies only to pure NVMe write
+ * workloads without metadata; concurrent writes may then safely expose the
+ * same immutable source bytes to a remote pull transport. */
+static bool g_reuse_write_buffer;
 
 static int g_outstanding_commands;
 
@@ -783,6 +792,8 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 	uint32_t max_io_size_bytes, max_io_md_size;
 	int32_t numa_id;
 	void *buf;
+	bool reuse_write_buf;
+	bool allocated_buf = false;
 	int rc;
 
 	ctrlr = task->ns_ctx->entry->u.nvme.ctrlr;
@@ -792,24 +803,38 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 	 * it's same with g_io_size_bytes for namespace without metadata.
 	 */
 	max_io_size_bytes = g_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
-	buf = spdk_dma_zmalloc_socket(max_io_size_bytes, g_io_align, NULL, numa_id);
+	max_io_md_size = g_max_io_md_size * g_max_io_size_blocks;
+	reuse_write_buf = g_reuse_write_buffer && task->ns_ctx->entry->md_size == 0 &&
+			  max_io_md_size == 0;
+	buf = reuse_write_buf ? task->ns_ctx->shared_write_buf : NULL;
+	if (buf == NULL) {
+		buf = spdk_dma_zmalloc_socket(max_io_size_bytes, g_io_align, NULL, numa_id);
+		allocated_buf = true;
+		if (reuse_write_buf) {
+			task->ns_ctx->shared_write_buf = buf;
+		}
+	}
 	if (buf == NULL) {
 		fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
 		exit(1);
 	}
-	memset(buf, pattern, max_io_size_bytes);
+	if (allocated_buf) {
+		memset(buf, pattern, max_io_size_bytes);
+	}
+	task->uses_shared_write_buf = reuse_write_buf;
 
 	rc = nvme_perf_allocate_iovs(task, buf, max_io_size_bytes);
 	if (rc < 0) {
 		fprintf(stderr, "perf task failed to allocate iovs\n");
-		spdk_dma_free(buf);
+		if (!reuse_write_buf) {
+			spdk_dma_free(buf);
+		}
 		exit(1);
 	}
 
 	task->ext_opts.size = SPDK_SIZEOF(&task->ext_opts, accel_sequence);
 	task->ext_opts.io_flags = task->ns_ctx->entry->io_flags;
 
-	max_io_md_size = g_max_io_md_size * g_max_io_size_blocks;
 	if (max_io_md_size != 0) {
 		task->md_iov.iov_base = spdk_dma_zmalloc(max_io_md_size, g_io_align, NULL);
 		task->md_iov.iov_len = max_io_md_size;
@@ -1070,6 +1095,10 @@ nvme_cleanup_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 
 	spdk_nvme_poll_group_destroy(ns_ctx->u.nvme.group);
 	free(ns_ctx->u.nvme.qpair);
+	if (ns_ctx->shared_write_buf != NULL) {
+		spdk_dma_free(ns_ctx->shared_write_buf);
+	}
+	ns_ctx->shared_write_buf = NULL;
 }
 
 static void
@@ -1447,7 +1476,9 @@ submit_single_io(struct perf_task *task)
 			TAILQ_INSERT_TAIL(&ns_ctx->queued_tasks, task, link);
 		} else {
 			RATELIMIT_LOG("starting I/O failed: %d\n", rc);
-			spdk_dma_free(task->iovs[0].iov_base);
+			if (!task->uses_shared_write_buf) {
+				spdk_dma_free(task->iovs[0].iov_base);
+			}
 			free(task->iovs);
 			spdk_dma_free(task->md_iov.iov_base);
 			task->ns_ctx->status = 1;
@@ -1498,7 +1529,9 @@ task_complete(struct perf_task *task)
 	 * replace the one just completed.
 	 */
 	if (spdk_unlikely(ns_ctx->is_draining)) {
-		spdk_dma_free(task->iovs[0].iov_base);
+		if (!task->uses_shared_write_buf) {
+			spdk_dma_free(task->iovs[0].iov_base);
+		}
 		free(task->iovs);
 		spdk_dma_free(task->md_iov.iov_base);
 		free(task);
@@ -3262,6 +3295,7 @@ int
 main(int argc, char **argv)
 {
 	int rc;
+	const char *reuse_write_buffer;
 	struct worker_thread *worker, *main_worker;
 	struct ns_worker_ctx *ns_ctx;
 	struct spdk_env_opts opts;
@@ -3282,6 +3316,19 @@ main(int argc, char **argv)
 		}
 
 		goto out;
+	}
+
+	reuse_write_buffer = getenv("SPDK_URMA_PERF_REUSE_WRITE_BUFFER");
+	g_reuse_write_buffer = reuse_write_buffer != NULL &&
+				 strcmp(reuse_write_buffer, "0") != 0;
+	if (g_reuse_write_buffer) {
+		if (g_rw_percentage != 0) {
+			fprintf(stderr, "SPDK_URMA_PERF_REUSE_WRITE_BUFFER requires -w write\n");
+			rc = 1;
+			free_globals();
+			goto out;
+		}
+		printf("URMA diagnostic: reusing one NVMe write source buffer per namespace/worker\n");
 	}
 
 	/* Transport statistics are printed from each thread.
