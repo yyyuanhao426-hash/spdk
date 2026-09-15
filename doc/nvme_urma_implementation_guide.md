@@ -424,24 +424,28 @@ target 没有重新实现 namespace、controller、NVMe command 校验或 SSD dr
 
 ### 7.1 什么是控制面
 
-控制面负责建立连接、交换资源标识和传递 command/completion。它关注“要做什么”。
+控制面负责建立连接、交换资源标识，并可传递 command/completion。它关注“要做什么”。
 
 ### 7.2 什么是数据面
 
 数据面负责搬运真正的 payload。它关注“数据从哪里移动到哪里”。
 
-### 7.3 当前第一版的实现
+### 7.3 当前实现
 
 当前代码使用：
 
-- TCP：bootstrap、endpoint 描述、NVMe command capsule、NVMe completion capsule。
+- TCP：始终承载 bootstrap 和 endpoint 描述；默认也承载 NVMe command/completion capsule。
+- URMA SEND/RECV：可配置为承载 NVMe command/completion capsule。
 - URMA：有 payload 的 NVMe READ/WRITE 数据搬运。
 
-也就是说，它不是把现有 NVMe/TCP transport 拿来复用，而是新的 NVMe/URMA transport 暂时使用一个 TCP socket 承担控制消息。
+也就是说，它不是把现有 NVMe/TCP transport 拿来复用，而是新的 NVMe/URMA transport 使用 TCP 完成 bootstrap，并允许在建连时选择后续 capsule 数据路径。
 
 ~~~text
-TCP 控制通道：
-HELLO / HELLO_RSP / NVMe CMD / NVMe CPL
+TCP bootstrap：
+HELLO / HELLO_RSP
+
+可配置 capsule 通道：
+TCP 或 URMA SEND/RECV：NVMe CMD / NVMe CPL
 
 URMA 数据通道：
 GPU/HOST/NPU payload READ / WRITE
@@ -454,7 +458,7 @@ GPU/HOST/NPU payload READ / WRITE
 3. GPU buffer 是否能通过 URMA 直接访问。
 4. target 是否能继续使用原有 NVMf/bdev 状态机。
 
-未来可以把 command capsule 也放到 URMA SEND/RECV 或正式标准定义的控制通道中，但那需要先确定协议、credit、重连和 discovery 格式。
+URMA SEND/RECV 模式使用预投递 receive WR 和 inline SEND；双方必须在握手中选择同一模式。协议的正式标准 binding、重连和 discovery 格式仍需后续确定。
 
 ---
 
@@ -951,7 +955,7 @@ UMDK `urma_perftest`。完整步骤见 [测试指南](nvme_urma_gpu_perf.md)。
 主要限制如下：
 
 1. **没有正式标准 binding。** URMA 尚无正式 NVMe-oF 8-bit TRTYPE 和 TSAS 定义。
-2. **控制面暂用 TCP。** command 和 completion 还没有改为 URMA SEND/RECV。
+2. **bootstrap 仍使用 TCP。** command 和 completion 可切换到 URMA SEND/RECV，但建连与 endpoint 描述交换仍依赖 TCP。
 3. **只支持连续 payload。** initiator 当前只接受一个连续 buffer，不支持多 SGL/IOV。
 4. **没有注册缓存。** 每个有数据的请求都会注册和注销内存，性能会受影响。
 5. **target 仍使用 HOST buffer。** 尚未实现 SSD 与 accelerator 的 target 侧 P2P/XDS 路径。

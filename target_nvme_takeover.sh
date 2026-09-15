@@ -18,6 +18,7 @@
 #   ./target_nvme_takeover.sh                   # 只分析：列系统盘 + 空闲候选盘，不做任何变更
 #   ./target_nvme_takeover.sh -d nvme3n1        # 接管 nvme3n1 → 后台启动 nvmf_tgt → 自动配 RPC
 #   ./target_nvme_takeover.sh -d nvme3n1 -s 10  # 同上 + SPDK_URMA_TARGET_DUMP_SEC=10 计时
+#   ./target_nvme_takeover.sh -d nvme3n1 -p sendrecv  # capsule 使用 URMA SEND/RECV
 #   ./target_nvme_takeover.sh -d nvme3n1,nvme4n1    # 两块盘 → subsystem 里两个 namespace（nsid 1,2）
 #   ./target_nvme_takeover.sh -d nvme3n1 -d nvme4n1 # 同上（-d 可重复，逗号分隔均可）
 #   ./target_nvme_takeover.sh -d nvme3n1,nvme4n1 -R 128  # 两块盘合成 raid0（strip 128KB）→ 单 namespace
@@ -42,6 +43,8 @@
 #                UMMU 注册（数十 ms）→ 吞吐崩。每核固定预占 32 个 large
 #                （bdev 16+accel 16），池子必须盖住 核数×(32+此值)+余量
 #   -s <秒>      打开 target 计时（SPDK_URMA_TARGET_DUMP_SEC，transport 创建时读取）
+#   -p <方式>    NVMe capsule 传输方式：tcp 或 sendrecv（默认 tcp）。initiator
+#                必须配置相同的 SPDK_URMA_CAPSULE_TRANSPORT
 #   -i <IP>      listener 地址（默认自动探测本机第一个全局 IPv4；多网卡机器建议显式指定）
 #   -m <掩码>    nvmf_tgt core mask（默认 0x3；盘多时可加宽，如 0xf）
 #   -w <目录>    SPDK 源码根（默认从脚本所在目录向上找 build/bin/nvmf_tgt）
@@ -72,6 +75,7 @@ IOBUF_SPEC=""        # "小池数量,小池buf,大池数量,大池buf"
 IOBUF_PG_CACHE=32    # -O 生效时 URMA transport 每 PG 的 large 缓存（-C 可调）
 MAX_IO_SIZE=0        # URMA transport max_io_size（字节）
 DUMP_SEC=""
+CAPSULE_TRANSPORT="tcp"
 COREMASK="0x3"
 SPDK_DIR=""
 LIBDIR="/home/yin/gdr/UMDK_netlab/lib"
@@ -100,10 +104,11 @@ confirm() {
     [ "$a" = "yes" ]
 }
 
-while getopts "d:s:i:m:w:L:N:R:I:O:C:ryh" opt; do
+while getopts "d:s:p:i:m:w:L:N:R:I:O:C:ryh" opt; do
     case $opt in
         d) DISKS="${DISKS:+$DISKS,}$OPTARG" ;;
         s) DUMP_SEC=$OPTARG ;;
+        p) CAPSULE_TRANSPORT=$OPTARG ;;
         i) LISTEN_IP=$OPTARG ;;
         m) COREMASK=$OPTARG ;;
         w) SPDK_DIR=$OPTARG ;;
@@ -120,6 +125,11 @@ while getopts "d:s:i:m:w:L:N:R:I:O:C:ryh" opt; do
     esac
 done
 shift $((OPTIND - 1))
+
+case "$CAPSULE_TRANSPORT" in
+    tcp|sendrecv) ;;
+    *) abort "-p capsule transport 只支持 tcp 或 sendrecv，收到: $CAPSULE_TRANSPORT" ;;
+esac
 
 [ "$(id -u)" -eq 0 ] || abort "必须以 root 运行（sysfs 绑定 + hugepages + 启动 nvmf_tgt）"
 
@@ -291,7 +301,7 @@ echo
 #---------------- 只分析模式 ----------------
 if [ -z "$DISKS" ]; then
     info "未指定 -d，到此为止（未做任何变更）。选定“空闲”盘后："
-    info "  $0 -d <盘名>[,<盘名>...] [-R strip_kb] [-I iobuf四元组] [-O max_io_size] [-s 计时秒数] [-i listener IP]"
+    info "  $0 -d <盘名>[,<盘名>...] [-p tcp|sendrecv] [-R strip_kb] [-I iobuf四元组] [-O max_io_size] [-s 计时秒数] [-i listener IP]"
     exit 0
 fi
 
@@ -344,6 +354,7 @@ echo "之后这些盘无法再作为块设备访问；请再次确认都不是�
 [ "$RAID0_STRIP" -lt 0 ] && echo "命名空间模式：每盘一个 namespace（nsid 1..${#DISK_LIST[@]}）"
 [ -n "$IOBUF_SPEC" ] && echo "iobuf 池：$IOBUF_SPEC（--wait-for-rpc 启动 + iobuf_set_options）"
 [ "$MAX_IO_SIZE" -gt 0 ] && echo "transport max_io_size：$MAX_IO_SIZE 字节"
+echo "capsule transport：$CAPSULE_TRANSPORT"
 confirm "继续?" || abort "用户取消"
 echo
 
@@ -449,6 +460,7 @@ fi
 # -O 校验：2 的幂且 ≥8KB（与 transport 层一致）；且必须 ≤ large_bufsize
 # —— urma 数据路径要求 iovcnt==1（urma.c nvmf_urma_post_data），I/O 大于 large_bufsize
 #    会被拆成多个 iobuf buffer，直接 -ENOTSUP 失败，所以这里提前把配置卡死
+URMA_TRANSPORT_ARGS=(-t URMA --capsule-transport "$CAPSULE_TRANSPORT")
 if [ "$MAX_IO_SIZE" -gt 0 ]; then
     [ $((MAX_IO_SIZE & (MAX_IO_SIZE - 1))) -eq 0 ] && [ "$MAX_IO_SIZE" -ge 8192 ] \
         || abort "-O max_io_size 必须是 2 的幂且 ≥8KB"
@@ -592,11 +604,10 @@ if [ "$MAX_IO_SIZE" -gt 0 ]; then
     if [ "$IB_SMALL_COUNT" -gt 0 ] && [ "$IB_SMALL_COUNT" -le "$_small_eager" ]; then
         warn "small 池同理：核数=$_ncore × 1280（bdev 128+accel 128+PG 1024）= $_small_eager ≥ 池 $IB_SMALL_COUNT → 调大 -I 第 1 个字段（如 16384）"
     fi
-    run_rpc nvmf_create_transport -t URMA -i "$MAX_IO_SIZE" \
-        --iobuf-large-cache-size "$IOBUF_PG_CACHE" --iobuf-small-cache-size 1024
-else
-    run_rpc nvmf_create_transport -t URMA
+    URMA_TRANSPORT_ARGS+=(-i "$MAX_IO_SIZE" \
+        --iobuf-large-cache-size "$IOBUF_PG_CACHE" --iobuf-small-cache-size 1024)
 fi
+run_rpc nvmf_create_transport "${URMA_TRANSPORT_ARGS[@]}"
 run_rpc nvmf_create_subsystem "$NQN" -a -s "$SUBSYS_SN"
 
 if [ "$RAID0_STRIP" -ge 0 ]; then
@@ -630,6 +641,7 @@ else
 fi
 echo "  subsystem  : $NQN"
 echo "  listener   : $LISTEN_IP:$LISTEN_PORT (URMA)"
+echo "  capsule    : $CAPSULE_TRANSPORT"
 [ -n "$IOBUF_SPEC" ] && echo "  iobuf      : small ${IB_SMALL_COUNT}x${IB_SMALL_SIZE}B / large ${IB_LARGE_COUNT}x${IB_LARGE_SIZE}B"
 [ "$MAX_IO_SIZE" -gt 0 ] && echo "  max_io_size: $MAX_IO_SIZE B（transport，PG large 缓存 $IOBUF_PG_CACHE/PG）"
 echo "  nvmf_tgt   : PID $TGT_PID，日志 $TGT_LOG$( [ -n "$DUMP_SEC" ] && echo "；target 打点每 ${DUMP_SEC}s 输出一次（==== URMA target timing breakdown ====）")"
@@ -640,7 +652,7 @@ if [ "$MAX_IO_SIZE" -gt 0 ]; then
     echo "  # transport max_io_size=$MAX_IO_SIZE，initiator 侧必须一致（否则 hello 协商后按小的算）："
     echo "  export SPDK_URMA_MAX_IO_SIZE=$MAX_IO_SIZE"
 fi
-echo "  sudo LD_LIBRARY_PATH=<成套库目录> SPDK_URMA_DEV_NAME=$DEVNAME \\"
+echo "  sudo LD_LIBRARY_PATH=<成套库目录> SPDK_URMA_DEV_NAME=$DEVNAME SPDK_URMA_CAPSULE_TRANSPORT=$CAPSULE_TRANSPORT \\"
 echo "      ./build/examples/urma_perf \\"
 echo "      -r 'trtype:URMA adrfam:IPv4 traddr:$LISTEN_IP trsvcid:$LISTEN_PORT subnqn:$NQN' \\"
 echo "      -w write -o 4096 -T 4 -b 32 -t 30 -n 1 -g 0 -l 0 -M posix"
