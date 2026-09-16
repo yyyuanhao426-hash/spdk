@@ -267,6 +267,78 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-15 #9：批次 5（两个隔离实验）
+
+前置：批次 4 已回执。**外部已提交代码改造**：urma_register_seg_dmabuf 改为
+运行时 dlsym 解析（RTLD_DEFAULT），同一份 urma_perf 二进制现在可以用
+标准 liburma 跑 host-only 路线（cpu/posix/npu-staged）——批次 4 被阻断的
+对照实验已解锁。
+
+```bash
+# 197：先拉代码并增量重编（含诊断打印 + 本次改造）
+cd /home/lx/spdk && git pull origin nds_v1
+nice -n 10 make -j16 2>&1 | tail -10
+```
+
+**E1. 507033 触发源隔离（197，核心实验；需 151 target 已按 7b 启动）**
+
+背景：批次 4 证实 HDC 在 urma_perf 进程内走了 remote-jetty 路径且全败。
+主嫌疑：进程加载的 gds liburma（及其插件库）让 HDC 选择了 UB/远程路径。
+现在可用两种 liburma 分别跑 npu-staged 对比：
+
+```bash
+# E1-a. 标准 liburma（LD_LIBRARY_PATH 只含 CANN，不含 UMDK）
+LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.T500/aarch64-linux/lib64 \
+SPDK_URMA_MAX_IO_SIZE=4194304 \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M npu-staged -t 5
+
+# E1-b. gds liburma（对照组，原配置重跑确认 507033 仍复现）
+LD_LIBRARY_PATH=/home/lx/nds/UMDK_netlab/lib:/usr/local/Ascend/cann-9.0.T500/aarch64-linux/lib64 \
+SPDK_URMA_MAX_IO_SIZE=4194304 \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M npu-staged -t 5
+```
+
+判定：
+- **结果 A（E1-a 507033 消失且预检通过）= NDS 全链路首测通过 🎯**，且锁定
+  根因 = gds liburma 在进程中触发 HDC remote-jetty 路径 → 外部再定根治方案
+- 结果 B（E1-a 仍 507033）→ 排除 gds liburma，下一步查 DPDK/EAL 与 HDC 交互
+- 结果 C（E1-a URMA 连接失败）→ 记录标准库差异报错
+
+**E2. LOC_ACCESS_ERR 基线（绕开 SPDK，直接测 197 内核 URMA 路径）**
+
+E2-a. 找或构建 urma_perftest（UMDK 自带工具，纯 URMA 层双向读写，
+完全绕开 SPDK，可判定 197 内核驱动是否有问题）：
+```bash
+find /home/lx/nds/UMDK_netlab /home/l00955908/nds -name "urma_perftest" -type f 2>/dev/null
+# 若没有：UMDK 树 src/urma/tools/urma_perftest 有源码，根目录有 CMakeLists.txt；
+# 或到 245 上 find /home -name "urma_perftest"（同事A 编译过 UMDK，可能有现成二进制，
+# 同为 aarch64 可直接拷）
+```
+E2-b. 双机基线：151 起 server、197 起 client，纯 host 内存最简模式
+（命令按 urma_perftest -h，不要加 GPU 参数）：
+- **perftest 通过** → 197 内核 URMA 路径正常，LOC_ACCESS_ERR 出在
+  SPDK/gds-liburma 的注册方式（外部下一步对照 perftest 的 token_policy/
+  access 配置——本地源码已发现两者有差异，perftest 用
+  token_id_valid + token_policy + ATOMIC，SPDK 用 TOKEN_NONE + 无 ATOMIC）
+- **perftest 也报 access error** → 197 内核驱动问题实锤 → 后续方案：
+  用 urma_driver 源码为 197 内核编译驱动模块（共享机装卸需协调维护窗口）
+
+E2-c. 顺手补批次 4 没做成的对照（现在不会 undefined symbol 了）：
+```bash
+# 标准 liburma 下的 -M cpu（LOC_ACCESS_ERR 是否与 gds liburma 相关）
+LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.T500/aarch64-linux/lib64 \
+SPDK_URMA_MAX_IO_SIZE=4194304 \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M cpu -t 5
+```
+
+**回传**：全部输出追加第 9 节，注明「批次 5 完毕」。
+
 ### 回执导入 2026-09-15 #5（批次 3R-1 结果，用户带回）
 
 - 环境变更：197 已可联网；197 代码在 /home/lx/spdk（fetch+reset 至 0f4bfaf）；

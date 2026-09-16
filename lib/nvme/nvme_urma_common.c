@@ -4,6 +4,8 @@
 
 #include "nvme_urma_internal.h"
 
+#include <dlfcn.h>
+
 #define SPDK_URMA_PROVIDER_COUNT (SPDK_NVME_URMA_MEM_XDS + 1)
 
 struct spdk_nvme_urma_memory_region {
@@ -26,6 +28,39 @@ static struct spdk_nvme_urma_memory_stats g_memory_stats;
 
 #define SPDK_URMA_STAT_INC(member) \
 	__atomic_fetch_add(&g_memory_stats.member, 1, __ATOMIC_RELAXED)
+
+/* Modified By NDS: urma_register_seg_dmabuf 是 liburma gds 分支的扩展符号，
+ * 标准版 liburma 没有。改为运行时 dlsym 解析（RTLD_DEFAULT），使同一份
+ * urma_perf 二进制既能配 gds liburma 也能配标准 liburma 运行——批次 4 的
+ * 标准库对照实验因 undefined symbol 无法进行，此改动解锁该实验，
+ * 同时让 host-only 路线（cpu/posix/npu-staged）摆脱对 gds 库的运行时依赖。 */
+typedef urma_target_seg_t *(*spdk_urma_reg_seg_dmabuf_fn)(urma_context_t *,
+		urma_seg_cfg_t *, int, uint64_t);
+
+static spdk_urma_reg_seg_dmabuf_fn g_reg_seg_dmabuf_fn;
+static pthread_once_t g_reg_seg_dmabuf_once = PTHREAD_ONCE_INIT;
+
+static void
+spdk_urma_resolve_reg_seg_dmabuf_fn(void)
+{
+	g_reg_seg_dmabuf_fn = (spdk_urma_reg_seg_dmabuf_fn)
+			      dlsym(RTLD_DEFAULT, "urma_register_seg_dmabuf");
+	if (g_reg_seg_dmabuf_fn == NULL) {
+		SPDK_NOTICELOG("liburma has no urma_register_seg_dmabuf "
+			       "(standard build); dmabuf registration disabled\n");
+	}
+}
+
+static urma_target_seg_t *
+spdk_urma_register_seg_dmabuf(void *urma_context, urma_seg_cfg_t *cfg,
+			      int dmabuf_fd, uint64_t offset)
+{
+	pthread_once(&g_reg_seg_dmabuf_once, spdk_urma_resolve_reg_seg_dmabuf_fn);
+	if (g_reg_seg_dmabuf_fn == NULL) {
+		return NULL;
+	}
+	return g_reg_seg_dmabuf_fn(urma_context, cfg, dmabuf_fd, offset);
+}
 
 static int
 spdk_urma_runtime_get(void)
@@ -329,7 +364,7 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 		rc = region->provider->export_dmabuf(region->provider->provider_ctx,
 					     region->pin_handle, &region->dmabuf_fd, &offset);
 		if (rc == 0) {
-			region->target_seg = urma_register_seg_dmabuf(urma_context, &cfg,
+			region->target_seg = spdk_urma_register_seg_dmabuf(urma_context, &cfg,
 								       region->dmabuf_fd, offset);
 			if (region->target_seg != NULL) {
 				SPDK_URMA_STAT_INC(dmabuf_registrations);
