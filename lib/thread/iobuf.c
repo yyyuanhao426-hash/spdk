@@ -60,6 +60,7 @@ struct iobuf_node {
 	struct spdk_ring		*large_pool;
 	void				*small_pool_base;
 	void				**large_pool_chunks;
+	uint32_t			*large_pool_chunk_buf_counts;
 	uint32_t			large_pool_chunk_count;
 };
 
@@ -129,16 +130,15 @@ iobuf_large_chunks_free(struct iobuf_node *node)
 {
 	uint32_t i;
 
-	if (node->large_pool_chunks == NULL) {
-		return;
+	if (node->large_pool_chunks != NULL) {
+		for (i = 0; i < node->large_pool_chunk_count; i++) {
+			spdk_free(node->large_pool_chunks[i]);
+		}
+		spdk_free(node->large_pool_chunks);
+		node->large_pool_chunks = NULL;
 	}
-
-	for (i = 0; i < node->large_pool_chunk_count; i++) {
-		spdk_free(node->large_pool_chunks[i]);
-	}
-
-	spdk_free(node->large_pool_chunks);
-	node->large_pool_chunks = NULL;
+	spdk_free(node->large_pool_chunk_buf_counts);
+	node->large_pool_chunk_buf_counts = NULL;
 	node->large_pool_chunk_count = 0;
 }
 
@@ -162,8 +162,12 @@ iobuf_large_chunks_alloc(struct iobuf_node *node, uint32_t numa_id)
 	num_chunks = SPDK_CEIL_DIV(opts->large_pool_count, IOBUF_LARGE_POOL_MIN_CHUNK_SIZE);
 	node->large_pool_chunks = spdk_malloc(num_chunks * sizeof(void *), IOBUF_ALIGNMENT,
 					      NULL, numa_id, SPDK_MALLOC_DMA);
-	if (node->large_pool_chunks == NULL) {
+	node->large_pool_chunk_buf_counts = spdk_zmalloc(num_chunks * sizeof(uint32_t),
+							IOBUF_ALIGNMENT, NULL, numa_id,
+							SPDK_MALLOC_DMA);
+	if (node->large_pool_chunks == NULL || node->large_pool_chunk_buf_counts == NULL) {
 		SPDK_ERRLOG("Unable to allocate large iobuf chunk table\n");
+		iobuf_large_chunks_free(node);
 		return -ENOMEM;
 	}
 
@@ -188,6 +192,7 @@ iobuf_large_chunks_alloc(struct iobuf_node *node, uint32_t numa_id)
 		}
 
 		node->large_pool_chunks[allocated++] = chunk;
+		node->large_pool_chunk_buf_counts[allocated - 1] = want;
 		node->large_pool_chunk_count = allocated;
 
 		for (j = 0; j < want; j++) {
@@ -455,6 +460,39 @@ spdk_iobuf_get_opts(struct spdk_iobuf_opts *opts, size_t opts_size)
 	/* Do not remove this statement, you should always update this statement when you adding a new field,
 	 * and do not forget to add the SET_FIELD statement for your added field. */
 	SPDK_STATIC_ASSERT(sizeof(struct spdk_iobuf_opts) == 40, "Incorrect size");
+}
+
+int
+spdk_iobuf_for_each_pool_memory(spdk_iobuf_pool_memory_cb cb_fn, void *cb_arg)
+{
+	struct iobuf_node *node;
+	int32_t numa_id;
+	int rc;
+
+	if (!g_iobuf_is_initialized || cb_fn == NULL) {
+		return -EINVAL;
+	}
+	IOBUF_FOREACH_NUMA_ID(numa_id) {
+		int32_t allocation_numa_id = g_iobuf.opts.enable_numa ? numa_id :
+					     SPDK_ENV_NUMA_ID_ANY;
+
+		node = &g_iobuf.node[numa_id];
+		rc = cb_fn(cb_arg, node->small_pool_base,
+			   (size_t)g_iobuf.opts.small_pool_count * g_iobuf.opts.small_bufsize,
+			   allocation_numa_id);
+		if (rc != 0) {
+			return rc;
+		}
+		for (uint32_t i = 0; i < node->large_pool_chunk_count; i++) {
+			rc = cb_fn(cb_arg, node->large_pool_chunks[i],
+				   (size_t)node->large_pool_chunk_buf_counts[i] *
+				   g_iobuf.opts.large_bufsize, allocation_numa_id);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+	}
+	return 0;
 }
 
 static void
