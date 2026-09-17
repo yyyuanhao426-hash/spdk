@@ -340,6 +340,7 @@ struct nvmf_urma_qpair {
 	struct spdk_urma_device *device;
 	urma_jetty_t **jettys;
 	urma_target_jetty_t **target_jettys;
+	urma_jfr_t **jfrs;
 	uint32_t jetty_count;
 	uint32_t next_jetty;
 	uint32_t send_jfc_index;
@@ -539,7 +540,8 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 	}
 	uqpair->jettys = calloc(uqpair->jetty_count, sizeof(*uqpair->jettys));
 	uqpair->target_jettys = calloc(uqpair->jetty_count, sizeof(*uqpair->target_jettys));
-	if (uqpair->jettys == NULL || uqpair->target_jettys == NULL) {
+	uqpair->jfrs = calloc(uqpair->jetty_count, sizeof(*uqpair->jfrs));
+	if (uqpair->jettys == NULL || uqpair->target_jettys == NULL || uqpair->jfrs == NULL) {
 		return -ENOMEM;
 	}
 	uqpair->send_jfc_index = spdk_urma_device_next_send_jfc(device);
@@ -562,24 +564,43 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 	for (i = 0; i < uqpair->jetty_count; i++) {
 		urma_jetty_cfg_t cfg = {};
 		uint32_t jfr_index = spdk_urma_device_next_jfr(device);
+		urma_jfr_cfg_t jfr_cfg = device->jfrs[jfr_index]->jfr_cfg;
 
+		/* Keep completion queues context-wide, but give every endpoint its
+		 * own receive queue.  This guarantees that destroying an endpoint
+		 * also removes all of its posted capsule receives. */
+		jfr_cfg.jfc = device->recv_jfcs[jfr_index];
+		uqpair->jfrs[i] = urma_create_jfr(device->context, &jfr_cfg);
+		if (uqpair->jfrs[i] == NULL) {
+			goto error;
+		}
 		cfg.jfs_cfg = jfs;
 		cfg.flag.bs.share_jfr = 1;
-		cfg.shared.jfr = device->jfrs[jfr_index];
+		cfg.shared.jfr = uqpair->jfrs[i];
 		cfg.shared.jfc = device->recv_jfcs[jfr_index];
 		uqpair->jettys[i] = urma_create_jetty(device->context, &cfg);
 		if (uqpair->jettys[i] == NULL) {
-			while (i > 0) {
-				urma_delete_jetty(uqpair->jettys[--i]);
-			}
-			free(uqpair->jettys);
-			free(uqpair->target_jettys);
-			uqpair->jettys = NULL;
-			uqpair->target_jettys = NULL;
-			return -EIO;
+			goto error;
 		}
 	}
 	return 0;
+
+error:
+	for (uint32_t j = 0; j <= i; j++) {
+		if (uqpair->jettys[j] != NULL) {
+			urma_delete_jetty(uqpair->jettys[j]);
+		}
+		if (uqpair->jfrs[j] != NULL) {
+			urma_delete_jfr(uqpair->jfrs[j]);
+		}
+	}
+	free(uqpair->jfrs);
+	free(uqpair->jettys);
+	free(uqpair->target_jettys);
+	uqpair->jfrs = NULL;
+	uqpair->jettys = NULL;
+	uqpair->target_jettys = NULL;
+	return -EIO;
 }
 
 static int
@@ -605,8 +626,7 @@ nvmf_urma_capsule_resources_init(struct nvmf_urma_qpair *uqpair)
 	uqpair->capsule_rx_count = uqpair->qpair.sq_head_max + 1;
 	if (uqpair->capsule_rx_count == 0 ||
 	    (uint64_t)uqpair->capsule_rx_count >
-	    (uint64_t)uqpair->device->jfrs[0]->jfr_cfg.depth *
-	    spdk_min(uqpair->jetty_count, uqpair->device->jfr_count)) {
+	    (uint64_t)uqpair->jfrs[0]->jfr_cfg.depth * uqpair->jetty_count) {
 		return -EINVAL;
 	}
 	uqpair->capsule_rx_slots = calloc(uqpair->capsule_rx_count,
@@ -684,8 +704,8 @@ nvmf_urma_handshake(struct nvmf_urma_qpair *uqpair)
 	max_queue_depth = spdk_min(remote.max_queue_depth,
 				   spdk_min(uqpair->transport->transport.opts.max_queue_depth,
 					    (uint32_t)spdk_min(
-						    (uint64_t)device->jfrs[0]->jfr_cfg.depth *
-						    spdk_min(uqpair->jetty_count, device->jfr_count),
+						    (uint64_t)uqpair->jfrs[0]->jfr_cfg.depth *
+						    uqpair->jetty_count,
 						    (uint64_t)UINT32_MAX)));
 	if (max_queue_depth < 2) {
 		return -EINVAL;
@@ -822,6 +842,12 @@ nvmf_urma_accept(void *arg)
 				}
 				free(uqpair->target_jettys);
 				free(uqpair->jettys);
+				for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
+					if (uqpair->jfrs != NULL && uqpair->jfrs[i] != NULL) {
+						urma_delete_jfr(uqpair->jfrs[i]);
+					}
+				}
+				free(uqpair->jfrs);
 				nvmf_urma_capsule_resources_fini(uqpair);
 				spdk_urma_device_close(uqpair->device);
 				close(fd);
@@ -1995,9 +2021,13 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 		if (uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
 			urma_delete_jetty(uqpair->jettys[i]);
 		}
+		if (uqpair->jfrs != NULL && uqpair->jfrs[i] != NULL) {
+			urma_delete_jfr(uqpair->jfrs[i]);
+		}
 	}
 	free(uqpair->target_jettys);
 	free(uqpair->jettys);
+	free(uqpair->jfrs);
 	nvmf_urma_capsule_resources_fini(uqpair);
 	/* Modified By Yida: unregister all cached target-side memory regions before freeing qpair */
 	for (int i = 0; i < NVMF_URMA_REG_CACHE_SIZE; i++) {

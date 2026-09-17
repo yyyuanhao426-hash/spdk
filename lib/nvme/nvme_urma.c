@@ -188,6 +188,7 @@ struct nvme_urma_qpair {
 	struct spdk_urma_device *device;
 	urma_jetty_t **jettys;
 	urma_target_jetty_t **target_jettys;
+	urma_jfr_t **jfrs;
 	uint32_t jetty_count;
 	uint32_t next_jetty;
 	uint32_t send_jfc_index;
@@ -424,7 +425,8 @@ nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 	}
 	uqpair->jettys = calloc(uqpair->jetty_count, sizeof(*uqpair->jettys));
 	uqpair->target_jettys = calloc(uqpair->jetty_count, sizeof(*uqpair->target_jettys));
-	if (uqpair->jettys == NULL || uqpair->target_jettys == NULL) {
+	uqpair->jfrs = calloc(uqpair->jetty_count, sizeof(*uqpair->jfrs));
+	if (uqpair->jettys == NULL || uqpair->target_jettys == NULL || uqpair->jfrs == NULL) {
 		return -ENOMEM;
 	}
 	uqpair->send_jfc_index = spdk_urma_device_next_send_jfc(uqpair->device);
@@ -449,24 +451,44 @@ nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 	for (i = 0; i < uqpair->jetty_count; i++) {
 		urma_jetty_cfg_t cfg = {};
 		uint32_t jfr_index = spdk_urma_device_next_jfr(uqpair->device);
+		urma_jfr_cfg_t jfr_cfg = uqpair->device->jfrs[jfr_index]->jfr_cfg;
 
+		/* JFCs belong to the NIC context, but receive queues must belong to
+		 * the endpoint.  Otherwise posted receive WRs outlive a disconnected
+		 * qpair in the context-wide JFR and can consume the next connection's
+		 * capsule. */
+		jfr_cfg.jfc = uqpair->device->recv_jfcs[jfr_index];
+		uqpair->jfrs[i] = urma_create_jfr(uqpair->device->context, &jfr_cfg);
+		if (uqpair->jfrs[i] == NULL) {
+			goto error;
+		}
 		cfg.jfs_cfg = jfs;
 		cfg.flag.bs.share_jfr = 1;
-		cfg.shared.jfr = uqpair->device->jfrs[jfr_index];
+		cfg.shared.jfr = uqpair->jfrs[i];
 		cfg.shared.jfc = uqpair->device->recv_jfcs[jfr_index];
 		uqpair->jettys[i] = urma_create_jetty(uqpair->device->context, &cfg);
 		if (uqpair->jettys[i] == NULL) {
-			while (i > 0) {
-				urma_delete_jetty(uqpair->jettys[--i]);
-			}
-			free(uqpair->jettys);
-			free(uqpair->target_jettys);
-			uqpair->jettys = NULL;
-			uqpair->target_jettys = NULL;
-			return -EIO;
+			goto error;
 		}
 	}
 	return 0;
+
+error:
+	for (uint32_t j = 0; j <= i; j++) {
+		if (uqpair->jettys[j] != NULL) {
+			urma_delete_jetty(uqpair->jettys[j]);
+		}
+		if (uqpair->jfrs[j] != NULL) {
+			urma_delete_jfr(uqpair->jfrs[j]);
+		}
+	}
+	free(uqpair->jfrs);
+	free(uqpair->jettys);
+	free(uqpair->target_jettys);
+	uqpair->jfrs = NULL;
+	uqpair->jettys = NULL;
+	uqpair->target_jettys = NULL;
+	return -EIO;
 }
 
 static int
@@ -491,9 +513,8 @@ nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
 	local.tp_type = uqpair->device->opts.tp_type;
 	local.max_queue_depth = spdk_min(uqpair->num_entries + 1,
 					 (uint32_t)spdk_min(
-						 (uint64_t)uqpair->device->jfrs[0]->jfr_cfg.depth *
-						 spdk_min(uqpair->jetty_count, uqpair->device->jfr_count),
-						 (uint64_t)UINT32_MAX));
+						 (uint64_t)uqpair->jfrs[0]->jfr_cfg.depth *
+						 uqpair->jetty_count, (uint64_t)UINT32_MAX));
 	local.max_io_size = uqpair->max_io_size;
 	local.capsule_transport = uqpair->device->opts.capsule_transport;
 	rc = nvme_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
@@ -584,8 +605,7 @@ nvme_urma_capsule_resources_init(struct nvme_urma_qpair *uqpair)
 	uqpair->capsule_rx_count = uqpair->num_entries;
 	if (uqpair->capsule_rx_count == 0 ||
 	    (uint64_t)uqpair->capsule_rx_count >
-	    (uint64_t)uqpair->device->jfrs[0]->jfr_cfg.depth *
-	    spdk_min(uqpair->jetty_count, uqpair->device->jfr_count)) {
+	    (uint64_t)uqpair->jfrs[0]->jfr_cfg.depth * uqpair->jetty_count) {
 		return -EINVAL;
 	}
 	uqpair->capsule_rx_slots = calloc(uqpair->capsule_rx_count,
@@ -1105,11 +1125,16 @@ nvme_urma_qpair_release_transport(struct nvme_urma_qpair *uqpair)
 		if (uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
 			urma_delete_jetty(uqpair->jettys[i]);
 		}
+		if (uqpair->jfrs != NULL && uqpair->jfrs[i] != NULL) {
+			urma_delete_jfr(uqpair->jfrs[i]);
+		}
 	}
 	free(uqpair->target_jettys);
 	free(uqpair->jettys);
+	free(uqpair->jfrs);
 	uqpair->target_jettys = NULL;
 	uqpair->jettys = NULL;
+	uqpair->jfrs = NULL;
 	uqpair->jetty_count = 0;
 	nvme_urma_capsule_resources_fini(uqpair);
 	if (uqpair->fd >= 0) {
