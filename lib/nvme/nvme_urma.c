@@ -679,6 +679,7 @@ nvme_urma_send_cmd_capsule(struct nvme_urma_qpair *uqpair,
 		.len = sizeof(*frame),
 	};
 	urma_jfs_wr_t wr = {}, *bad_wr = NULL;
+	urma_status_t status;
 	uint32_t jetty_index = nvme_urma_next_jetty(uqpair);
 
 	wr.opcode = URMA_OPC_SEND;
@@ -688,8 +689,16 @@ nvme_urma_send_cmd_capsule(struct nvme_urma_qpair *uqpair,
 	wr.user_ctx = (uint64_t)&uqpair->capsule_tx_cqe;
 	wr.send.src.sge = &sge;
 	wr.send.src.num_sge = 1;
-	return urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr, &bad_wr) ==
-	       URMA_SUCCESS ? 0 : -EIO;
+	status = urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr, &bad_wr);
+	if (status != URMA_SUCCESS) {
+		SPDK_ERRLOG("capsule SEND post failed: status=%d qid=%u cid=%u jetty=%u "
+			    "send_jfc=%u queue_depth=%u/%u bad_wr=%p\n",
+			    status, uqpair->qpair.id, frame->capsule.cmd.cid, jetty_index,
+			    uqpair->send_jfc_index, uqpair->qpair.queue_depth,
+			    uqpair->num_entries, bad_wr);
+		return -EIO;
+	}
+	return 0;
 }
 
 static enum spdk_nvme_urma_memory_type
@@ -903,6 +912,8 @@ nvme_urma_queue_response(struct nvme_urma_qpair *uqpair,
 
 	pthread_mutex_lock(&uqpair->pending_rsp_lock);
 	if (uqpair->pending_rsp_count == uqpair->capsule_rx_count) {
+		SPDK_ERRLOG("pending response queue full: qid=%u cid=%u count=%u\n",
+			    uqpair->qpair.id, rsp->cpl.cid, uqpair->pending_rsp_count);
 		rc = -ENOSPC;
 	} else {
 		uqpair->pending_rsps[uqpair->pending_rsp_tail] = *rsp;
