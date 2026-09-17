@@ -148,7 +148,7 @@ Deprecated, use iobuf-small-cache-size instead""",
     p.add_argument('--capsule-transport', choices=['tcp', 'sendrecv'],
                    help='NVMe capsule transport (URMA only)')
     p.add_argument('--dev-name', help='Local URMA device name (URMA only)', type=str)
-    p.add_argument('--trans-mode', choices=['RM', 'RC', 'UM'], type=str.upper,
+    p.add_argument('--trans-mode', type=str.upper,
                    help='URMA transport mode (URMA only)')
     p.add_argument('--active-port',
                    help='URMA active port; omit or use -1 for automatic selection (URMA only)', type=int)
@@ -166,7 +166,7 @@ Deprecated, use iobuf-small-cache-size instead""",
     p.add_argument('--jetty-depth', help='URMA Jetty depth (URMA only)', type=int)
     p.add_argument('--priority',
                    help='URMA priority; omit or use -1 to auto-select by CTP/RTP type (URMA only)', type=int)
-    p.add_argument('--tp-type', choices=['ctp', 'rtp'], type=str.lower,
+    p.add_argument('--tp-type', type=str.lower,
                    help='URMA transport-path type (URMA only)')
     p.add_argument('--bonding-multipath', action='store_true', default=None,
                    help='Enable URMA bonding multipath at IODIE level (URMA only)')
