@@ -136,6 +136,15 @@ struct spdk_urma_device {
 	struct spdk_memory_domain *memory_domain;
 };
 
+/* UMDK constructs these queue-state notification CRs without a valid
+ * user_ctx.  They must be consumed before any transport context lookup. */
+static inline bool
+spdk_urma_cr_is_fake(const urma_cr_t *cr)
+{
+	return cr->status == URMA_CR_WR_SUSPEND_DONE ||
+	       cr->status == URMA_CR_WR_FLUSH_ERR_DONE;
+}
+
 void spdk_urma_opts_init(struct spdk_urma_transport_opts *opts);
 int spdk_urma_parse_capsule_transport(const char *value,
 				       enum spdk_urma_capsule_transport *transport);

@@ -858,9 +858,13 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 static int32_t
 nvme_urma_process_capsule_cr(const urma_cr_t *cr, uint32_t *completed)
 {
-	struct nvme_urma_cqe_ctx *ctx = (void *)cr->user_ctx;
+	struct nvme_urma_cqe_ctx *ctx;
 	uint64_t t_compl0 = spdk_get_ticks();
 
+	if (spdk_urma_cr_is_fake(cr)) {
+		return 0;
+	}
+	ctx = (void *)cr->user_ctx;
 	if (ctx == NULL || cr->status != URMA_CR_SUCCESS) {
 		SPDK_ERRLOG("capsule completion failed: status=%d user_ctx=%p\n",
 			    cr->status, (void *)cr->user_ctx);

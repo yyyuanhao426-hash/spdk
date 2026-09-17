@@ -1669,10 +1669,14 @@ nvmf_urma_process_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot,
 static int
 nvmf_urma_handle_completion(const urma_cr_t *completion)
 {
-	struct nvmf_urma_cqe_ctx *ctx = (void *)completion->user_ctx;
+	struct nvmf_urma_cqe_ctx *ctx;
 	struct nvmf_urma_qpair *uqpair;
 	struct nvmf_urma_req *ureq;
 
+	if (spdk_urma_cr_is_fake(completion)) {
+		return 0;
+	}
+	ctx = (void *)completion->user_ctx;
 	if (ctx == NULL) {
 		return 0;
 	}
@@ -1750,10 +1754,14 @@ nvmf_urma_completion_msg_fn(void *ctx)
 static int
 nvmf_urma_process_completion(const urma_cr_t *completion)
 {
-	struct nvmf_urma_cqe_ctx *ctx = (void *)completion->user_ctx;
+	struct nvmf_urma_cqe_ctx *ctx;
 	struct nvmf_urma_qpair *uqpair = NULL;
 	struct nvmf_urma_completion_msg *msg;
 
+	if (spdk_urma_cr_is_fake(completion)) {
+		return 0;
+	}
+	ctx = (void *)completion->user_ctx;
 	if (ctx == NULL) {
 		return 0;
 	}
