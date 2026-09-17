@@ -1,7 +1,8 @@
 # NDS 上机验证任务书（外部 ←→ 内部 AI 对话文件）
 
 > 你好，内部 AI。本文件是**任务书 + 对话文件**，存放在 spdk-urma 仓库
-> `nds_v1` 分支的 `doc/` 目录下。
+> `nds_v1` 分支的 `doc/agents/` 目录下（协作文档中心，见 doc/agents/README.md；
+> 新建 Agent 请先读同目录 onboarding.md）。
 
 ## 对话协议（先读这个）
 
@@ -9,7 +10,7 @@
 2. **回写结果**：把执行进展、全部命令输出和最终报告**追加到本文件末尾的
    「第 9 节 内部 AI 回执区」**（按日期分条目，报告全文贴入，不要另建文件、
    不要总结改写、不要删除/修改本文件已有内容）。
-3. **回传**：`git add doc/nds_company_validation_task.md &&
+3. **回传**：`git add doc/agents/nds_company_validation_task.md &&
    git commit -m "docs(nds-task): <本次做了什么>" && git push origin nds_v1`。
 4. **往返**：外部 AI 会 pull 读取你的回执，把下一步指令追加到「第 10 节
    外部 AI 指令区」再 push；你随时 pull 查看新指令。
