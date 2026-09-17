@@ -147,6 +147,33 @@ Deprecated, use iobuf-small-cache-size instead""",
     p.add_argument('--data-wr-pool-size', help='RDMA data WR pool size (RDMA only)', type=int)
     p.add_argument('--capsule-transport', choices=['tcp', 'sendrecv'],
                    help='NVMe capsule transport (URMA only)')
+    p.add_argument('--dev-name', help='Local URMA device name (URMA only)', type=str)
+    p.add_argument('--trans-mode', choices=['RM', 'RC', 'UM'], type=str.upper,
+                   help='URMA transport mode (URMA only)')
+    p.add_argument('--active-port',
+                   help='URMA active port; omit or use -1 for automatic selection (URMA only)', type=int)
+    p.add_argument('--eid-index', help='Local URMA EID index (URMA only)', type=int)
+    p.add_argument('--send-jfc-count',
+                   help='Number of shared send JFCs per local URMA NIC context (URMA only)', type=int)
+    p.add_argument('--jfc-count',
+                   help='Deprecated alias setting both send_jfc_count and recv_jfc_count (URMA only)', type=int)
+    p.add_argument('--recv-jfc-count',
+                   help='Number of shared receive JFCs per local URMA NIC context (URMA only)', type=int)
+    p.add_argument('--jfc-depth', help='Shared URMA JFC depth (URMA only)', type=int)
+    p.add_argument('--num-jetty-per-ep',
+                   help='Number of Jettys in each remote NIC endpoint (URMA only)', type=int)
+    p.add_argument('--jetty-count', help='Deprecated alias for num_jetty_per_ep (URMA only)', type=int)
+    p.add_argument('--jetty-depth', help='URMA Jetty depth (URMA only)', type=int)
+    p.add_argument('--priority',
+                   help='URMA priority; omit or use -1 to auto-select by CTP/RTP type (URMA only)', type=int)
+    p.add_argument('--tp-type', choices=['ctp', 'rtp'], type=str.lower,
+                   help='URMA transport-path type (URMA only)')
+    p.add_argument('--bonding-multipath', action='store_true', default=None,
+                   help='Enable URMA bonding multipath at IODIE level (URMA only)')
+    p.add_argument('--bonding-balance', action='store_true', default=None,
+                   help='Enable URMA bonding balance mode (URMA only)')
+    p.add_argument('--numa-affinity', action='store_true', default=None,
+                   help='Attach source and destination chip affinity to URMA data WRs (URMA only)')
     p.add_argument('--disable-command-passthru', action='store_true',
                    help='Disallow forwarding unrecognized I/O opcodes and the Identify Namespace admin command'
                         ' to the underlying bdev. Passthrough subsystems and admin_cmd_passthru are unaffected')

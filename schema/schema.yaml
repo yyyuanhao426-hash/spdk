@@ -2972,6 +2972,54 @@ methods:
         type: enum
         class: nvmf_urma_capsule_transport
         description: NVMe capsule transport (URMA only)
+      - name: dev_name
+        type: string
+        description: Local URMA device name (URMA only)
+      - name: trans_mode
+        type: string
+        description: URMA transport mode, RM, RC, or UM (URMA only)
+      - name: active_port
+        type: int32
+        description: URMA active port; omit or use -1 for automatic selection (URMA only)
+      - name: eid_index
+        type: uint32
+        description: Local URMA EID index (URMA only)
+      - name: send_jfc_count
+        type: uint32
+        description: Number of shared send JFCs per local URMA NIC context (URMA only)
+      - name: jfc_count
+        type: uint32
+        description: Deprecated alias setting both send_jfc_count and recv_jfc_count (URMA only)
+      - name: recv_jfc_count
+        type: uint32
+        description: Number of shared receive JFCs per local URMA NIC context (URMA only)
+      - name: jfc_depth
+        type: uint32
+        description: Shared URMA JFC depth (URMA only)
+      - name: num_jetty_per_ep
+        type: uint32
+        description: Number of Jettys in each remote NIC endpoint (URMA only)
+      - name: jetty_count
+        type: uint32
+        description: Deprecated alias for num_jetty_per_ep (URMA only)
+      - name: jetty_depth
+        type: uint32
+        description: URMA Jetty depth (URMA only)
+      - name: priority
+        type: int32
+        description: URMA priority; omit or use -1 to auto-select by CTP/RTP type (URMA only)
+      - name: tp_type
+        type: string
+        description: URMA transport-path type, ctp or rtp (URMA only)
+      - name: bonding_multipath
+        type: boolean
+        description: Enable URMA bonding multipath at IODIE level (URMA only)
+      - name: bonding_balance
+        type: boolean
+        description: Enable URMA bonding balance mode (URMA only)
+      - name: numa_affinity
+        type: boolean
+        description: Attach source and destination chip affinity to URMA data WRs (URMA only)
       - name: disable_command_passthru
         type: boolean
         description: Disallow forwarding unrecognized I/O opcodes and the Identify Namespace admin command to the underlying bdev. Passthrough subsystems and admin_cmd_passthru are unaffected
