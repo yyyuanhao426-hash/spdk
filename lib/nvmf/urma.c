@@ -1254,6 +1254,21 @@ nvmf_urma_poll_group_remove(struct spdk_nvmf_transport_poll_group *base, struct 
 
 static void nvmf_urma_release_req(struct nvmf_urma_req *ureq);
 
+static void
+nvmf_urma_disconnect_qpair(struct nvmf_urma_qpair *uqpair)
+{
+	int rc;
+
+	if (!spdk_nvmf_qpair_is_active(&uqpair->qpair)) {
+		return;
+	}
+	rc = spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+	if (rc != 0 && rc != -EINPROGRESS) {
+		SPDK_ERRLOG("Failed to disconnect URMA qpair qid=%u, rc=%d\n",
+			    uqpair->qpair.qid, rc);
+	}
+}
+
 static int
 nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 {
@@ -1510,7 +1525,7 @@ nvmf_urma_buffers_ready(struct nvmf_urma_req *ureq)
 			ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 			ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 			if (nvmf_urma_send_response(ureq) != 0) {
-				qpair->state = SPDK_NVMF_QPAIR_ERROR;
+				nvmf_urma_disconnect_qpair(nvmf_urma_qpair(qpair));
 			}
 		}
 	} else {
@@ -1637,6 +1652,30 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 	return nvmf_urma_handle_capsule(uqpair, &hdr, &capsule, t_peek, t_parse0);
 }
 
+/* The TCP socket remains the lifetime channel even when NVMe capsules use
+ * URMA SEND/RECV.  No payload is expected on it after the handshake in that
+ * mode, but observing EOF is required to release the target qpair when the
+ * initiator exits. */
+static int
+nvmf_urma_check_lifetime_socket(struct nvmf_urma_qpair *uqpair)
+{
+	uint8_t byte;
+	ssize_t rc;
+
+	rc = recv(uqpair->fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+	if (rc > 0) {
+		/* SEND/RECV mode must not carry capsules on the bootstrap socket. */
+		return -EPROTO;
+	}
+	if (rc == 0) {
+		return -ECONNRESET;
+	}
+	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+		return 0;
+	}
+	return -errno;
+}
+
 static int
 nvmf_urma_process_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot,
 			      const urma_cr_t *cr)
@@ -1694,20 +1733,20 @@ nvmf_urma_handle_completion(const urma_cr_t *completion)
 		SPDK_ERRLOG("poll_group: completion error status=%d type=%d user_ctx=%p\n",
 			    completion->status, ctx->type, (void *)completion->user_ctx);
 		if (ctx->type != NVMF_URMA_CQE_DATA) {
-			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+			nvmf_urma_disconnect_qpair(uqpair);
 			return 0;
 		}
 		ureq = ctx->owner;
 		ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 		ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		if (nvmf_urma_send_response(ureq) != 0) {
-			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+			nvmf_urma_disconnect_qpair(uqpair);
 		}
 		return 0;
 	}
 	if (ctx->type == NVMF_URMA_CQE_CAPSULE_TX) {
 		if (completion->flag.bs.s_r != 0) {
-			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+			nvmf_urma_disconnect_qpair(uqpair);
 		}
 		return 1;
 	}
@@ -1715,7 +1754,7 @@ nvmf_urma_handle_completion(const urma_cr_t *completion)
 		int rc = nvmf_urma_process_cmd_receive(ctx->owner, completion);
 
 		if (rc < 0) {
-			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+			nvmf_urma_disconnect_qpair(uqpair);
 			return 0;
 		}
 		return rc;
@@ -1732,7 +1771,7 @@ nvmf_urma_handle_completion(const urma_cr_t *completion)
 		/* Modified By Yida(v3): C2H push — WR posted -> JFC completion */
 		NVMF_URMA_TGT_STAGE(push, spdk_get_ticks() - ureq->post_tick);
 		if (nvmf_urma_send_response(ureq) != 0) {
-			uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+			nvmf_urma_disconnect_qpair(uqpair);
 		}
 	}
 	return 1;
@@ -1779,13 +1818,13 @@ nvmf_urma_process_completion(const urma_cr_t *completion)
 	}
 	msg = malloc(sizeof(*msg));
 	if (msg == NULL) {
-		uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+		nvmf_urma_disconnect_qpair(uqpair);
 		return -ENOMEM;
 	}
 	msg->completion = *completion;
 	if (spdk_thread_send_msg(uqpair->thread, nvmf_urma_completion_msg_fn, msg) != 0) {
 		free(msg);
-		uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+		nvmf_urma_disconnect_qpair(uqpair);
 		return -EIO;
 	}
 	return 0;
@@ -1797,7 +1836,7 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 	struct nvmf_urma_poll_group *group = SPDK_CONTAINEROF(base, struct nvmf_urma_poll_group, group);
 	struct nvmf_urma_transport *transport = SPDK_CONTAINEROF(base->transport,
 							 struct nvmf_urma_transport, transport);
-	struct nvmf_urma_qpair *uqpair;
+	struct nvmf_urma_qpair *uqpair, *tmp;
 	urma_cr_t completions[64];
 	uint32_t stride = spdk_max(transport->worker_count, 1u);
 	int total = 0;
@@ -1831,7 +1870,20 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 		}
 	}
 
-	TAILQ_FOREACH(uqpair, &group->qpairs, link) {
+	TAILQ_FOREACH_SAFE(uqpair, &group->qpairs, link, tmp) {
+		if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+			int rc = nvmf_urma_check_lifetime_socket(uqpair);
+
+			if (rc < 0) {
+				SPDK_DEBUGLOG(nvmf_urma, "qpair qid=%u lifetime socket closed, rc=%d\n",
+					      uqpair->qpair.qid, rc);
+				/* spdk_nvmf_qpair_disconnect() may synchronously remove and free
+				 * this qpair, so do not access uqpair after this call. */
+				nvmf_urma_disconnect_qpair(uqpair);
+				total++;
+			}
+			continue;
+		}
 		/* Modified By Yida(v4): drain every fully-arrived capsule instead of
 		 * one per poll round — bursty submitters used to back up one capsule
 		 * per round in the rcvbuf. Capped at NVMF_URMA_CAPSULE_BATCH so JFC
@@ -1842,7 +1894,8 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 			int rc = nvmf_urma_receive_capsule(uqpair);
 
 			if (rc < 0) {
-				uqpair->qpair.state = SPDK_NVMF_QPAIR_ERROR;
+				nvmf_urma_disconnect_qpair(uqpair);
+				total++;
 				break;
 			}
 			if (rc == 0) {
@@ -1919,7 +1972,7 @@ nvmf_urma_req_complete(struct spdk_nvmf_request *req)
 		ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
 	if (nvmf_urma_send_response(ureq) != 0) {
-		qpair->state = SPDK_NVMF_QPAIR_ERROR;
+		nvmf_urma_disconnect_qpair(nvmf_urma_qpair(qpair));
 	}
 }
 
