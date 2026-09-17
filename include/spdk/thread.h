@@ -1218,6 +1218,31 @@ int spdk_iobuf_set_opts(const struct spdk_iobuf_opts *opts);
 void spdk_iobuf_get_opts(struct spdk_iobuf_opts *opts, size_t opts_size);
 
 /**
+ * Callback invoked once for every contiguous allocation backing an iobuf pool.
+ *
+ * \param cb_arg Context supplied to spdk_iobuf_for_each_pool_memory().
+ * \param addr Start of the allocation.
+ * \param length Allocation length in bytes.
+ * \param numa_id NUMA node containing the allocation, or SPDK_ENV_NUMA_ID_ANY.
+ *
+ * \return 0 to continue iteration or a negative errno to stop.
+ */
+typedef int (*spdk_iobuf_pool_memory_cb)(void *cb_arg, void *addr, size_t length,
+					 int32_t numa_id);
+
+/**
+ * Visit the contiguous allocations backing all initialized iobuf pools.
+ * The allocations remain owned by iobuf and are valid until spdk_iobuf_finish().
+ *
+ * \param cb_fn Callback invoked for each allocation.
+ * \param cb_arg Context passed to cb_fn.
+ *
+ * \return 0 on success, -EINVAL before iobuf initialization or for a NULL callback,
+ * or the first error returned by cb_fn.
+ */
+int spdk_iobuf_for_each_pool_memory(spdk_iobuf_pool_memory_cb cb_fn, void *cb_arg);
+
+/**
  * Register a module as an iobuf pool user.  Only registered users can request buffers from the
  * iobuf pool.
  *
