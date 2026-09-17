@@ -340,6 +340,71 @@ SPDK_URMA_MAX_IO_SIZE=4194304 \
 
 **回传**：全部输出追加第 9 节，注明「批次 5 完毕」。
 
+### 回执导入 2026-09-17（新环境阶段 0~3 + 阶段 4 进行中）
+
+**新环境（第二次换机）**：133 = NPU 机（8× Ascend **950DT** 84GB/卡，
+CANN **9.1.0**，与旧环境 950PR/9.0.T500 不同型号与版本）；245 回归当
+Target（12× NVMe，nvme8 系统盘）。两台 HEAD 对齐 a3413ce。
+
+- 阶段 0~3 ✅：角色确认（133=Initiator，245=Target）、体检（davinci/hmm
+  符号存在、CANN dmabuf 导出能力确认 aclrtMallocPhysical/
+  aclrtMemExportToShareableHandle(V2) 等）、代码部署、gds UMDK 部署
+  （133=/home/lx/UMDK_netlab，扩展验证齐）
+- 阶段 4 ⏳：configure 依赖逐个解决（libfuse3 绕过 --without-nvme-cuse；
+  isa-l/isa-l-crypto 在 245 预编译后 rsync 到 133 /home/lx/isal_install；
+  外部 isa-l 需 **--with-shared** 重跑 configure），待编译
+- 共享机状态：133 有业务（NPU1 vLLM ~78GB、NPU2 python），空闲卡
+  0/3/4/5/6/7 可用
+
+### 指令 2026-09-17 #10：批次 A'（新环境编译收尾 + 首测准备）
+
+**10a. 完成编译**（批准用 --with-shared）：
+```bash
+cd /home/lx/nds/spdk
+./configure --with-urma=/home/lx/UMDK_netlab \
+            --without-nvme-cuse --with-shared \
+            --with-isal-install=/home/lx/isal_install 2>&1 | tail -20
+# （若 isa-l 外部安装的参数名与 configure 实际不一致，以 ./configure --help 为准）
+nice -n 10 make -j16 2>&1 | tail -30
+```
+
+**10b. 产物验证**：
+```bash
+ls -l build/examples/urma_perf build/bin/nvmf_tgt
+LD_LIBRARY_PATH=/home/lx/nds/spdk/build/lib:/home/lx/UMDK_netlab/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+./build/examples/urma_perf -h 2>&1 | grep -A3 -- '-M'
+# 注意：--with-shared 后运行时需加 <spdk>/build/lib，否则起不来
+# 启动 -h 也会打印 CANN runtime loaded: ... —— 确认是 9.1.0
+```
+
+**10c. 首测准备与执行（133 共享机硬约束）**：
+1. 任何 NPU 测试前：npu-smi info 截图记录，确认所用卡空闲；
+   **只允许空闲卡 0/3/4/5/6/7，严禁 NPU1/NPU2**；urma_perf 用 -g <空闲卡序号> 显式指定
+2. hugepages 跑前记录/跑后恢复（vLLM 在跑，大页变动影响更大）
+3. 245 起 target（同 7b 方式，库路径按本环境调整）：
+   ```bash
+   cd /home/l00955908/nds/spdk
+   ./target_nvme_takeover.sh -d <空闲盘> -L /home/l00955908/nds/UMDK_netlab/lib -i 141.61.84.245 -y
+   ```
+4. 133 依次跑（traddr 改为 245 的 IP 141.61.84.245）：
+   ```bash
+   # ① cpu 回归（历史 LOC_ACCESS_ERR 在新环境重验——133 的内核/驱动与
+   #    旧 197 不同，此问题可能不复现）
+   # ② npu-staged（CANN 9.1.0 + 950DT 上 507033 是否复现同样待验；
+   #    历史 HDC remote-jetty 结论基于 950PR+9.0.T500，不可直接搬）
+   LD_LIBRARY_PATH=/home/lx/nds/spdk/build/lib:/home/lx/UMDK_netlab/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+   SPDK_URMA_MAX_IO_SIZE=4194304 \
+   ./build/examples/urma_perf \
+     -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.245 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+     -M cpu -t 5 -g <空闲卡序号>     # 先 cpu，通过后同命令换 -M npu-staged
+   ```
+
+**10d. 报告要求**：最终报告除常规内容外**必须包含**：两台内核版本与
+URMA 驱动 srcversion 对比表（判断旧 LOC_ACCESS_ERR 是否适用本环境）；
+CANN runtime loaded 打印行；每次测试前后的 hugepages 与 npu-smi 状态。
+
+**回传**：输出追加第 9 节，注明「批次 A' 完毕」。
+
 ### 回执导入 2026-09-15 #5（批次 3R-1 结果，用户带回）
 
 - 环境变更：197 已可联网；197 代码在 /home/lx/spdk（fetch+reset 至 0f4bfaf）；

@@ -36,18 +36,17 @@ NPU HBM ──► [host DRAM 暂存] ──网卡──URMA──► iobuf ─�
 
 ## 4. 当前环境速览（⚠️ 易变节：换环境时由外部 AI 更新本节）
 
-> **最近一次更新**：2026-09-17，环境已更换（原 197/151 被占用）。
-> 新机器的 IP/型号/内核等信息**以最新体检报告为准**（见主对话文件回执区，
-> 或 env_sop.md 阶段 1 的产出）。下方占位待首批体检后填充。
+> **最近一次更新**：2026-09-17，第二次换环境（197/151 → 133/245；
+> 原 950PR 机器被占用）。
 
 | 项 | 值 |
 |---|---|
-| NPU 节点（Initiator） | IP：___ 型号：___ CANN：___ 内核：___ |
-| Target 节点 | IP：___ 空闲盘：___ 内核：___ |
-| 代码路径 | NPU 机：___ Target 机：___ |
-| UMDK（gds 版）路径 | ___ |
-| 是否共用机 | ___（决定隔离级别） |
-| 两台互通 | ___ |
+| NPU 节点（Initiator） | **133**：8× Ascend **950DT**（84GB HBM/卡，与旧环境 950PR 不同型号）；CANN **9.1.0**（/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64）；内核 davinci/hmm 符号存在；**共享机且有业务在跑**（NPU1 vLLM、NPU2 python）——测试只用空闲卡 0/3/4/5/6/7，用 -g 显式指定 |
+| Target 节点 | **245**：12× NVMe 7.68T；nvme8=系统盘（禁碰），nvme7/3=raid 成员，其余空闲 |
+| 代码路径 | 133：/home/lx/nds/spdk（HEAD a3413ce）；245：同仓 clone |
+| UMDK（gds 版）路径 | 133：/home/lx/UMDK_netlab；245：/home/l00955908/nds/UMDK_netlab |
+| 两台互通 | ✅ ping 正常 |
+| 编译注意 | isa-l/isa-l-crypto 用 245 预编译外部安装（/home/lx/isal_install），configure 需加 **--with-shared**；运行时 LD_LIBRARY_PATH 需加 <spdk>/build/lib |
 
 ## 5. 运行 urma_perf 的固定姿势（gds liburma 隔离加载）
 
