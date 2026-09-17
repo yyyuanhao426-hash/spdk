@@ -204,6 +204,12 @@ struct nvme_urma_qpair {
 	struct nvme_urma_rsp_rx_slot *capsule_rx_slots;
 	struct spdk_nvme_urma_memory_region *capsule_rx_region;
 	uint32_t capsule_rx_count;
+	struct spdk_urma_capsule_rsp *pending_rsps;
+	uint32_t pending_rsp_head;
+	uint32_t pending_rsp_tail;
+	uint32_t pending_rsp_count;
+	pthread_mutex_t pending_rsp_lock;
+	bool pending_rsp_lock_initialized;
 	/* Modified By Yida: memory registration cache */
 	struct nvme_urma_reg_entry reg_cache[NVME_URMA_REG_CACHE_SIZE];
 	TAILQ_HEAD(, nvme_urma_req) outstanding;
@@ -610,9 +616,14 @@ nvme_urma_capsule_resources_init(struct nvme_urma_qpair *uqpair)
 	}
 	uqpair->capsule_rx_slots = calloc(uqpair->capsule_rx_count,
 					  sizeof(*uqpair->capsule_rx_slots));
-	if (uqpair->capsule_rx_slots == NULL) {
+	uqpair->pending_rsps = calloc(uqpair->capsule_rx_count, sizeof(*uqpair->pending_rsps));
+	if (uqpair->capsule_rx_slots == NULL || uqpair->pending_rsps == NULL) {
 		return -ENOMEM;
 	}
+	if (pthread_mutex_init(&uqpair->pending_rsp_lock, NULL) != 0) {
+		return -EIO;
+	}
+	uqpair->pending_rsp_lock_initialized = true;
 	rc = spdk_nvme_urma_register_memory(uqpair->device->context,
 			uqpair->capsule_rx_slots,
 			uqpair->capsule_rx_count * sizeof(*uqpair->capsule_rx_slots),
@@ -645,6 +656,15 @@ nvme_urma_capsule_resources_fini(struct nvme_urma_qpair *uqpair)
 {
 	spdk_nvme_urma_unregister_memory(uqpair->capsule_rx_region);
 	uqpair->capsule_rx_region = NULL;
+	if (uqpair->pending_rsp_lock_initialized) {
+		pthread_mutex_destroy(&uqpair->pending_rsp_lock);
+		uqpair->pending_rsp_lock_initialized = false;
+	}
+	free(uqpair->pending_rsps);
+	uqpair->pending_rsps = NULL;
+	uqpair->pending_rsp_head = 0;
+	uqpair->pending_rsp_tail = 0;
+	uqpair->pending_rsp_count = 0;
 	free(uqpair->capsule_rx_slots);
 	uqpair->capsule_rx_slots = NULL;
 	uqpair->capsule_rx_count = 0;
@@ -875,8 +895,59 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 	return 1;
 }
 
+static int
+nvme_urma_queue_response(struct nvme_urma_qpair *uqpair,
+			 const struct spdk_urma_capsule_rsp *rsp)
+{
+	int rc = 0;
+
+	pthread_mutex_lock(&uqpair->pending_rsp_lock);
+	if (uqpair->pending_rsp_count == uqpair->capsule_rx_count) {
+		rc = -ENOSPC;
+	} else {
+		uqpair->pending_rsps[uqpair->pending_rsp_tail] = *rsp;
+		uqpair->pending_rsp_tail = (uqpair->pending_rsp_tail + 1) % uqpair->capsule_rx_count;
+		uqpair->pending_rsp_count++;
+	}
+	pthread_mutex_unlock(&uqpair->pending_rsp_lock);
+	return rc;
+}
+
+static int
+nvme_urma_drain_queued_responses(struct nvme_urma_qpair *uqpair,
+				 uint32_t max_completions)
+{
+	uint32_t completed = 0;
+
+	while (completed < max_completions) {
+		struct spdk_urma_capsule_rsp rsp;
+		bool found = false;
+		int rc;
+
+		pthread_mutex_lock(&uqpair->pending_rsp_lock);
+		if (uqpair->pending_rsp_count != 0) {
+			rsp = uqpair->pending_rsps[uqpair->pending_rsp_head];
+			uqpair->pending_rsp_head = (uqpair->pending_rsp_head + 1) %
+						  uqpair->capsule_rx_count;
+			uqpair->pending_rsp_count--;
+			found = true;
+		}
+		pthread_mutex_unlock(&uqpair->pending_rsp_lock);
+		if (!found) {
+			break;
+		}
+		rc = nvme_urma_complete_response(uqpair, &rsp);
+		if (rc < 0) {
+			return rc;
+		}
+		completed += rc;
+	}
+	return completed;
+}
+
 static int32_t
-nvme_urma_process_capsule_cr(const urma_cr_t *cr, uint32_t *completed)
+nvme_urma_process_capsule_cr(struct nvme_urma_qpair *poller, const urma_cr_t *cr,
+			     uint32_t *completed)
 {
 	struct nvme_urma_cqe_ctx *ctx;
 	uint64_t t_compl0 = spdk_get_ticks();
@@ -917,6 +988,9 @@ nvme_urma_process_capsule_cr(const urma_cr_t *cr, uint32_t *completed)
 		__atomic_add_fetch(&g_timing.compl_ticks, spdk_get_ticks() - t_compl0,
 				   __ATOMIC_RELAXED);
 		__atomic_add_fetch(&g_timing.compl_count, 1, __ATOMIC_RELAXED);
+		if (owner != poller) {
+			return nvme_urma_queue_response(owner, &frame.capsule);
+		}
 		rc = nvme_urma_complete_response(owner, &frame.capsule);
 		if (rc < 0) {
 			return rc;
@@ -937,13 +1011,19 @@ nvme_urma_process_sendrecv_completions(struct nvme_urma_qpair *uqpair,
 	uint32_t budget = requested_budget > SPDK_COUNTOF(cr) ? SPDK_COUNTOF(cr) :
 			  (uint32_t)requested_budget;
 
+	int pending = nvme_urma_drain_queued_responses(uqpair, max_completions);
+
+	if (pending < 0) {
+		return pending;
+	}
+	completed = pending;
 	for (uint32_t j = 0; j < uqpair->device->send_jfc_count && completed < max_completions; j++) {
 		int count = spdk_urma_device_poll_send_jfc(uqpair->device, j, budget, cr);
 		if (count < 0) {
 			return -EIO;
 		}
 		for (int i = 0; i < count; i++) {
-			int rc = nvme_urma_process_capsule_cr(&cr[i], &completed);
+			int rc = nvme_urma_process_capsule_cr(uqpair, &cr[i], &completed);
 			if (rc != 0) {
 				return rc;
 			}
@@ -957,7 +1037,7 @@ nvme_urma_process_sendrecv_completions(struct nvme_urma_qpair *uqpair,
 			return -EIO;
 		}
 		for (int i = 0; i < count; i++) {
-			int rc = nvme_urma_process_capsule_cr(&cr[i], &completed);
+			int rc = nvme_urma_process_capsule_cr(uqpair, &cr[i], &completed);
 			if (rc != 0) {
 				return rc;
 			}
