@@ -30,7 +30,7 @@
 
 enum spdk_urma_capsule_transport {
 	SPDK_URMA_CAPSULE_TRANSPORT_TCP = 0,
-	SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV = 1,
+	SPDK_URMA_CAPSULE_TRANSPORT_URMA = 1,
 };
 
 enum spdk_urma_msg_type {

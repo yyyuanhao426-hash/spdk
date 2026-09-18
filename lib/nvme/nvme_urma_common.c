@@ -200,10 +200,8 @@ spdk_urma_parse_capsule_transport(const char *value,
 		*transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
 		return 0;
 	}
-	if (strcasecmp(value, "sendrecv") == 0 ||
-	    strcasecmp(value, "send_recv") == 0 ||
-	    strcasecmp(value, "urma") == 0) {
-		*transport = SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV;
+	if (strcasecmp(value, "urma") == 0) {
+		*transport = SPDK_URMA_CAPSULE_TRANSPORT_URMA;
 		return 0;
 	}
 	return -EINVAL;
@@ -215,8 +213,8 @@ spdk_urma_capsule_transport_name(enum spdk_urma_capsule_transport transport)
 	switch (transport) {
 	case SPDK_URMA_CAPSULE_TRANSPORT_TCP:
 		return "tcp";
-	case SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV:
-		return "sendrecv";
+	case SPDK_URMA_CAPSULE_TRANSPORT_URMA:
+		return "urma";
 	default:
 		return "unknown";
 	}
@@ -812,7 +810,7 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 	    opts->num_jetty_per_ep > SPDK_URMA_MAX_JETTY_PER_EP ||
 	    opts->priority < -1 || opts->priority > URMA_MAX_PRIORITY ||
 	    (opts->tp_type != URMA_CTP && opts->tp_type != URMA_RTP) ||
-	    opts->capsule_transport > SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+	    opts->capsule_transport > SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		SPDK_ERRLOG("Invalid URMA transport options\n");
 		return -EINVAL;
 	}
