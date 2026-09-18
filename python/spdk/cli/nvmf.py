@@ -145,7 +145,7 @@ Deprecated, use iobuf-small-cache-size instead""",
                    type=int)
     p.add_argument('--ack-timeout', help='ACK timeout in milliseconds', type=int)
     p.add_argument('--data-wr-pool-size', help='RDMA data WR pool size (RDMA only)', type=int)
-    p.add_argument('--capsule-transport', choices=['tcp', 'sendrecv'],
+    p.add_argument('--capsule-transport', choices=['tcp', 'urma'],
                    help='NVMe capsule transport (URMA only)')
     p.add_argument('--dev-name', help='Local URMA device name (URMA only)', type=str)
     p.add_argument('--trans-mode', type=str,

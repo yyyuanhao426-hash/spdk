@@ -550,7 +550,7 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 	jfs.priority = device->priority;
 	jfs.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
 	jfs.flag.bs.multi_path = device->opts.bonding_multipath ? 1 : 0;
-	if (device->opts.capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+	if (device->opts.capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		if (device->attr.dev_cap.max_jfs_inline_len < capsule_inline_size) {
 			SPDK_ERRLOG("URMA capsule SEND requires %u inline bytes, device supports %u\n",
 				    capsule_inline_size, device->attr.dev_cap.max_jfs_inline_len);
@@ -620,7 +620,7 @@ nvmf_urma_capsule_resources_init(struct nvmf_urma_qpair *uqpair)
 	urma_target_seg_t *tseg;
 	int rc;
 
-	if (uqpair->capsule_transport != SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+	if (uqpair->capsule_transport != SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		return 0;
 	}
 	uqpair->capsule_rx_count = uqpair->qpair.sq_head_max + 1;
@@ -998,7 +998,7 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	if (json_opts.capsule_transport != NULL &&
 	    spdk_urma_parse_capsule_transport(json_opts.capsule_transport,
 					      &transport->urma_opts.capsule_transport) != 0) {
-		SPDK_ERRLOG("Invalid URMA capsule_transport '%s' (expected 'tcp' or 'sendrecv')\n",
+		SPDK_ERRLOG("Invalid URMA capsule_transport '%s' (expected 'tcp' or 'urma')\n",
 			    json_opts.capsule_transport);
 		free(json_opts.dev_name);
 		free(json_opts.trans_mode);
@@ -1312,7 +1312,7 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 	/* Keep the wire frame contiguous. TCP emits it with one write; SEND/RECV
 	 * copies the same bytes inline into the WQE before this stack frame goes
 	 * out of scope. */
-	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		struct spdk_urma_capsule_rsp_frame frame = {
 			.hdr = hdr,
 			.capsule = rsp,
@@ -1897,7 +1897,7 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 	}
 
 	TAILQ_FOREACH_SAFE(uqpair, &group->qpairs, link, tmp) {
-		if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+		if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 			int rc = nvmf_urma_check_lifetime_socket(uqpair);
 
 			if (rc < 0) {

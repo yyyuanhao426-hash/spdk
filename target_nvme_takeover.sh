@@ -18,7 +18,7 @@
 #   ./target_nvme_takeover.sh                   # 只分析：列系统盘 + 空闲候选盘，不做任何变更
 #   ./target_nvme_takeover.sh -d nvme3n1        # 接管 nvme3n1 → 后台启动 nvmf_tgt → 自动配 RPC
 #   ./target_nvme_takeover.sh -d nvme3n1 -s 10  # 同上 + SPDK_URMA_TARGET_DUMP_SEC=10 计时
-#   ./target_nvme_takeover.sh -d nvme3n1 -p sendrecv  # capsule 使用 URMA SEND/RECV
+#   ./target_nvme_takeover.sh -d nvme3n1 -p urma  # capsule 使用 URMA
 #   ./target_nvme_takeover.sh -Z                 # 不接管物理盘，创建 1TiB Null0 bdev
 #   ./target_nvme_takeover.sh -d nvme3n1,nvme4n1    # 两块盘 → subsystem 里两个 namespace（nsid 1,2）
 #   ./target_nvme_takeover.sh -d nvme3n1 -d nvme4n1 # 同上（-d 可重复，逗号分隔均可）
@@ -46,7 +46,7 @@
 #                UMMU 注册（数十 ms）→ 吞吐崩。每核固定预占 32 个 large
 #                （bdev 16+accel 16），池子必须盖住 核数×(32+此值)+余量
 #   -s <秒>      打开 target 计时（SPDK_URMA_TARGET_DUMP_SEC，transport 创建时读取）
-#   -p <方式>    NVMe capsule 传输方式：tcp 或 sendrecv（默认 tcp）。initiator
+#   -p <方式>    NVMe capsule 传输方式：tcp 或 urma（默认 tcp）。initiator
 #                必须配置相同的 SPDK_URMA_CAPSULE_TRANSPORT
 #   -i <IP>      listener 地址（默认自动探测本机第一个全局 IPv4；多网卡机器建议显式指定）
 #   -m <掩码>    nvmf_tgt core mask（默认 0x3；盘多时可加宽，如 0xf）
@@ -141,8 +141,8 @@ if [ "$NULL_BDEV_MODE" = 1 ]; then
 fi
 
 case "$CAPSULE_TRANSPORT" in
-    tcp|sendrecv) ;;
-    *) abort "-p capsule transport 只支持 tcp 或 sendrecv，收到: $CAPSULE_TRANSPORT" ;;
+    tcp|urma) ;;
+    *) abort "-p capsule transport 只支持 tcp 或 urma，收到: $CAPSULE_TRANSPORT" ;;
 esac
 
 [ "$(id -u)" -eq 0 ] || abort "必须以 root 运行（sysfs 绑定 + hugepages + 启动 nvmf_tgt）"
@@ -315,8 +315,8 @@ echo
 #---------------- 只分析模式 ----------------
 if [ -z "$DISKS" ] && [ "$NULL_BDEV_MODE" = 0 ]; then
     info "未指定 -d，到此为止（未做任何变更）。选定“空闲”盘后："
-    info "  $0 -d <盘名>[,<盘名>...] [-p tcp|sendrecv] [-R strip_kb] [-I iobuf四元组] [-O max_io_size] [-s 计时秒数] [-i listener IP]"
-    info "  或使用 Null bdev：$0 -Z [-p tcp|sendrecv] [-I iobuf四元组] [-O max_io_size] [-s 计时秒数] [-i listener IP]"
+    info "  $0 -d <盘名>[,<盘名>...] [-p tcp|urma] [-R strip_kb] [-I iobuf四元组] [-O max_io_size] [-s 计时秒数] [-i listener IP]"
+    info "  或使用 Null bdev：$0 -Z [-p tcp|urma] [-I iobuf四元组] [-O max_io_size] [-s 计时秒数] [-i listener IP]"
     exit 0
 fi
 

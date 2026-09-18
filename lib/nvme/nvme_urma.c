@@ -442,7 +442,7 @@ nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 	jfs.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
 	jfs.flag.bs.multi_path = uqpair->device->opts.bonding_multipath ? 1 : 0;
 	if (uqpair->device->opts.capsule_transport ==
-	    SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+	    SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		if (uqpair->device->attr.dev_cap.max_jfs_inline_len < capsule_inline_size) {
 			SPDK_ERRLOG("URMA capsule SEND requires %u inline bytes, device supports %u\n",
 				    capsule_inline_size,
@@ -605,7 +605,7 @@ nvme_urma_capsule_resources_init(struct nvme_urma_qpair *uqpair)
 	urma_target_seg_t *tseg;
 	int rc;
 
-	if (uqpair->capsule_transport != SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+	if (uqpair->capsule_transport != SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		return 0;
 	}
 	uqpair->capsule_rx_count = uqpair->num_entries;
@@ -812,7 +812,7 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	/* Keep the wire frame contiguous. TCP emits it with one write; SEND/RECV
 	 * copies the same bytes inline into the WQE, so the stack frame may be
 	 * released as soon as urma_post_jetty_send_wr() returns. */
-	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		struct spdk_urma_capsule_cmd_frame frame = {
 			.hdr = hdr,
 			.capsule = capsule,
@@ -1013,7 +1013,7 @@ nvme_urma_process_capsule_cr(struct nvme_urma_qpair *poller, const urma_cr_t *cr
 }
 
 static int32_t
-nvme_urma_process_sendrecv_completions(struct nvme_urma_qpair *uqpair,
+nvme_urma_process_capsule_completions(struct nvme_urma_qpair *uqpair,
 				       uint32_t max_completions)
 {
 	uint32_t completed = 0;
@@ -1067,8 +1067,8 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	if (max_completions == 0) {
 		max_completions = UINT32_MAX;
 	}
-	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
-		rc = nvme_urma_process_sendrecv_completions(uqpair, max_completions);
+	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
+		rc = nvme_urma_process_capsule_completions(uqpair, max_completions);
 		if (rc < 0) {
 			return rc;
 		}
