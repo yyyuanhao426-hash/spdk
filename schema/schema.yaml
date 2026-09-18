@@ -188,7 +188,7 @@ enums:
     fields:
       - name: tcp
         value: 0
-      - name: sendrecv
+      - name: urma
         value: 1
   - name: oncs_feature
     fields:
