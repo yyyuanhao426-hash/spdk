@@ -116,13 +116,10 @@ spdk_urma_env_i32(const char *name, int32_t default_value)
 }
 
 static bool
-spdk_urma_env_bool(const char *name, const char *compat_name, bool default_value)
+spdk_urma_env_bool(const char *name, bool default_value)
 {
 	const char *value = getenv(name);
 
-	if ((value == NULL || value[0] == '\0') && compat_name != NULL) {
-		value = getenv(compat_name);
-	}
 	if (value == NULL || value[0] == '\0') {
 		return default_value;
 	}
@@ -146,9 +143,6 @@ spdk_urma_opts_init(struct spdk_urma_transport_opts *opts)
 	memset(opts, 0, sizeof(*opts));
 	opts->active_port = -1;
 	value = getenv("SPDK_URMA_TRANS_MODE");
-	if (value == NULL || value[0] == '\0') {
-		value = getenv("MC_URMA_TRANS_MODE");
-	}
 	opts->transport_mode = spdk_urma_parse_mode(value);
 	opts->eid_index = spdk_urma_env_u32("SPDK_URMA_EID_INDEX", 0);
 	opts->send_jfc_count = spdk_urma_env_u32("SPDK_URMA_SEND_JFC_COUNT",
@@ -177,17 +171,11 @@ spdk_urma_opts_init(struct spdk_urma_transport_opts *opts)
 		SPDK_WARNLOG("Ignoring invalid SPDK_URMA_CAPSULE_TRANSPORT=%s\n", value);
 		opts->capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
 	}
-	opts->bonding_balance = spdk_urma_env_bool("SPDK_URMA_BONDING_BALANCE",
-				"MC_URMA_BONDING_BALANCE", false);
-	opts->bonding_multipath = spdk_urma_env_bool("SPDK_URMA_BONDING_MULTIPATH_ENABLE",
-				  "MC_URMA_BONDING_MULTIPATH_ENABLE", false);
-	opts->numa_affinity = spdk_urma_env_bool("SPDK_URMA_NUMA_AFFINITY_ENABLE",
-			      "MC_UB_NUMA_AFFINITY_ENABLE", false);
+	opts->bonding_balance = spdk_urma_env_bool("SPDK_URMA_BONDING_BALANCE", false);
+	opts->bonding_multipath = spdk_urma_env_bool("SPDK_URMA_BONDING_MULTIPATH_ENABLE", false);
+	opts->numa_affinity = spdk_urma_env_bool("SPDK_URMA_NUMA_AFFINITY_ENABLE", false);
 
 	value = getenv("SPDK_URMA_ACTIVE_PORT");
-	if (value == NULL || value[0] == '\0') {
-		value = getenv("MC_URMA_ACTIVE_PORT");
-	}
 	if (value != NULL && value[0] != '\0') {
 		char *end = NULL;
 		long port = strtol(value, &end, 10);
