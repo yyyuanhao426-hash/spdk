@@ -811,10 +811,20 @@ work_fn(void *arg)
 	       !atomic_load_explicit(&g_failed, memory_order_acquire)) {
 		for (i = 0; i < g_batch_size; i++) {
 			struct io_task *task = &worker->tasks[i];
+			int submit_rc;
 
-			if (!task->in_flight && submit_io(worker, task, !g_read_workload,
-							 worker_next_lba(worker)) != 0) {
-				fprintf(stderr, "Worker %u failed to submit I/O\n", worker->id);
+			if (!task->in_flight &&
+			    (submit_rc = submit_io(worker, task, !g_read_workload,
+						    worker_next_lba(worker))) != 0) {
+				if (submit_rc == -EAGAIN || submit_rc == -ENOMEM) {
+					/* Transient qpair/request-pool backpressure.  Poll below and
+					 * retry this task on the next loop iteration. */
+					continue;
+				}
+				fprintf(stderr, "Worker %u failed to submit I/O: rc=%d (%s), "
+					"outstanding=%u task=%u\n", worker->id, submit_rc,
+					submit_rc < 0 ? spdk_strerror(-submit_rc) : "transport error",
+					worker->outstanding, i);
 				atomic_store_explicit(&g_failed, true, memory_order_release);
 				break;
 			}
@@ -824,9 +834,16 @@ work_fn(void *arg)
 			break;
 		}
 	}
+	uint64_t drain_deadline = spdk_get_ticks() + 5 * spdk_get_ticks_hz();
 	while (worker->outstanding != 0) {
 		if (spdk_nvme_qpair_process_completions(worker->qpair, 0) < 0) {
 			atomic_store_explicit(&g_failed, true, memory_order_release);
+			break;
+		}
+		if (atomic_load_explicit(&g_failed, memory_order_acquire) &&
+		    spdk_get_ticks() >= drain_deadline) {
+			fprintf(stderr, "Worker %u timed out draining %u outstanding I/O(s)\n",
+				worker->id, worker->outstanding);
 			break;
 		}
 	}

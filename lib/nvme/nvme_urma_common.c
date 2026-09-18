@@ -23,6 +23,11 @@ static pthread_mutex_t g_runtime_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_runtime_refs;
 static bool g_runtime_owned;
 static struct spdk_nvme_urma_memory_stats g_memory_stats;
+static pthread_mutex_t g_device_mutex = PTHREAD_MUTEX_INITIALIZER;
+static TAILQ_HEAD(, spdk_urma_device) g_devices = TAILQ_HEAD_INITIALIZER(g_devices);
+static pthread_once_t g_numa_chip_once = PTHREAD_ONCE_INIT;
+static uint8_t *g_numa_chip_ids;
+static size_t g_numa_chip_id_count;
 
 #define SPDK_URMA_STAT_INC(member) \
 	__atomic_fetch_add(&g_memory_stats.member, 1, __ATOMIC_RELAXED)
@@ -72,7 +77,7 @@ spdk_urma_parse_mode(const char *value)
 	return URMA_TM_RM;
 }
 
-uint32_t
+static uint32_t
 spdk_urma_env_u32(const char *name, uint32_t default_value)
 {
 	const char *value = getenv(name);
@@ -91,14 +96,30 @@ spdk_urma_env_u32(const char *name, uint32_t default_value)
 	return (uint32_t)parsed;
 }
 
+static int32_t
+spdk_urma_env_i32(const char *name, int32_t default_value)
+{
+	const char *value = getenv(name);
+	char *end = NULL;
+	long parsed;
+
+	if (value == NULL || value[0] == '\0') {
+		return default_value;
+	}
+	errno = 0;
+	parsed = strtol(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0' || parsed < INT32_MIN || parsed > INT32_MAX) {
+		SPDK_WARNLOG("Ignoring invalid %s=%s\n", name, value);
+		return default_value;
+	}
+	return (int32_t)parsed;
+}
+
 static bool
-spdk_urma_env_bool(const char *name, const char *compat_name, bool default_value)
+spdk_urma_env_bool(const char *name, bool default_value)
 {
 	const char *value = getenv(name);
 
-	if ((value == NULL || value[0] == '\0') && compat_name != NULL) {
-		value = getenv(compat_name);
-	}
 	if (value == NULL || value[0] == '\0') {
 		return default_value;
 	}
@@ -122,18 +143,27 @@ spdk_urma_opts_init(struct spdk_urma_transport_opts *opts)
 	memset(opts, 0, sizeof(*opts));
 	opts->active_port = -1;
 	value = getenv("SPDK_URMA_TRANS_MODE");
-	if (value == NULL || value[0] == '\0') {
-		value = getenv("MC_URMA_TRANS_MODE");
-	}
 	opts->transport_mode = spdk_urma_parse_mode(value);
 	opts->eid_index = spdk_urma_env_u32("SPDK_URMA_EID_INDEX", 0);
-	opts->jfc_count = spdk_urma_env_u32("SPDK_URMA_JFC_COUNT", SPDK_URMA_DEFAULT_JFC_COUNT);
+	opts->send_jfc_count = spdk_urma_env_u32("SPDK_URMA_SEND_JFC_COUNT",
+			      spdk_urma_env_u32("SPDK_URMA_JFC_COUNT", SPDK_URMA_DEFAULT_JFC_COUNT));
+	opts->recv_jfc_count = spdk_urma_env_u32("SPDK_URMA_RECV_JFC_COUNT",
+			      spdk_urma_env_u32("SPDK_URMA_JFC_COUNT", SPDK_URMA_DEFAULT_JFC_COUNT));
 	opts->jfc_depth = spdk_urma_env_u32("SPDK_URMA_JFC_DEPTH", SPDK_URMA_DEFAULT_JFC_DEPTH);
-	opts->jetty_count = spdk_urma_env_u32("SPDK_URMA_JETTY_COUNT",
-			    SPDK_URMA_DEFAULT_JETTY_COUNT);
+	opts->num_jetty_per_ep = spdk_urma_env_u32("SPDK_URMA_NUM_JETTY_PER_EP",
+				spdk_urma_env_u32("SPDK_URMA_JETTY_COUNT",
+						  SPDK_URMA_DEFAULT_JETTY_COUNT));
 	opts->jetty_depth = spdk_urma_env_u32("SPDK_URMA_JETTY_DEPTH",
 			    SPDK_URMA_DEFAULT_JETTY_DEPTH);
 	opts->max_io_size = spdk_urma_env_u32("SPDK_URMA_MAX_IO_SIZE", 131072);
+	opts->priority = spdk_urma_env_i32("SPDK_URMA_JETTY_PRIORITY", -1);
+	opts->tp_type = URMA_CTP;
+	value = getenv("SPDK_URMA_TP_TYPE");
+	if (value != NULL && strcasecmp(value, "rtp") == 0) {
+		opts->tp_type = URMA_RTP;
+	} else if (value != NULL && value[0] != '\0' && strcasecmp(value, "ctp") != 0) {
+		SPDK_WARNLOG("Ignoring invalid SPDK_URMA_TP_TYPE=%s (expected ctp or rtp)\n", value);
+	}
 	opts->capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
 	value = getenv("SPDK_URMA_CAPSULE_TRANSPORT");
 	if (value != NULL && value[0] != '\0' &&
@@ -141,15 +171,11 @@ spdk_urma_opts_init(struct spdk_urma_transport_opts *opts)
 		SPDK_WARNLOG("Ignoring invalid SPDK_URMA_CAPSULE_TRANSPORT=%s\n", value);
 		opts->capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
 	}
-	opts->bonding_balance = spdk_urma_env_bool("SPDK_URMA_BONDING_BALANCE",
-				"MC_URMA_BONDING_BALANCE", false);
-	opts->bonding_multipath = spdk_urma_env_bool("SPDK_URMA_BONDING_MULTIPATH_ENABLE",
-				  "MC_URMA_BONDING_MULTIPATH_ENABLE", false);
+	opts->bonding_balance = spdk_urma_env_bool("SPDK_URMA_BONDING_BALANCE", false);
+	opts->bonding_multipath = spdk_urma_env_bool("SPDK_URMA_BONDING_MULTIPATH_ENABLE", false);
+	opts->numa_affinity = spdk_urma_env_bool("SPDK_URMA_NUMA_AFFINITY_ENABLE", false);
 
 	value = getenv("SPDK_URMA_ACTIVE_PORT");
-	if (value == NULL || value[0] == '\0') {
-		value = getenv("MC_URMA_ACTIVE_PORT");
-	}
 	if (value != NULL && value[0] != '\0') {
 		char *end = NULL;
 		long port = strtol(value, &end, 10);
@@ -234,56 +260,63 @@ spdk_nvme_urma_unregister_memory_provider(enum spdk_nvme_urma_memory_type type)
 	return rc;
 }
 
-/* Modified By Yida(v7): 整池注册表 —— 仅由应用侧 spdk_nvme_urma_register_memory_for_qpair
- * （预注册整块连续缓冲）填充；I/O 提交路径用 find() 采纳覆盖本 I/O 缓冲的 region，
- * 跳过 per-I/O register，capsule 携带全区 seg，对端可整池 import 一次。
- * 按 urma_context 键控：每 qpair 独立 device/context，注册只对同 context 的 I/O 生效。 */
-#define NVME_URMA_REGION_REGISTRY_SIZE 64
+/* Modified By Yida(v7): 整池注册表 —— 由 initiator 预注册缓冲或 target iobuf
+ * 整池注册填充；I/O 提交路径用 find() 采纳覆盖本 I/O 缓冲的 region，跳过
+ * per-I/O register，capsule 携带全区 seg，对端可整池 import 一次。
+ * 按共享 urma_context 键控；使用动态表避免 target iobuf chunk 数超过固定槽位。 */
 
 struct nvme_urma_region_entry {
 	void *context;
 	uintptr_t start;
 	uintptr_t end;   /* start + length */
 	struct spdk_nvme_urma_memory_region *region;
-	bool used;
+	TAILQ_ENTRY(nvme_urma_region_entry) link;
 };
 
-static struct nvme_urma_region_entry g_region_registry[NVME_URMA_REGION_REGISTRY_SIZE];
+static TAILQ_HEAD(, nvme_urma_region_entry) g_region_registry =
+	TAILQ_HEAD_INITIALIZER(g_region_registry);
 static pthread_mutex_t g_region_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void
+int
 nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
 			      struct spdk_nvme_urma_memory_region *region)
 {
-	pthread_mutex_lock(&g_region_registry_mutex);
-	for (int i = 0; i < NVME_URMA_REGION_REGISTRY_SIZE; i++) {
-		struct nvme_urma_region_entry *e = &g_region_registry[i];
+	struct nvme_urma_region_entry *e;
+	uintptr_t start = (uintptr_t)addr;
 
-		if (!e->used) {
-			e->context = urma_context;
-			e->start = (uintptr_t)addr;
-			e->end = (uintptr_t)addr + length;
-			e->region = region;
-			e->used = true;
-			break;
-		}
+	if (urma_context == NULL || addr == NULL || length == 0 || region == NULL ||
+	    length > UINTPTR_MAX - start) {
+		return -EINVAL;
 	}
+	e = calloc(1, sizeof(*e));
+
+	if (e == NULL) {
+		SPDK_ERRLOG("Unable to add URMA memory region to registry\n");
+		return -ENOMEM;
+	}
+	e->context = urma_context;
+	e->start = start;
+	e->end = start + length;
+	e->region = region;
+	pthread_mutex_lock(&g_region_registry_mutex);
+	TAILQ_INSERT_TAIL(&g_region_registry, e, link);
 	pthread_mutex_unlock(&g_region_registry_mutex);
+	return 0;
 }
 
 void
 nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region)
 {
+	struct nvme_urma_region_entry *e, *tmp;
+
 	if (region == NULL) {
 		return;
 	}
 	pthread_mutex_lock(&g_region_registry_mutex);
-	for (int i = 0; i < NVME_URMA_REGION_REGISTRY_SIZE; i++) {
-		struct nvme_urma_region_entry *e = &g_region_registry[i];
-
-		if (e->used && e->region == region) {
-			e->used = false;
-			e->region = NULL;
+	TAILQ_FOREACH_SAFE(e, &g_region_registry, link, tmp) {
+		if (e->region == region) {
+			TAILQ_REMOVE(&g_region_registry, e, link);
+			free(e);
 		}
 	}
 	pthread_mutex_unlock(&g_region_registry_mutex);
@@ -293,12 +326,14 @@ struct spdk_nvme_urma_memory_region *
 nvme_urma_region_registry_find(void *urma_context, uint64_t addr, size_t length)
 {
 	struct spdk_nvme_urma_memory_region *found = NULL;
+	struct nvme_urma_region_entry *e;
 
+	if (length > UINT64_MAX - addr) {
+		return NULL;
+	}
 	pthread_mutex_lock(&g_region_registry_mutex);
-	for (int i = 0; i < NVME_URMA_REGION_REGISTRY_SIZE; i++) {
-		struct nvme_urma_region_entry *e = &g_region_registry[i];
-
-		if (e->used && e->context == urma_context &&
+	TAILQ_FOREACH(e, &g_region_registry, link) {
+		if (e->context == urma_context &&
 		    addr >= e->start && addr + length <= e->end) {
 			found = e->region;
 			break;
@@ -515,21 +550,288 @@ spdk_nvme_urma_reset_memory_stats(void)
 	__atomic_store_n(&g_memory_stats.registration_failures, 0, __ATOMIC_RELAXED);
 }
 
+static bool
+spdk_urma_device_opts_compatible(const struct spdk_urma_device *device,
+				 const struct spdk_urma_transport_opts *opts)
+{
+	return (opts->dev_name[0] == '\0' || strcmp(device->dev_name, opts->dev_name) == 0) &&
+	       device->opts.eid_index == opts->eid_index &&
+	       device->opts.active_port == opts->active_port &&
+	       device->opts.transport_mode == opts->transport_mode &&
+	       device->opts.send_jfc_count == opts->send_jfc_count &&
+	       device->opts.recv_jfc_count == opts->recv_jfc_count &&
+	       device->opts.jfc_depth == opts->jfc_depth &&
+	       device->opts.num_jetty_per_ep == opts->num_jetty_per_ep &&
+	       device->opts.jetty_depth == opts->jetty_depth &&
+	       device->opts.capsule_transport == opts->capsule_transport &&
+	       device->opts.bonding_balance == opts->bonding_balance &&
+	       device->opts.bonding_multipath == opts->bonding_multipath &&
+	       device->opts.numa_affinity == opts->numa_affinity &&
+	       device->opts.priority == opts->priority &&
+	       device->opts.tp_type == opts->tp_type;
+}
+
+static int
+spdk_urma_select_priority(const urma_device_attr_t *attr, urma_tp_type_t tp_type,
+			  int32_t configured)
+{
+	union urma_tp_type_en wanted = {};
+
+	if (tp_type == URMA_CTP) {
+		wanted.bs.ctp = 1;
+	} else if (tp_type == URMA_RTP) {
+		wanted.bs.rtp = 1;
+	} else {
+		return -EINVAL;
+	}
+	if (configured >= 0) {
+		if (configured > URMA_MAX_PRIORITY ||
+		    attr->dev_cap.priority_info[configured].tp_type.value != wanted.value) {
+			SPDK_ERRLOG("URMA priority %d does not provide requested %s path\n",
+				    configured, tp_type == URMA_CTP ? "CTP" : "RTP");
+			return -EINVAL;
+		}
+		return configured;
+	}
+	for (int i = 0; i <= URMA_MAX_PRIORITY; i++) {
+		if (attr->dev_cap.priority_info[i].tp_type.value == wanted.value) {
+			return i;
+		}
+	}
+	SPDK_ERRLOG("No URMA priority provides requested %s path\n",
+		    tp_type == URMA_CTP ? "CTP" : "RTP");
+	return -ENOTSUP;
+}
+
+uint32_t
+spdk_urma_device_next_send_jfc(struct spdk_urma_device *device)
+{
+	return __atomic_fetch_add(&device->next_send_jfc, 1, __ATOMIC_RELAXED) %
+	       device->send_jfc_count;
+}
+
+uint32_t
+spdk_urma_device_next_jfr(struct spdk_urma_device *device)
+{
+	return __atomic_fetch_add(&device->next_jfr, 1, __ATOMIC_RELAXED) % device->jfr_count;
+}
+
+int
+spdk_urma_device_poll_send_jfc(struct spdk_urma_device *device, uint32_t index,
+			       int max_cr, urma_cr_t *cr)
+{
+	int rc;
+
+	if (index >= device->send_jfc_count ||
+	    pthread_mutex_trylock(&device->send_jfc_poll_locks[index]) != 0) {
+		return 0;
+	}
+	rc = urma_poll_jfc(device->send_jfcs[index], max_cr, cr);
+	pthread_mutex_unlock(&device->send_jfc_poll_locks[index]);
+	return rc;
+}
+
+int
+spdk_urma_device_poll_recv_jfc(struct spdk_urma_device *device, uint32_t index,
+			       int max_cr, urma_cr_t *cr)
+{
+	int rc;
+
+	if (index >= device->recv_jfc_count ||
+	    pthread_mutex_trylock(&device->recv_jfc_poll_locks[index]) != 0) {
+		return 0;
+	}
+	rc = urma_poll_jfc(device->recv_jfcs[index], max_cr, cr);
+	pthread_mutex_unlock(&device->recv_jfc_poll_locks[index]);
+	return rc;
+}
+
+static int
+spdk_urma_compare_int32(const void *lhs, const void *rhs)
+{
+	const int32_t a = *(const int32_t *)lhs;
+	const int32_t b = *(const int32_t *)rhs;
+
+	return (a > b) - (a < b);
+}
+
+static int32_t
+spdk_urma_read_numa_package_id(int32_t numa_id)
+{
+	char path[PATH_MAX];
+	FILE *file;
+	int32_t cpu_id, package_id;
+
+	snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", numa_id);
+	file = fopen(path, "r");
+	if (file == NULL) {
+		return -1;
+	}
+	if (fscanf(file, "%" SCNd32, &cpu_id) != 1 || cpu_id < 0) {
+		fclose(file);
+		return -1;
+	}
+	fclose(file);
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu_id);
+	file = fopen(path, "r");
+	if (file == NULL) {
+		return -1;
+	}
+	if (fscanf(file, "%" SCNd32, &package_id) != 1 || package_id < 0) {
+		fclose(file);
+		return -1;
+	}
+	fclose(file);
+	return package_id;
+}
+
+static void
+spdk_urma_numa_chip_map_init(void)
+{
+	int32_t *package_ids = NULL, *packages = NULL;
+	int32_t first = spdk_env_get_first_numa_id();
+	int32_t last = spdk_env_get_last_numa_id();
+	int32_t numa_id;
+	size_t node_count = 0, package_count = 0;
+	bool have_sysfs_mapping = false;
+
+	if (first < 0 || last < first || last == INT32_MAX) {
+		return;
+	}
+	g_numa_chip_id_count = (size_t)last + 1;
+	g_numa_chip_ids = malloc(g_numa_chip_id_count * sizeof(*g_numa_chip_ids));
+	package_ids = malloc(g_numa_chip_id_count * sizeof(*package_ids));
+	packages = malloc(g_numa_chip_id_count * sizeof(*packages));
+	if (g_numa_chip_ids == NULL || package_ids == NULL || packages == NULL) {
+		free(g_numa_chip_ids);
+		g_numa_chip_ids = NULL;
+		g_numa_chip_id_count = 0;
+		goto out;
+	}
+	memset(g_numa_chip_ids, SPDK_URMA_INVALID_CHIP_ID,
+	       g_numa_chip_id_count * sizeof(*g_numa_chip_ids));
+	for (size_t i = 0; i < g_numa_chip_id_count; i++) {
+		package_ids[i] = -1;
+	}
+	SPDK_ENV_FOREACH_NUMA_ID(numa_id) {
+		int32_t package_id;
+		bool seen = false;
+
+		if (numa_id < 0 || (size_t)numa_id >= g_numa_chip_id_count) {
+			continue;
+		}
+		node_count++;
+		package_id = spdk_urma_read_numa_package_id(numa_id);
+		if (package_id < 0) {
+			continue;
+		}
+		package_ids[numa_id] = package_id;
+		have_sysfs_mapping = true;
+		for (size_t i = 0; i < package_count; i++) {
+			if (packages[i] == package_id) {
+				seen = true;
+				break;
+			}
+		}
+		if (!seen) {
+			packages[package_count++] = package_id;
+		}
+	}
+	if (have_sysfs_mapping) {
+		qsort(packages, package_count, sizeof(*packages), spdk_urma_compare_int32);
+		SPDK_ENV_FOREACH_NUMA_ID(numa_id) {
+			if (numa_id < 0 || (size_t)numa_id >= g_numa_chip_id_count ||
+			    package_ids[numa_id] < 0) {
+				continue;
+			}
+			for (size_t i = 0; i < package_count && i < UINT8_MAX - 1; i++) {
+				if (packages[i] == package_ids[numa_id]) {
+					g_numa_chip_ids[numa_id] = (uint8_t)i + 1;
+					SPDK_NOTICELOG("URMA NUMA affinity: node %d package %d -> chip %u\n",
+						       numa_id, package_ids[numa_id],
+						       (unsigned)g_numa_chip_ids[numa_id]);
+					break;
+				}
+			}
+		}
+	} else if (node_count != 0) {
+		/* Restricted containers may hide CPU topology. Preserve Mooncake's
+		 * fallback by assigning the lower half of NUMA nodes to chip 1. */
+		size_t ordinal = 0;
+		size_t first_half = (node_count + 1) / 2;
+
+		SPDK_WARNLOG("URMA NUMA affinity: physical package topology unavailable; "
+			     "using node-order fallback\n");
+		SPDK_ENV_FOREACH_NUMA_ID(numa_id) {
+			if (numa_id >= 0 && (size_t)numa_id < g_numa_chip_id_count) {
+				g_numa_chip_ids[numa_id] = ordinal++ < first_half ? 1 : 2;
+			}
+		}
+	}
+out:
+	free(packages);
+	free(package_ids);
+}
+
+uint8_t
+spdk_urma_memory_chip_id(const void *addr)
+{
+	int32_t numa_id = spdk_mem_get_numa_id(addr, NULL);
+
+	if (numa_id < 0) {
+		return SPDK_URMA_INVALID_CHIP_ID;
+	}
+	pthread_once(&g_numa_chip_once, spdk_urma_numa_chip_map_init);
+	if (g_numa_chip_ids == NULL || (size_t)numa_id >= g_numa_chip_id_count) {
+		return SPDK_URMA_INVALID_CHIP_ID;
+	}
+	return g_numa_chip_ids[numa_id];
+}
+
 int
 spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			  struct spdk_urma_device **device_out)
 {
-	struct spdk_urma_device *device;
+	struct spdk_urma_device *device, *existing;
 	urma_device_t **devices = NULL;
 	urma_device_t *selected = NULL;
 	urma_eid_info_t *eids = NULL;
 	uint32_t eid_count = 0;
+	uint32_t max_jfc;
 	bool eid_found = false;
 	int count = 0, rc = -ENODEV;
 
 	if (opts == NULL || device_out == NULL) {
 		return -EINVAL;
 	}
+	if (opts->send_jfc_count == 0 || opts->recv_jfc_count == 0 ||
+	    opts->jfc_depth == 0 || opts->jetty_depth == 0 || opts->max_io_size == 0 ||
+	    opts->num_jetty_per_ep == 0 ||
+	    opts->num_jetty_per_ep > SPDK_URMA_MAX_JETTY_PER_EP ||
+	    opts->priority < -1 || opts->priority > URMA_MAX_PRIORITY ||
+	    (opts->tp_type != URMA_CTP && opts->tp_type != URMA_RTP) ||
+	    opts->capsule_transport > SPDK_URMA_CAPSULE_TRANSPORT_SEND_RECV) {
+		SPDK_ERRLOG("Invalid URMA transport options\n");
+		return -EINVAL;
+	}
+	pthread_mutex_lock(&g_device_mutex);
+	TAILQ_FOREACH(device, &g_devices, link) {
+		if (spdk_urma_device_opts_compatible(device, opts)) {
+			device->refs++;
+			*device_out = device;
+			pthread_mutex_unlock(&g_device_mutex);
+			return 0;
+		}
+		if (opts->dev_name[0] == '\0' || strcmp(device->dev_name, opts->dev_name) == 0) {
+			SPDK_ERRLOG("URMA NIC '%s' already has a context with incompatible options\n",
+				    device->dev_name);
+			pthread_mutex_unlock(&g_device_mutex);
+			return -EINVAL;
+		}
+	}
+	pthread_mutex_unlock(&g_device_mutex);
 	if (spdk_urma_runtime_get() != 0) {
 		SPDK_ERRLOG("urma device open '%s': runtime init failed\n", opts->dev_name);
 		return -EIO;
@@ -540,6 +842,7 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		goto fail_runtime;
 	}
 	device->opts = *opts;
+	device->refs = 1;
 	devices = urma_get_device_list(&count);
 	for (int i = 0; devices != NULL && i < count; i++) {
 		if (opts->dev_name[0] == '\0' || strcmp(opts->dev_name, devices[i]->name) == 0) {
@@ -552,6 +855,7 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			    opts->dev_name);
 		goto fail;
 	}
+	snprintf(device->dev_name, sizeof(device->dev_name), "%s", selected->name);
 	eids = urma_get_eid_list(selected, &eid_count);
 	if (eids == NULL || eid_count == 0) {
 		SPDK_ERRLOG("urma device open '%s': no eid list\n", selected->name);
@@ -578,6 +882,13 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		rc = -EIO;
 		goto fail;
 	}
+	rc = spdk_urma_select_priority(&device->attr, opts->tp_type, opts->priority);
+	if (rc < 0) {
+		goto fail;
+	}
+	device->priority = (uint32_t)rc;
+	SPDK_NOTICELOG("URMA device %s selected priority %u for %s\n", selected->name,
+		       device->priority, opts->tp_type == URMA_CTP ? "CTP" : "RTP");
 	/* Modified by Yin: 仅 BALANCE/MULTIPATH 才调 SET_BONDING_MODE，STANDALONE 不调（防 jetty 野指针崩溃） */
 	if (opts->bonding_balance || opts->bonding_multipath) {
 		bondp_set_bonding_mode_in_t mode = {
@@ -617,35 +928,79 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			goto fail;
 		}
 	}
-	device->jfc_count = spdk_min(opts->jfc_count,
-				     (uint32_t)device->attr.dev_cap.max_jfc);
-	if (device->jfc_count == 0) {
-		device->jfc_count = 1;
+	max_jfc = device->attr.dev_cap.max_jfc;
+	if (max_jfc < 2) {
+		SPDK_ERRLOG("urma device open '%s': at least two JFCs are required\n",
+			    selected->name);
+		rc = -ENOTSUP;
+		goto fail;
 	}
-	device->jfcs = calloc(device->jfc_count, sizeof(*device->jfcs));
-	if (device->jfcs == NULL) {
-		SPDK_ERRLOG("urma device open '%s': alloc jfc table (n=%u) failed\n",
-			    selected->name, device->jfc_count);
+	device->send_jfc_count = spdk_min(opts->send_jfc_count, max_jfc - 1);
+	if (device->send_jfc_count == 0) {
+		device->send_jfc_count = 1;
+	}
+	device->recv_jfc_count = spdk_min(opts->recv_jfc_count,
+					  max_jfc - device->send_jfc_count);
+	if (device->recv_jfc_count == 0) {
+		device->recv_jfc_count = 1;
+	}
+	device->send_jfcs = calloc(device->send_jfc_count, sizeof(*device->send_jfcs));
+	device->recv_jfcs = calloc(device->recv_jfc_count, sizeof(*device->recv_jfcs));
+	device->jfrs = calloc(device->recv_jfc_count, sizeof(*device->jfrs));
+	device->send_jfc_poll_locks = calloc(device->send_jfc_count,
+						 sizeof(*device->send_jfc_poll_locks));
+	device->recv_jfc_poll_locks = calloc(device->recv_jfc_count,
+						 sizeof(*device->recv_jfc_poll_locks));
+	if (device->send_jfcs == NULL || device->recv_jfcs == NULL || device->jfrs == NULL ||
+	    device->send_jfc_poll_locks == NULL || device->recv_jfc_poll_locks == NULL) {
+		SPDK_ERRLOG("urma device open '%s': allocate shared JFC/JFR tables failed\n",
+			    selected->name);
 		rc = -ENOMEM;
 		goto fail;
 	}
-	for (uint32_t i = 0; i < device->jfc_count; i++) {
+	for (uint32_t i = 0; i < device->send_jfc_count; i++) {
 		urma_jfc_cfg_t cfg = {};
+
 		cfg.depth = spdk_min(opts->jfc_depth,
 				     (uint32_t)device->attr.dev_cap.max_jfc_depth);
-		device->jfcs[i] = urma_create_jfc(device->context, &cfg);
-		if (device->jfcs[i] == NULL) {
-			SPDK_ERRLOG("urma device open '%s': create jfc %u (depth %u) failed\n",
+		if (pthread_mutex_init(&device->send_jfc_poll_locks[i], NULL) != 0) {
+			SPDK_ERRLOG("urma device open '%s': initialize send JFC lock %u failed\n",
+				    selected->name, i);
+			rc = -EIO;
+			goto fail;
+		}
+		device->send_jfc_poll_lock_count++;
+		device->send_jfcs[i] = urma_create_jfc(device->context, &cfg);
+		if (device->send_jfcs[i] == NULL) {
+			SPDK_ERRLOG("urma device open '%s': create send jfc %u (depth %u) failed\n",
 				    selected->name, i, cfg.depth);
 			rc = -EIO;
 			goto fail;
 		}
 	}
-	/* Modified by Yin: UB transport 强制 share_jfr=1，预建共享 jfr 供所有 jetty 复用 */
-	{
+	device->jfr_count = device->recv_jfc_count;
+	for (uint32_t i = 0; i < device->recv_jfc_count; i++) {
+		urma_jfc_cfg_t jfc_cfg = {};
 		urma_jfr_cfg_t jfr_cfg = {};
 		uint32_t max_jfr_depth = device->attr.dev_cap.max_jfr_depth;
 		uint8_t max_jfr_sge = device->attr.dev_cap.max_jfr_sge;
+
+		jfc_cfg.depth = spdk_min(opts->jfc_depth,
+					 (uint32_t)device->attr.dev_cap.max_jfc_depth);
+		if (pthread_mutex_init(&device->recv_jfc_poll_locks[i], NULL) != 0) {
+			SPDK_ERRLOG("urma device open '%s': initialize recv JFC lock %u failed\n",
+				    selected->name, i);
+			rc = -EIO;
+			goto fail;
+		}
+		device->recv_jfc_poll_lock_count++;
+		device->recv_jfcs[i] = urma_create_jfc(device->context, &jfc_cfg);
+		if (device->recv_jfcs[i] == NULL) {
+			SPDK_ERRLOG("urma device open '%s': create recv jfc %u failed\n",
+				    selected->name, i);
+			rc = -EIO;
+			goto fail;
+		}
 		if (max_jfr_depth == 0) {
 			max_jfr_depth = device->attr.dev_cap.max_jfs_depth ?
 					 device->attr.dev_cap.max_jfs_depth : opts->jetty_depth;
@@ -662,11 +1017,11 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		jfr_cfg.max_sge = spdk_min(SPDK_URMA_DEFAULT_MAX_SGE, max_jfr_sge);
 		jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
 		jfr_cfg.token_value.token = SPDK_URMA_DEFAULT_TOKEN;
-		jfr_cfg.jfc = device->jfcs[0];
-		device->jfr = urma_create_jfr(device->context, &jfr_cfg);
-		if (device->jfr == NULL) {
-			SPDK_ERRLOG("urma device open '%s': create shared jfr (depth %u) failed\n",
-				    selected->name, jfr_cfg.depth);
+		jfr_cfg.jfc = device->recv_jfcs[i];
+		device->jfrs[i] = urma_create_jfr(device->context, &jfr_cfg);
+		if (device->jfrs[i] == NULL) {
+			SPDK_ERRLOG("urma device open '%s': create shared jfr %u (depth %u) failed\n",
+				    selected->name, i, jfr_cfg.depth);
 			rc = -EIO;
 			goto fail;
 		}
@@ -692,6 +1047,25 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		urma_free_eid_list(eids);
 	}
 	urma_free_device_list(devices);
+	pthread_mutex_lock(&g_device_mutex);
+	TAILQ_FOREACH(existing, &g_devices, link) {
+		if (spdk_urma_device_opts_compatible(existing, opts)) {
+			existing->refs++;
+			pthread_mutex_unlock(&g_device_mutex);
+			spdk_urma_device_close(device);
+			*device_out = existing;
+			return 0;
+		}
+		if (strcmp(existing->dev_name, device->dev_name) == 0) {
+			pthread_mutex_unlock(&g_device_mutex);
+			SPDK_ERRLOG("URMA NIC '%s' raced with incompatible context creation\n",
+				    device->dev_name);
+			spdk_urma_device_close(device);
+			return -EINVAL;
+		}
+	}
+	TAILQ_INSERT_TAIL(&g_devices, device, link);
+	pthread_mutex_unlock(&g_device_mutex);
 	*device_out = device;
 	return 0;
 
@@ -710,22 +1084,68 @@ fail_runtime:
 }
 
 void
-spdk_urma_device_close(struct spdk_urma_device *device)
+spdk_urma_device_get(struct spdk_urma_device *device)
 {
 	if (device == NULL) {
 		return;
 	}
-	/* Modified by Yin: 释放 1.5 预建的共享 jfr，与 open 对称 */
-	if (device->jfr != NULL) {
-		urma_delete_jfr(device->jfr);
-		device->jfr = NULL;
+	pthread_mutex_lock(&g_device_mutex);
+	device->refs++;
+	pthread_mutex_unlock(&g_device_mutex);
+}
+
+void
+spdk_urma_device_close(struct spdk_urma_device *device)
+{
+	struct spdk_urma_device *it;
+	bool registered = false;
+
+	if (device == NULL) {
+		return;
 	}
-	for (uint32_t i = 0; i < device->jfc_count; i++) {
-		if (device->jfcs != NULL && device->jfcs[i] != NULL) {
-			urma_delete_jfc(device->jfcs[i]);
+	pthread_mutex_lock(&g_device_mutex);
+	TAILQ_FOREACH(it, &g_devices, link) {
+		if (it == device) {
+			registered = true;
+			break;
 		}
 	}
-	free(device->jfcs);
+	if (registered) {
+		assert(device->refs > 0);
+		if (--device->refs != 0) {
+			pthread_mutex_unlock(&g_device_mutex);
+			return;
+		}
+		TAILQ_REMOVE(&g_devices, device, link);
+	}
+	pthread_mutex_unlock(&g_device_mutex);
+
+	for (uint32_t i = 0; i < device->jfr_count; i++) {
+		if (device->jfrs != NULL && device->jfrs[i] != NULL) {
+			urma_delete_jfr(device->jfrs[i]);
+		}
+	}
+	for (uint32_t i = 0; i < device->recv_jfc_count; i++) {
+		if (device->recv_jfcs != NULL && device->recv_jfcs[i] != NULL) {
+			urma_delete_jfc(device->recv_jfcs[i]);
+		}
+	}
+	for (uint32_t i = 0; i < device->send_jfc_count; i++) {
+		if (device->send_jfcs != NULL && device->send_jfcs[i] != NULL) {
+			urma_delete_jfc(device->send_jfcs[i]);
+		}
+	}
+	for (uint32_t i = 0; i < device->recv_jfc_poll_lock_count; i++) {
+		pthread_mutex_destroy(&device->recv_jfc_poll_locks[i]);
+	}
+	for (uint32_t i = 0; i < device->send_jfc_poll_lock_count; i++) {
+		pthread_mutex_destroy(&device->send_jfc_poll_locks[i]);
+	}
+	free(device->jfrs);
+	free(device->recv_jfcs);
+	free(device->send_jfcs);
+	free(device->send_jfc_poll_locks);
+	free(device->recv_jfc_poll_locks);
 	if (device->memory_domain != NULL) {
 		spdk_memory_domain_destroy(device->memory_domain);
 	}

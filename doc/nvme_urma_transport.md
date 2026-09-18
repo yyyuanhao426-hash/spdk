@@ -16,7 +16,7 @@
 - 增加 HOST、CUDA、ROCm、NPU 和 XDS memory provider 抽象。HOST 可直接注册；异构内存由外部 provider 负责 pin/unpin 和可选 DMA-BUF 导出，再由公共层完成 URMA segment 注册。
 - SPDK 增加 `build/examples/urma_perf`，可用 CUDA 显存直接连接 SPDK target，并统计正确性、时延、IOPS 与带宽；UMDK 源码不修改。
 
-本快照属于端到端 MVP：仅支持单个连续 SGL、每个 qpair 一个 Jetty、最大 I/O 默认 128 KiB，尚未实现注册缓存、重连、超时恢复、多 SGL、协议 golden test 和完整性能调优。当前 UMDK 的 DMA-BUF 接口仍可能返回不支持，此时会回退到该分支已有的 `is_gpu_seg` peer-memory 注册路径；是否为真正零 HOST staging 必须在目标硬件上验证。
+本快照属于端到端 MVP：仅支持单个连续 SGL，最大 I/O 默认 128 KiB；每个 endpoint 的 Jetty 数可配置，且已经提供本地注册缓存、target import 哈希缓存和 target iobuf 整池注册。重连、超时恢复、多 SGL、协议 golden test 和完整性能调优仍未实现。当前 UMDK 的 DMA-BUF 接口仍可能返回不支持，此时会回退到该分支已有的 `is_gpu_seg` peer-memory 注册路径；是否为真正零 HOST staging 必须在目标硬件上验证。
 
 ### 编译开关
 
@@ -29,7 +29,7 @@ make -j
 
 ### 运行参数
 
-默认值参考 Mooncake 当前 URMA 实现：RM 模式、2 个 JFC、JFC 深度 4096、Jetty 深度 2048、priority 15、max_sge 5、rnr_retry 7、err_timeout 17、token `0xACFE`，active port 默认自动选择。
+默认值参考 Mooncake 当前 URMA 实现：RM 模式、每块本地 NIC 共享 2 个发送 JFC 和 2 个接收 JFC、每个远端 NIC endpoint 1 个 Jetty、JFC 深度 4096、Jetty 深度 2048、max_sge 5、rnr_retry 7、err_timeout 17、token `0xACFE`，active port 默认自动选择。priority 默认根据设备 `priority_info` 自动选择 CTP 对应项。
 
 SPDK 使用以下环境变量；为便于与 Mooncake 联调，四个 Mooncake 同名变量也作为低优先级兼容入口：
 
@@ -41,18 +41,24 @@ SPDK 使用以下环境变量；为便于与 Mooncake 联调，四个 Mooncake �
 | `SPDK_URMA_BONDING_MULTIPATH_ENABLE` | `MC_URMA_BONDING_MULTIPATH_ENABLE` | `false` |
 | `SPDK_URMA_DEV_NAME` | 无 | 第一个匹配设备 |
 | `SPDK_URMA_EID_INDEX` | 无 | `0`，不存在时使用首个 EID |
-| `SPDK_URMA_JFC_COUNT` | 无 | `2` |
+| `SPDK_URMA_SEND_JFC_COUNT` | 无 | `2`；`SPDK_URMA_JFC_COUNT` 为兼容别名 |
+| `SPDK_URMA_RECV_JFC_COUNT` | 无 | `2`；`SPDK_URMA_JFC_COUNT` 为兼容别名 |
 | `SPDK_URMA_JFC_DEPTH` | 无 | `4096` |
-| `SPDK_URMA_JETTY_COUNT` | 无 | `1` |
+| `SPDK_URMA_NUM_JETTY_PER_EP` | 无 | `1`；`SPDK_URMA_JETTY_COUNT` 为兼容别名 |
 | `SPDK_URMA_JETTY_DEPTH` | 无 | `2048` |
 | `SPDK_URMA_MAX_IO_SIZE` | 无 | `131072` |
 | `SPDK_URMA_CAPSULE_TRANSPORT` | 无 | `tcp`；可设为 `sendrecv` |
+| `SPDK_URMA_TP_TYPE` | 无 | `ctp`；可设为 `rtp` |
+| `SPDK_URMA_JETTY_PRIORITY` | 无 | 自动从 `priority_info` 选择；显式值范围 `0..15` 且必须匹配 TP type |
+| `SPDK_URMA_NUMA_AFFINITY_ENABLE` | `MC_UB_NUMA_AFFINITY_ENABLE` | `false` |
 
-NVMf target 的 transport-specific JSON 还可覆盖 `dev_name`、`trans_mode`、`capsule_transport`、`active_port`、`eid_index`、`jfc_count`、`jfc_depth`、`jetty_count`、`jetty_depth`、`bonding_balance` 和 `bonding_multipath`。`capsule_transport` 接受 `tcp` 或 `sendrecv`。initiator 与 target 必须配置成相同模式；握手发现不一致时会拒绝连接。
+NVMf target 的 transport-specific JSON 还可覆盖 `dev_name`、`trans_mode`、`capsule_transport`、`active_port`、`eid_index`、`send_jfc_count`、`recv_jfc_count`、`jfc_depth`、`num_jetty_per_ep`、`jetty_depth`、`priority`、`tp_type`、`bonding_balance`、`bonding_multipath` 和 `numa_affinity`。`capsule_transport` 接受 `tcp` 或 `sendrecv`，`tp_type` 接受 `ctp` 或 `rtp`。initiator 与 target 必须配置成相同 capsule、transport、TP type 和 endpoint Jetty 数；握手发现不一致时会拒绝连接。
+
+同一进程内每块本地 NIC 只创建一个 URMA context。该 context 的 JFC/JFR、内存域和 target iobuf 整池注册由所有 endpoint/qpair 共享；target 的远端 segment import cache 是 context 级分桶哈希表，并以 `URMA_NON_CACHEABLE` 导入。启用 `bonding_multipath` 后 JFS 打开 multi-path 并将设备设置为 BALANCE/IODIE；再启用 `numa_affinity` 时，数据 WR 根据 initiator buffer 的 NUMA 节点携带 chip affinity。NUMA 到 chip 的映射优先读取 sysfs `physical_package_id` 并按 package 排序生成 1-based chip ID，受限环境无法读取时才回退到节点前后半区启发式。
 
 `tcp` 保持原有 capsule 数据路径，也是默认值。`sendrecv` 只把 command/response capsule 切换到 URMA SEND/RECV：建连握手仍走 TCP，I/O payload 仍走 URMA READ/WRITE。SEND 使用 inline WQE；设备的 `max_jfs_inline_len` 不足以容纳 capsule frame 时，qpair 创建会失败。接收端按协商后的队列深度预投递 receive WR，并在消费 completion 后先补回 receive WR 再交付 NVMe completion。
 
-握手描述符新增 capsule 模式字段，因此 wire version 更新为 2；新旧版本会在握手阶段明确拒绝，而不会继续使用不一致的帧布局。
+握手描述符现在携带 Jetty 列表和数据 buffer chip ID，因此 wire version 更新为 3；新旧版本会在握手阶段明确拒绝，而不会继续使用不一致的帧布局。
 
 ### 最小联调示例
 
@@ -214,7 +220,7 @@ trtype:URMA adrfam:IB traddr:<eid> trsvcid:<service> subnqn:<nqn>
 
 ## 6. URMA 连接模型
 
-每个进程为选定 URMA device 和 EID index 创建一个 URMA context。每个 SPDK poll group 创建或关联 JFC。每个 qpair 持有 send/receive object 和连接状态。第一阶段使用 UDMA provider 支持的 reliable connected mode。
+每个进程按本地 URMA NIC 和兼容配置创建一个共享 URMA context；同一 NIC 的 endpoint/qpair 复用该 context 的发送 JFC、接收 JFC、JFR 和 memory domain。每个 endpoint 持有可配置数量的 Jetty，并以 round-robin 方式选择一个发送 JFC；target poll group 按 worker 编号分片轮询 context 的 JFC。传输模式支持配置为 RC、RM 或 UM，双方必须一致。
 
 ### 6.1 连接自举
 

@@ -75,6 +75,7 @@
 	spdk_iobuf_finish;
 	spdk_iobuf_set_opts;
 	spdk_iobuf_get_opts;
+	spdk_iobuf_for_each_pool_memory;
 	spdk_iobuf_channel_init;
 	spdk_iobuf_channel_fini;
 	spdk_iobuf_register_module;

@@ -48,6 +48,59 @@ ut_iobuf_foreach_cb(struct spdk_iobuf_channel *ch, struct spdk_iobuf_entry *entr
 #define SMALL_BUFSIZE 4096
 #define LARGE_BUFSIZE 8192
 
+struct ut_pool_memory_ctx {
+	uint32_t count;
+	size_t total_length;
+};
+
+static int
+ut_pool_memory_cb(void *cb_arg, void *addr, size_t length, int32_t numa_id)
+{
+	struct ut_pool_memory_ctx *ctx = cb_arg;
+
+	CU_ASSERT_PTR_NOT_NULL(addr);
+	CU_ASSERT_NOT_EQUAL(length, 0);
+	CU_ASSERT_EQUAL(numa_id, SPDK_ENV_NUMA_ID_ANY);
+	ctx->count++;
+	ctx->total_length += length;
+	return 0;
+}
+
+static void
+iobuf_pool_memory(void)
+{
+	struct spdk_iobuf_opts opts = {
+		.small_pool_count = 2,
+		.large_pool_count = 2,
+		.small_bufsize = SMALL_BUFSIZE,
+		.large_bufsize = LARGE_BUFSIZE,
+	};
+	struct ut_pool_memory_ctx ctx = {};
+	int rc, finish = 0;
+
+	allocate_cores(1);
+	allocate_threads(1);
+	set_thread(0);
+
+	rc = spdk_iobuf_for_each_pool_memory(ut_pool_memory_cb, &ctx);
+	CU_ASSERT_EQUAL(rc, -EINVAL);
+	g_iobuf.opts = opts;
+	rc = spdk_iobuf_initialize();
+	CU_ASSERT_EQUAL(rc, 0);
+	rc = spdk_iobuf_for_each_pool_memory(ut_pool_memory_cb, &ctx);
+	CU_ASSERT_EQUAL(rc, 0);
+	CU_ASSERT_EQUAL(ctx.count, 2);
+	CU_ASSERT_EQUAL(ctx.total_length,
+			(size_t)opts.small_pool_count * opts.small_bufsize +
+			(size_t)opts.large_pool_count * opts.large_bufsize);
+
+	spdk_iobuf_finish(ut_iobuf_finish_cb, &finish);
+	poll_threads();
+	CU_ASSERT_EQUAL(finish, 1);
+	free_threads();
+	free_cores();
+}
+
 static void
 iobuf(void)
 {
@@ -713,6 +766,7 @@ main(int argc, char **argv)
 	CU_initialize_registry();
 
 	suite = CU_add_suite("io_channel", NULL, NULL);
+	CU_ADD_TEST(suite, iobuf_pool_memory);
 	CU_ADD_TEST(suite, iobuf);
 	CU_ADD_TEST(suite, iobuf_cache);
 	CU_ADD_TEST(suite, iobuf_priority);

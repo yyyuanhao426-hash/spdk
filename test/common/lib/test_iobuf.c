@@ -14,6 +14,8 @@ DEFINE_STUB(spdk_iobuf_unregister_module, int, (const char *name), 0);
 DEFINE_STUB_V(spdk_iobuf_channel_fini, (struct spdk_iobuf_channel *ch));
 DEFINE_STUB(spdk_iobuf_for_each_entry, int, (struct spdk_iobuf_channel *ch,
 		spdk_iobuf_for_each_entry_fn cb_fn, void *cb_ctx), 0);
+DEFINE_STUB(spdk_iobuf_for_each_pool_memory, int,
+	    (spdk_iobuf_pool_memory_cb cb_fn, void *cb_arg), 0);
 DEFINE_STUB_V(spdk_iobuf_entry_abort, (struct spdk_iobuf_channel *ch,
 				       struct spdk_iobuf_entry *entry, uint64_t len));
 
