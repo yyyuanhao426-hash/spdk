@@ -355,6 +355,41 @@ SPDK_URMA_MAX_IO_SIZE=4194304 \
   代码侧已就绪，SPDK 层无法绕过驱动层问题，转内部协调
 - 现场已还原 ✅（改动清单完整）
 
+### 指令 2026-09-20 #13：批次 B（245 侧方案可行性侦察，只读）
+
+**新约束（用户确认）**：133 借来的公用机，**完全不能动**；245 可动但独占期
+结束后必须复原。因此驱动对齐只能在 245 侧做，且必须可回退。
+
+外部方案候选：① 请平台/同事A 配置 UB 管理面（零改动，优先）；
+② 在 245 用 urma_driver 源码构建同源驱动换装（可回退，需内核构建环境）；
+③ 换一台与 133 同内核代际的 Target 机（零改动备选）。
+
+本批 = 为 ②③ 采集可行性数据，**全部只读**：
+
+```bash
+# a. 内核构建环境（决定方案②能否编译）
+ls -l /lib/modules/$(uname -r)/build 2>/dev/null
+rpm -qa | grep -iE "kernel-(devel|headers)" 2>/dev/null
+ls /usr/src/ 2>/dev/null
+
+# b. 现有驱动模块备份可行性（方案②的回退保障）
+for m in ubcore uburma udma ummu ummu_core ubus ubase; do \
+  modinfo $m 2>/dev/null | grep filename; done
+find /lib/modules/$(uname -r) -name "ubcore*" 2>/dev/null
+
+# c. UB 管理面工具与状态（方案①的可行性）
+find /usr /opt -maxdepth 4 -name "*ubmad*" -o -name "*ubtool*" 2>/dev/null | head
+systemctl list-units 2>/dev/null | grep -iE "ub|urma|mad" | head
+ls /dev | grep -iE "ub|mad" | head
+
+# d. 245 的 URMA 设备与 EID 现状（供管理面配置参考）
+cat /sys/class/udmac*/ueid 2>/dev/null | head
+find /sys -name "*eid*" 2>/dev/null | head -10
+```
+
+**回传**：全部输出追加第 9 节，注明「批次 B 完毕」。本批不做任何
+模块装卸/替换/配置变更。
+
 ### 指令 2026-09-20 #12：暂停验证，特环境对齐后恢复
 
 **状态：验证批次暂停。** 阻塞是基础设施问题（URMA 驱动版本不一致 +
