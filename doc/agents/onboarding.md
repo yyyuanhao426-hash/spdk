@@ -41,7 +41,7 @@ NPU HBM ──► [host DRAM 暂存] ──网卡──URMA──► iobuf ─�
 
 | 项 | 值 |
 |---|---|
-| NPU 节点（Initiator） | **133**：8× Ascend **950DT**（84GB HBM/卡，与旧环境 950PR 不同型号）；CANN **9.1.0**（/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64）；内核 davinci/hmm 符号存在；**共享机且有业务在跑**（NPU1 vLLM、NPU2 python）——测试只用空闲卡 0/3/4/5/6/7，用 -g 显式指定 |
+| NPU 节点（Initiator） | **133**（npu-os）：8× Ascend **950DT**（84GB HBM/卡，与旧环境 950PR 不同型号）；CANN **9.1.0**（/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64）；内核 davinci/hmm 符号存在；**共享机且有业务在跑**——选卡规则：**每次跑测试前 npu-smi info 动态确认，只选状态 OK 且 HBM 空闲的卡，用 -g 显式指定**；已知 NPU1 常被 vLLM 占满（禁用）、NPU3/4 曾 Alarm（禁用直至恢复 OK） |
 | Target 节点 | **245**：12× NVMe 7.68T；nvme8=系统盘（禁碰），nvme7/3=raid 成员，其余空闲 |
 | 代码路径 | 133：/home/lx/nds/spdk（HEAD a3413ce）；245：同仓 clone |
 | UMDK（gds 版）路径 | 133：/home/lx/UMDK_netlab；245：/home/l00955908/nds/UMDK_netlab |
