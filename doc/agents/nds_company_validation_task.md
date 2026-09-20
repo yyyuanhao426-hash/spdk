@@ -355,6 +355,44 @@ SPDK_URMA_MAX_IO_SIZE=4194304 \
   代码侧已就绪，SPDK 层无法绕过驱动层问题，转内部协调
 - 现场已还原 ✅（改动清单完整）
 
+### 回执导入 2026-09-20 #8（批次 C-2 结果，用户带回）
+
+- 结论：**换装失败 → 回滚成功**，现场已还原，245 归还给公共池
+- C2-a ✅：停止残留 target（p50065573 的 nvmf_tgt PID 2127783，二次出现）
+- C2-b 方法一 ❌：ubase/ubus/ubfi 被非 URMA 组件（cis/ub_fwctl/unic）占用
+  无法卸载，转方法二
+- C2-c 方法二：替换 19 个 .ko + reboot 生效（中间一次 grub 默认项切到
+  标准内核的意外已修正）；16 个核心模块加载新 srcversion（c12ec44）
+- C2-d ❌ **换装后 udma 设备 probe 全部失败**：/dev/uburma 缺失；dmesg
+  `ubase register ctrlq event failed opcode=40 ret=-2` → udma probe -22；
+  **根因（源码级）**：atomgit c12ec44 基线中 udma_eq.c 注册了
+  UDMA_CMD_CTRLQ_TPID_DESTROY_DONE（服务类型 TP_ACL），但 ubase 的
+  ctrlq 白名单 ubase_ctrlq_wlist_udma 缺该 opcode → 注册返回 -ENOENT →
+  probe 失败。**外部已在本地源码验证确认该不一致存在**（udma_eq.c:991 vs
+  ubase_ctrlq.c:22），修复方案留待下次（下次再说）
+- C2-f 回滚 ✅：备份 .ko 恢复 + depmod + reboot，旧 srcversion 全部恢复，
+  /dev/uburma 6 设备齐全，grub 默认回标准内核（与占用前一致）；
+  残留：udma_nv_p2p_bridge 回滚后 insmod 失败（依赖 nvidia 栈未加载，
+  非核心，已记录）
+- 现场改动清单完整（独占期如实报告）
+
+### 指令 2026-09-20 #16：245 归还核对清单（最后一步）
+
+245 使用结束，归还公共池前做最终核对（只读为主）：
+
+```bash
+ps aux | grep -E "nvmf_tgt|urma_perf|spdk" | grep -v grep   # 无残留进程
+lsblk -o NAME,MOUNTPOINT,TYPE,FSTYPE,SIZE                   # 12 盘齐全且在 nvme 驱动
+grubby --default-kernel                                     # 应为标准内核（占用前默认值）
+grep -i huge /proc/meminfo                                  # 记录当前值
+modinfo ubcore uburma udma | grep srcversion                # 应为旧值（21A93C/6AA3EA/8E42E2）
+ls /dev/uburma/ 2>/dev/null                                 # URMA 设备节点齐全
+```
+- 全部符合 → 在 batchA_receipt.md 末尾追加「245 归还核对通过」段（含上述
+  输出），245 即可交还；home 目录下我方文件（/home/lx、/home/l00955908/nds）
+  **保留不删**（下次环境可能复用），是否清理听从机器管理方
+- 不符合项 → 原样记录回传，不要现场发挥修复
+
 ### 指令 2026-09-20 #15：批次 C-2（245 驱动换装 + 互通验证）
 
 **外部决策（对 C-1 三个风险点）**：① GPU P2P 启用保留（245 旧 bridge 本就
