@@ -355,6 +355,62 @@ SPDK_URMA_MAX_IO_SIZE=4194304 \
   代码侧已就绪，SPDK 层无法绕过驱动层问题，转内部协调
 - 现场已还原 ✅（改动清单完整）
 
+### 指令 2026-09-20 #14：批次 C-1（245 同源驱动：构建 + 备份，不换装）
+
+**用户已选方案②**：在 245 用 urma_driver 源码构建与 133 同源的 URMA 驱动
+（源码仓 openEuler SP4 同步 + GPU 补丁，133 的驱动即同一基线编译），换装后
+两机驱动同源 → 解决互通问题。**本批只做构建与备份，不卸载/替换任何
+运行中的模块**；换装（C-2）待外部确认后另批执行。
+
+**Gate 0（先做，任一不满足则中止回传）：**
+```bash
+ls -l /lib/modules/$(uname -r)/build     # 内核构建目录必须存在
+which gcc make && rpm -q kernel-devel 2>/dev/null
+```
+
+**C1-a. 获取 urma_driver 源码：**
+```bash
+# 优先：直接 clone（AtomGit，默认分支 sp4_driver）
+git clone https://atomgit.com/TongX123/urma_driver_netlab.git /home/lx/urma_driver
+cd /home/lx/urma_driver && git log --oneline -1   # 记录 HEAD
+# （无法访问 AtomGit 时：外部本地有副本，用户可 scp 过来）
+```
+
+**C1-b. 构建（245 无 NVIDIA，GPU P2P 会自动禁用，Target 不需要它）：**
+```bash
+cd /home/lx/urma_driver
+make 2>&1 | tail -40
+# 记录产出：find . -name "*.ko" | sort
+```
+
+**C1-c. 模块集对比（关键）：**
+```bash
+# 当前运行中的 URMA 相关模块及其磁盘位置
+lsmod | grep -iE "ub|urma|ummu|udma|cdma|obmm|sentry|ubfi|ubagg|ipourma|hisi" \
+  | awk '{print $1}' | while read m; do \
+    echo "$m => $(modinfo $m 2>/dev/null | grep '^filename')"; done
+# 构建产出的模块列表
+find /home/lx/urma_driver -name "*.ko" | sort
+```
+- 逐个比对：运行中的模块是否都能在构建产出中找到对应 .ko？
+- **若有运行中模块不在构建产出里（混合版本风险）→ 停止，原样回传等待决策**
+
+**C1-d. 备份（回退保障）：**
+```bash
+mkdir -p /home/lx/driver_backup
+lsmod > /home/lx/driver_backup/lsmod_before.txt
+# 把当前加载的每个 URMA 模块的磁盘文件原样拷贝到备份目录（保留目录结构）
+# 并记录 modinfo filename 与卸载顺序建议（按 lsmod 依赖反向）
+```
+
+**C1-e. 换装演练清单（只写在报告里，不执行）：**
+按依赖反向的 rmmod 顺序、正向的 insmod 顺序、depmod -A 命令、
+验证命令（lsmod/dmesg/urma 设备列表）、回退步骤（rmmod 新 + 恢复备份 .ko +
+depmod + 重新加载）。
+
+**回传**：全部输出 + 模块对比表 + 换装演练清单，注明「批次 C-1 完毕」。
+外部确认后才下发 C-2（换装）指令。
+
 ### 指令 2026-09-20 #13：批次 B（245 侧方案可行性侦察，只读）
 
 **新约束（用户确认）**：133 借来的公用机，**完全不能动**；245 可动但独占期
