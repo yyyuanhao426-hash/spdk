@@ -355,6 +355,71 @@ SPDK_URMA_MAX_IO_SIZE=4194304 \
   代码侧已就绪，SPDK 层无法绕过驱动层问题，转内部协调
 - 现场已还原 ✅（改动清单完整）
 
+### 指令 2026-09-20 #15：批次 C-2（245 驱动换装 + 互通验证）
+
+**外部决策（对 C-1 三个风险点）**：① GPU P2P 启用保留（245 旧 bridge 本就
+启用，wire 兼容不要求 srcversion 一致，且为 Phase 2 保留基础）；
+② ummu/ummu_core 内核自带无法对齐，接受残留风险（历史失败点在
+ubcore/ubus 层，本次换装已覆盖）；③ ubase/ubus 连带依赖风险用双方法+
+回滚应对。前提：独占窗口内、C1-d 备份完好、所有用户态 SPDK/URMA 应用已停。
+
+**C2-a. 停用户态**：确认 245 无 urma_perf/nvmf_tgt/其他 URMA 应用（有则停）。
+
+**C2-b. 方法一（在线换装，优先）**：
+```bash
+# 按批次 C1-e 的反向顺序卸载（建议用 modprobe -r 让内核自动解析依赖，
+# 从叶子 udma_nv_p2p_bridge 开始）。任一模块报 Module is in use：
+#   记录占用者 → 若可停则停后重试 → 不可停（如 mami/fabric 类服务）→ 转方法二
+modprobe -r udma_nv_p2p_bridge    # 从叶子开始，逐个按 C1-e 反向顺序
+# ... 全部卸载后，替换文件：
+# 把新构建 .ko 拷到各模块原 filename 位置（备份已在 /home/lx/driver_backup）
+# 注意保持原文件名/路径/压缩格式不变
+depmod -A
+# 正向加载（按 C1-e 顺序）：ubase → ubcore → ubfi → ubus → hisi_ubus →
+# cdma/obmm → udma → uburma/ubagg/ipourma → sentry 系列 → udma_nv_p2p_bridge
+modprobe ubase    # 逐个按顺序，或 insmod <路径>
+```
+
+**C2-c. 方法二（方法一失败时的回退式换装）**：
+```bash
+# 直接替换 .ko 文件（同 C2-b 的替换步骤）→ reboot
+# 重启后检查：lsmod 是否自动加载（先查 /etc/modules-load.d/ 与
+# /etc/modprobe.d/ 判断是否开机自动加载）；未加载则手动按顺序加载
+```
+
+**C2-d. 换装后验证（245 本机）**：
+```bash
+lsmod | grep -iE "ub|urma|udma"        # 全部新模块加载
+dmesg | tail -50                        # 无驱动报错
+ls /dev | grep -i uburma                # 设备节点存在
+modinfo ubcore | grep srcversion        # 应为 53C2130...（c12ec44）
+# 起 target 验证（依次尝试两种 liburma）：
+LD_LIBRARY_PATH=/usr/lib64 \
+  ./target_nvme_takeover.sh -d nvme0n1 -L /usr/lib64 -i 141.61.84.245 -y
+# 若 urma_init 失败，换 gds liburma 再试：
+LD_LIBRARY_PATH=/home/lx/UMDK_netlab/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+  ./target_nvme_takeover.sh -d nvme0n1 -L /home/lx/UMDK_netlab/lib -i 141.61.84.245 -y
+```
+
+**C2-e. 互通验证（133，target 已在 245）**：
+```bash
+# 133 跑 cpu 回归（标准 liburma）——判定驱动同源后互通是否成立：
+LD_LIBRARY_PATH=/home/lx/nds/spdk/build/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+SPDK_URMA_MAX_IO_SIZE=4194304 \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.245 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M cpu -t 5
+# 通过 → 同命令换 -M npu-staged 跑全链路首测（NPU 卡选 OK 且空闲者，-g 显式）
+```
+
+**判定与分支**：
+- 互通通过 → **保持新驱动**（不回滚），继续批次 A'' 剩余项；这是里程碑
+- 互通仍失败 → 回滚（rmmod 新 → 恢复 /home/lx/driver_backup 备份 .ko →
+  depmod -A → 重载原模块），记录后转方案①（管理面）/③（换机器）
+
+**C2-f. 回传**：全部输出（含方法一/二的执行轨迹、互换后 srcversion、
+互通结果）追加第 9 节，注明「批次 C-2 完毕」。
+
 ### 指令 2026-09-20 #14：批次 C-1（245 同源驱动：构建 + 备份，不换装）
 
 **用户已选方案②**：在 245 用 urma_driver 源码构建与 133 同源的 URMA 驱动
