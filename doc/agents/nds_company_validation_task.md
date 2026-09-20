@@ -340,6 +340,64 @@ SPDK_URMA_MAX_IO_SIZE=4194304 \
 
 **回传**：全部输出追加第 9 节，注明「批次 5 完毕」。
 
+### 回执导入 2026-09-20 #6（批次 A' 结果，用户带回）
+
+- 10a ✅：133 编译完成（urma_perf + nvmf_tgt）。解决 6 个依赖问题（numa/
+  cunit/uuid/aio/ISAL_DIR/isa-l-crypto 头文件名），全部按「245 系统文件 →
+  拷到自家目录隔离使用」模式（/home/lx/nds/{numa,cunit,uuid,aio}_install）；
+  configure 实际参数为 --with-isal/--with-isal-crypto（非 --with-isal-install）
+- 10b ✅：-h 含 -M npu/npu-staged、-g 支持；CANN 9.1.0
+- 10c ❌ **阻塞：245 被他人占用**——p50065573 的 nvmf_tgt（PID 627047，
+  /home/p50065573/nof/spdk-urma-v6）在跑且已 vfio 接管 nvme1n1；takeover
+  脚本检测到 SPDK 应用即 abort；按隔离守则不能 kill。external 决策：
+  **协调独占时间窗（约 15~20 分钟），不做双 target 共存绕行**（URMA 设备
+  多进程共存未验证 + 绕过安全检查有风险）
+- 10d ✅：内核/驱动对比表已采集——133 内核 6.6.0-155.0.0.143.oe2403sp4
+  （发行版标准，比旧 197 的 -159 还不同）、245 = netlab_pcie_ub_compat+；
+  URMA srcversion 两台全部不同——**LOC_ACCESS_ERR 风险在新环境依然成立**，
+  cpu 回归重点观察
+- 卡健康：NPU3/4/5 Alarm（pmbus 供电监控类，非计算核报错）、NPU6/7
+  Warning；仅 NPU2 完全可用（-g 2）；NPU0 OK 但有 4.3G 占用残留
+- 现场已还原；245 的 p50065573 target 未触碰
+
+### 指令 2026-09-20 #11：批次 A''（等待 245 窗口 + 快速执行预案）
+
+状态：245 被 p50065573 的 nvmf_tgt 占用，用户正在内部协调**独占窗口**。
+本批 = 窗口预案。窗口未到时不做任何 245 操作。
+
+**窗口开启的判定**（每次尝试前先确认）：
+```bash
+ps aux | grep nvmf_tgt        # 无他人进程（或对方明确已让出）
+lsblk -o NAME,MOUNTPOINT,TYPE,FSTYPE,SIZE   # nvme1n1 已还原、目标空闲盘仍在
+```
+
+**窗口内快速执行预案（全程约 15~20 分钟，按序）：**
+
+```bash
+# 1. 起 target（245；空闲盘首选 nvme0n1，被占则依次换 nvme2n1/4n1/5n1/9n1/10n1/11n1）
+cd /home/l00955908/nds/spdk
+./target_nvme_takeover.sh -d nvme0n1 -L /home/l00955908/nds/UMDK_netlab/lib -i 141.61.84.245 -y
+
+# 2. 133：cpu 回归（重点观察 LOC_ACCESS_ERR 是否复现）
+LD_LIBRARY_PATH=/home/lx/nds/spdk/build/lib:/home/lx/UMDK_netlab/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+SPDK_URMA_MAX_IO_SIZE=4194304 \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.245 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M cpu -t 5 -g 2
+
+# 3. 133：NDS 全链路首测（npu-staged；观察 507033/LOC_ACCESS_ERR 是否复现）
+#    同上命令换 -M npu-staged
+
+# 4. （可选，时间富余）133：-M npu 收集 peermem 路线报错
+
+# 5. 还原现场：245 还原 nvme0n1 + hugepages 恢复；197/133 hugepages 恢复
+```
+
+**异常处理**：窗口内任一步失败——记录报错、跳过继续能做的步骤、
+窗口结束前恢复现场；全部原样回传。
+
+**回传**：追加第 9 节，注明「批次 A'' 完毕」或「窗口尝试失败详情」。
+
 ### 回执导入 2026-09-17（新环境阶段 0~3 + 阶段 4 进行中）
 
 **新环境（第二次换机）**：133 = NPU 机（8× Ascend **950DT** 84GB/卡，
