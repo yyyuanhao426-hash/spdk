@@ -292,7 +292,61 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-21 #19：批次 L-1（133 本机回环可行性探测，只读）
+
+**拓扑再变更**：197 确认不可用（退出），245↔151 方案放弃。当前主力方案 =
+**133 单机回环**：133 上同时跑 initiator 与 target——nvmf_tgt 接管本地空闲
+NVMe 盘，urma_perf 用本机另一个 udmac 设备，URMA 流量走服务器内部 UB 交换。
+本批探测该方案的四个前提，**全部只读**，遵守共享机守则。
+
+**Gate 0**：按既有方式登录 133（IP/账号以用户带回为准；若登录不上，
+只回报「133 现状」三行：能否 ping/能否登录/谁在用，不要做别的）。
+
+**A. 基本信息**：
+```bash
+hostname; uname -r
+npu-smi info | head -20
+```
+
+**B. 【前提 2】NVMe 盘情况**：
+```bash
+nvme list
+lsblk -o NAME,MOUNTPOINT,TYPE,FSTYPE,SIZE | head -30
+# 记录哪些盘无挂载点（空闲），并标注系统盘
+```
+
+**C. 【前提 3】udmac 设备与占用**：
+```bash
+find /sys -name '*udmac*' | head -20
+ls /dev | grep -iE "udma|ub"
+lsmod | grep -E "udma|urma|ubcore|ubase"
+ls /dev/uburma 2>/dev/null
+fuser -v /dev/uburma/* 2>&1 | head -20      # 只读检查谁在占用
+```
+
+**D. 【前提 4 数据】EID / UB 管理面**：
+```bash
+cat /sys/class/udmac*/ueid 2>/dev/null | head
+find /sys -name '*eid*' 2>/dev/null | head -10
+find /usr /opt -maxdepth 4 \( -name "*ubmad*" -o -name "*ubtool*" \) 2>/dev/null | head
+systemctl list-units 2>/dev/null | grep -iE "ub|mad" | head
+```
+
+**E. 我方环境残留**（不影响判定，L-2 前重新部署即可）：
+```bash
+ls -ld /home/lx/nds/spdk /home/lx/UMDK_netlab /home/lx/isal_install 2>/dev/null
+cd /home/lx/nds/spdk && git log --oneline -1 && git status -s | head -5
+```
+
+**判定与回传**：
+- A~C 齐备（空闲 NVMe ≥1 且可用 udmac ≥2）→ 回传「L-1 通过，可下发
+  L-2（回环连通实测）」
+- udmac 全被业务占用或无空闲盘 → 原样记录回传，外部另定方案
+- 全部输出整理成文本交用户带回（不 commit/push），注明「批次 L-1 完毕」
+
 ### 指令 2026-09-21 #18：批次 R-0 续行（补料已到位，重试 A~E）
+
+> **注（2026-09-21）：本指令已作废**——197 确认不再可用，勿执行，保留备查。
 
 R-0 两个卡点的处理：
 - **卡点 1 已解决**：外部文档已 push 到 origin/nds_v1。请重新
