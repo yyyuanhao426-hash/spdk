@@ -268,72 +268,48 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 10. 外部 AI 指令区
 
-### 指令 2026-09-21 #17：回归 197+151，批次 R-1（代码更新 + 双基线实验 + 全链路首测）
+### 指令 2026-09-21 #17：批次 R-0（197 可用性侦察，只读）
 
-**拓扑变更（重要）**：用户确认 **133 与 245 之间没有 UB 总线连接**——133↔245
-建连失败的真正根因，驱动换装方案作废，245 退出本拓扑。回归 197（Initiator，
-950PR）+ 151（Target）：该拓扑 URMA 链路已验证可通（HELLO 通过、进入数据
-路径），遗留问题 LOC_ACCESS_ERR 与 507033 用本批实验定位。遵守 0.5 节隔离
-守则（197 多人共用）。
+**背景（重要，已确认的根因）**：用户确认 **133 与 245 之间没有 UB 总线
+连接**——133↔245 URMA 建连失败的真正根因，驱动换装方案作废，245 退出。
+计划回归 197（Initiator，950PR）+ 151（Target）拓扑（该链路 URMA 已验证
+可通）。**本批只做 197 可用性侦察，全部只读**；确认可用后外部再下发
+回归执行批（R-1）。
 
-**Gate 0（任一不满足则中止回传）**：用户已确认借到 197；197/151 上
-`ps aux | grep -E "nvmf_tgt|urma_perf|spdk" | grep -v grep` 无冲突进程。
-
-**R1-a. 197 代码更新（必须含 dlsym 改造）**：
+**A. 197 连通性（用既有登录方式）**：
 ```bash
-cd /home/lx/spdk && git pull origin nds_v1
-git log --oneline -1        # HEAD 必须为 e688fdf 或更新
-nice -n 10 make -j16 2>&1 | tail -10
+ping -c 3 141.61.84.197
+# 能登录则继续；登录方式照旧（ssh/sshpass）
 ```
 
-**R1-b. 151 target 启动**（树若还在则直接用；不在则按指令 #7 的 7a 重部署）：
+**B. 197 是否被占用**：
 ```bash
-cd /home/l00955908/nds/spdk && git pull origin nds_v1
-./target_nvme_takeover.sh                    # 先只分析，确认空闲盘（历史为 nvme4n1）
-./target_nvme_takeover.sh -d nvme4n1 -L /usr/lib64 -i 141.61.84.151 -y
-# target 侧用系统标准 liburma 即可（不需 gds 扩展）
+who
+ps aux | grep -E "nvmf_tgt|urma_perf|vllm" | grep -v grep | head
 ```
 
-**R1-c. E2 urma_perftest 基线（绕开 SPDK，判定 197 内核 URMA 路径）**：
+**C. 我方环境残留**：
 ```bash
-find /home/lx/nds/UMDK_netlab /home/l00955908/nds -name "urma_perftest" -type f 2>/dev/null
-# 没有则到 UMDK 树 src/urma/tools/urma_perftest 构建
-# 151 起 server、197 起 client，纯 host 内存最简模式（参数按 -h，不带 GPU 参数）
-```
-- perftest 通过 → 197 内核 URMA 路径正常，LOC_ACCESS_ERR 出在 SPDK 的
-  注册方式（perftest 用 token_id_valid+token_policy+ATOMIC，SPDK 用
-  TOKEN_NONE+无 ATOMIC——外部将对照修正）
-- perftest 也报 access error → 197 内核驱动问题实锤，原样记录
-
-**R1-d. E1 liburma 隔离对照（197，需 target 已起）**：
-```bash
-# E1-a 标准 liburma（LD_LIBRARY_PATH 只含 CANN，不含 UMDK）
-LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.T500/aarch64-linux/lib64 \
-SPDK_URMA_MAX_IO_SIZE=4194304 \
-./build/examples/urma_perf \
-  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
-  -M npu-staged -t 5
-# E1-b gds liburma（对照组，原 LD_LIBRARY_PATH 配置重跑）
-```
-判定：A（E1-a 507033 消失且预检通过）= **NDS 全链路首测通过 🎯** 且锁定
-根因为 gds liburma 触发 HDC remote-jetty；B（E1-a 仍 507033）→ 排除
-liburma，下一步查 DPDK/EAL 与 HDC 交互；C（连接失败）→ 记录标准库差异报错
-
-**R1-e. cpu 回归 + 全链路（197）**：
-```bash
-# 先 -M cpu（重点观察 LOC_ACCESS_ERR 是否复现），
-# 通过后同命令换 -M npu-staged；时间富余再 -M npu 收集 peermem 路线报错（Phase 2 输入）
-LD_LIBRARY_PATH=/home/lx/nds/UMDK_netlab/lib:/usr/local/Ascend/cann-9.0.T500/aarch64-linux/lib64 \
-SPDK_URMA_MAX_IO_SIZE=4194304 \
-./build/examples/urma_perf \
-  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.84.151 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
-  -M cpu -t 5
+ls -ld /home/lx/spdk /home/lx/nds/UMDK_netlab 2>/dev/null
+cd /home/lx/spdk && git log --oneline -1 && git status -s | head -5
 ```
 
-**R1-f. 恢复现场**：151 还原盘 + hugepages；197 hugepages 恢复（跑前记录），
-清理自家临时文件。
+**D. 197 基本状态**：
+```bash
+npu-smi info | head -20
+uname -r
+grep -i huge /proc/meminfo
+```
 
-**回传**：全部输出追加第 9 节，注明「批次 R-1 完毕」。
+**E. 151 顺带确认（用户已表示可随时借用）**：
+```bash
+ping -c 3 141.61.84.151
+# 能登录则：ls -ld /home/l00955908/nds/spdk && nvme list | head
+```
+
+**判定与回传**：197 空闲 + 代码树在 → 回传「R-0 通过，可下发 R-1」；
+被占用或代码树丢失 → 原样记录回传（都有办法处理，不要现场发挥）。
+全部输出追加第 9 节，注明「批次 R-0 完毕」。
 
 ### 指令 2026-09-15 #9：批次 5（两个隔离实验）
 
