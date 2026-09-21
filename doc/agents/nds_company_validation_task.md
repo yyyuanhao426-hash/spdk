@@ -245,6 +245,24 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-21 #L5（批次 L-5 回执，用户带回）
+
+**核心结论：① 133 上不存在 URMA/UB 用户态管理 agent——ubmad 实为内核
+工作队列线程（已在运行），5 个 ub-pkg-* 服务全是 oneshot modprobe 脚本
+（无一合格，未启动，正确拦截）；② TLV 156 定位成功 = CONGESTION_CTRL_ALG
+（gds urma_cmd_tlv.h 枚举 128 起，156=拥塞控制算法能力；内核期望
+field_size=4，gds 用户态送 2）。**
+
+- 补充证据：which ubmad = 无；无 mad/mue/manager 用户态二进制；设备持有者
+  仅 npu-smi/npu-exporter（采集，非管理）；有 CLI 工具 /usr/bin/ubctl
+  （check/dump/rollback/update）、ub-pkg-cli；包 umdk-urma-{lib,bin,tools}
+  26.06.0-B003、ubctl 1.0.6、ubutils 1.0.2
+- 外部修正认知：jetty 导入失败**不是**"agent 未运行"，本环境的管理面就是
+  内核自含（kworker）形态 → 失败原因需重新定位（下一批源码级）
+- gds 备份线修改点已明确：gds 侧 congestion_ctrl_alg 字段宽度 2 → 4（对齐
+  内核 include/ub/urma/ubcore_types.h 的 ubcore_device_attr），外部出 patch
+- 现场：全程只读无写操作，无残留
+
 ### 回执导入 2026-09-21 #L4（批次 L-4 回执，用户带回）
 
 **判定链：L4-b 不通（回环仍失败），但 4096 已消除，根因下移一层；且出现
@@ -379,6 +397,55 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-21 #24：批次 L-6（jetty 导入失败源码级定位 + ubctl 体检，全只读）
+
+**背景**：L-5 证伪"管理面 agent 未运行"假设——本环境管理面为内核自含
+（kworker-ubmad），无用户态 agent。系统版 liburma 的
+`Failed to import jetty: 0` 需重新归因。本批沿用 L-3/L-4 验证有效的打法：
+**源码级定位 + 运行时取证**，全部只读。
+
+**A. b2 稳定复现 + 运行时取证（运行 urma_perftest，无持久写入）**：
+```bash
+# 系统版并发（同 L-4 b2：server=udma7 + client=udma3，LD_LIBRARY_PATH=/usr/lib64）
+# 跑前 dmesg | tail -30 存底；跑后 dmesg | tail -60 原样带回
+#   （重点：ubcore/ubagg/udma/uburma 的 import/jetty/udata/eid 相关报错）
+# 若可行加 strace -f -e trace=ioctl 跑 client，取失败 ioctl 序列最后 30 行
+# 连测 2 次确认稳定复现（换设备组合 udma2+udma3 再测一次，排除个例）
+```
+
+**B.【核心交付】源码级定位 import jetty 失败分支**：
+```bash
+# B1. 错误消息来源：
+grep -rn "Failed to import jetty" /home/lx/UMDK_netlab/src --include=*.c | head
+# B2. 顺藤摸瓜：该打印所在的调用链（urma_import_jetty 或类似 API），
+#     在 liburma 里找到该 API 的实现与其失败分支，把关键分支前后各 20 行
+#     源码原样摘录（标 文件:行号），特别是返回失败前的错误码来源
+# B3. 管理面交互点：grep -rn "ubmad\|exchange.*udata\|udata" \
+#     /home/lx/UMDK_netlab/src/urma/lib --include=*.c | head -30
+#     （判断 udata 交换走内核 ctrlq 还是用户态——决定下一步在哪修）
+```
+
+**C. ubctl 体检（只读子命令）**：
+```bash
+ubctl check 2>&1 | head -40
+ubctl dump 2>&1 | head -60        # EID/设备/管理状态
+ubctl --help 2>&1 | head -20      # 了解还有哪些子命令（只看不执行写类子命令）
+```
+
+**D. gds 备份线补料（为外部出 patch）**：
+```bash
+# D1. gds 侧 TLV attr 条目（含 CONGESTION_CTRL_ALG 的 field_size 定义）：
+grep -n -B2 -A2 "CONGESTION_CTRL_ALG" /home/lx/UMDK_netlab/src/urma/lib/urma/core/urma_cmd_tlv.h
+grep -rn "congestion_ctrl_alg" /home/lx/UMDK_netlab/src --include=*.h | head
+# D2. 内核侧对照：
+grep -n -B2 -A2 "congestion_ctrl_alg" /lib/modules/$(uname -r)/build/include/ub/urma/ubcore_types.h 2>/dev/null
+grep -rn "congestion_ctrl_alg" /lib/modules/$(uname -r)/build/include/ub/ 2>/dev/null | head
+```
+
+**判定与回传**：全部输出整理成文本交用户带回，注明「批次 L-6 完毕」。
+外部将根据 B 项判定：jetty 导入失败是"可修的参数/配置"（下发修复批），
+还是"本环境管理面能力缺失"（单机方案盖棺，gds patch + store 节点两条线走）。
 
 ### 指令 2026-09-21 #23：批次 L-5（管理面 agent 定位与有条件启动 + 系统版全链首测）
 
