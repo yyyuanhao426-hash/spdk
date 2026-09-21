@@ -36,17 +36,17 @@ NPU HBM ──► [host DRAM 暂存] ──网卡──URMA──► iobuf ─�
 
 ## 4. 当前环境速览（⚠️ 易变节：换环境时由外部 AI 更新本节）
 
-> **最近一次更新**：2026-09-17，第二次换环境（197/151 → 133/245；
-> 原 950PR 机器被占用）。
+> **最近一次更新**：2026-09-21，第三次换环境——确认 **133 与 245 之间没有
+> UB 总线连接**（133↔245 URMA 通信本就不可能通，驱动换装方案作废，245 退出），
+> 回归 **197+151** 拓扑（该链路 URMA 已验证可通）。执行以任务书指令 #17 为准。
 
 | 项 | 值 |
 |---|---|
-| NPU 节点（Initiator） | **133**（npu-os）：8× Ascend **950DT**（84GB HBM/卡，与旧环境 950PR 不同型号）；CANN **9.1.0**（/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64）；内核 davinci/hmm 符号存在；**共享机且有业务在跑**——选卡规则：**每次跑测试前 npu-smi info 动态确认，只选状态 OK 且 HBM 空闲的卡，用 -g 显式指定**；已知 NPU1 常被 vLLM 占满（禁用）、NPU3/4 曾 Alarm（禁用直至恢复 OK） |
-| Target 节点 | **245**：12× NVMe 7.68T；nvme8=系统盘（禁碰），nvme7/3=raid 成员，其余空闲 |
-| 代码路径 | 133：/home/lx/nds/spdk（HEAD a3413ce）；245：同仓 clone |
-| UMDK（gds 版）路径 | 133：/home/lx/UMDK_netlab；245：/home/l00955908/nds/UMDK_netlab |
-| 两台互通 | ✅ ping 正常 |
-| 编译注意 | isa-l/isa-l-crypto 用 245 预编译外部安装（/home/lx/isal_install），configure 需加 **--with-shared**；运行时 LD_LIBRARY_PATH 需加 <spdk>/build/lib |
+| NPU 节点（Initiator） | **197**：4× Ascend **950PR**（128GB HBM/卡）；CANN 多版本并存（8.5.0/9.0.1/9.1.0/9.0.T500），实际加载版本以 urma_perf 启动打印 "CANN runtime loaded" 为准；**共享机**——遵守隔离守则，hugepages 跑前记录跑后恢复 |
+| Target 节点 | **151**（node4）：Tesla V100，12× NVMe，gdr 定制内核 6.6.0-gdr_w00921547+；空闲盘历史为 nvme4n1/nvme7n1（以 takeover 脚本现场分析为准），系统盘 nvme9n1 禁碰 |
+| 代码路径 | 197：/home/lx/spdk（HEAD ≥ e688fdf）；151：/home/l00955908/nds/spdk |
+| UMDK（gds 版）路径 | 197：/home/lx/nds/UMDK_netlab |
+| 两台互通 | ✅ URMA 链路已验证（HELLO 通过）；遗留 LOC_ACCESS_ERR 见指令 #17 R1-c/R1-d |
 
 ## 5. 运行 urma_perf 的固定姿势（gds liburma 隔离加载）
 
