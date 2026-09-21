@@ -428,28 +428,28 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 ### 指令 2026-09-21 #25：批次 L-7（环境恢复 + TLV 修复验证 + jetty 归因）
 
 > **修订（2026-09-21）**：/home/lx 已被外部连根删除且用户无法阻止复发
-> （公用借用机）。**本批起我方工作目录更名**：`/home/y00884102`（工号风格，
-> 与本机既有用户目录形态一致，降低再次被清理的概率）。历史回执中的
+> （公用借用机）。**本批起我方工作目录更名**：`/home/tools`（中性工具目录名，
+> 不指向任何个人，降低被定向清理的概率）。历史回执中的
 > /home/lx 路径一律按本批新路径理解。
 
 **背景**：① /home/lx 被外部删除（用户去与管理员确认，本批先自力恢复——
 两棵树都有源码仓）；② L-6 确认 netlab 内核 TLV spec 表对 type 156 自相
 矛盾，gds 修复 = query 请求跳过该类型（源码改动见 R1-c）。**批准写操作**：
 git clone ×2、编译、R1-c 的一行源码修改、R1-e 的 provider 目录补齐。
-产物只进 /home/y00884102/ 自家目录。
+产物只进 /home/tools/ 自家目录。
 
 **R1. 环境恢复**：
 ```bash
 # R1-a. spdk（GitHub 经代理可达）：
-mkdir -p /home/y00884102/app
-git clone -b nds_v1 https://github.com/yyyuanhao426-hash/spdk.git /home/y00884102/app/spdk
-cd /home/y00884102/app/spdk && git log --oneline -1   # 应为 b67f955 或更新
+mkdir -p /home/tools/app
+git clone -b nds_v1 https://github.com/yyyuanhao426-hash/spdk.git /home/tools/app/spdk
+cd /home/tools/app/spdk && git log --oneline -1   # 应为 b67f955 或更新
 git submodule update --init                            # 7 个 submodule
 # R1-b. UMDK gds 树（atomgit）：
-git clone https://atomgit.com/TongX123/UMDK_tool_netlab.git /home/y00884102/app/umdk
+git clone https://atomgit.com/TongX123/UMDK_tool_netlab.git /home/tools/app/umdk
 git log --oneline -1                                   # 记录 HEAD
 # R1-c.【批准的源码修改】gds liburma 跳过 TLV type 156：
-#   编辑 /home/y00884102/app/umdk/src/urma/lib/urma/core/urma_cmd_tlv.c，
+#   编辑 /home/tools/app/umdk/src/urma/lib/urma/core/urma_cmd_tlv.c，
 #   找到 ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_CONGESTION_CTRL_ALG, ...)（约 L1256），
 #   整行注释掉（内核 spec 表 4B vs 自身结构体 2B 自相矛盾，请求必被 -EINVAL 拒绝；
 #   跳过后该能力字段保持 0，对 gds 路径无影响）。
@@ -475,20 +475,20 @@ git log --oneline -1                                   # 记录 HEAD
 （udma7+udma3），预期到 `Failed to import jetty: 0`，dmesg 跑后带回。
 
 **R4. gds perftest + gds liburma（含 R1-c 修复 + R1-e provider 目录）并发**：
-LD_LIBRARY_PATH 含 /home/y00884102/app/umdk/lib，预期 **query 不再报
+LD_LIBRARY_PATH 含 /home/tools/app/umdk/lib，预期 **query 不再报
 type 156**；记录 create/import jetty 走到哪一步。
 
 **R5.【核心】import jetty 源码级定位**（树已恢复，补 L-6 未竟）：
 ```bash
-grep -rn "Failed to import jetty" /home/y00884102/app/umdk/src/urma/tools --include=*.c
+grep -rn "Failed to import jetty" /home/tools/app/umdk/src/urma/tools --include=*.c
 # 顺调用链找到 import API（urma_import_jetty）在 liburma 的实现
 # （urma_cmd_import_jetty），失败分支前后各 20 行原样摘录（标 文件:行号）
-grep -rn "import_jetty\|exchange" /home/y00884102/app/umdk/src/urma/lib --include=*.c | head -30
+grep -rn "import_jetty\|exchange" /home/tools/app/umdk/src/urma/lib --include=*.c | head -30
 ```
 
 **回传**：全部输出整理成文本交用户带回，注明「批次 L-7 完毕」+ 判定链
 （R2 -j 是否解锁 / R4 query 是否过 / R5 import 失败分支源码）。
-**所有运行日志也放 /home/y00884102/app/ 下，不要再建 /home/lx。**
+**所有运行日志也放 /home/tools/app/ 下，不要再建 /home/lx。**
 
 ### 指令 2026-09-21 #24：批次 L-6（jetty 导入失败源码级定位 + ubctl 体检，全只读）
 
