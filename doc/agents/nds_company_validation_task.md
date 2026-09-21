@@ -245,6 +245,30 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-21 #L8（批次 L-8 回执，用户带回）
+
+**判定链：TLV 4B 修订有效（type 156 彻底消失 ✅）→ query 前进到 type 159
+（MAX_EID_CNT，内核 spec 8B vs gds 4B）❌ → 未达 create/import。同设备对照
+（udma7+udma7）同卡 type 159，跨设备因素排除。**
+
+- A：修订 patch 应用+重编成功（atomgit 无 797593d，手工编辑；备份
+  urma_cmd_tlv.c.bak_l8）。UMDK 编译要点：`cmake -S 必须指向 /src`
+- B：dmesg `Invalid attr, spec/attr, field_size: 8/4, type: 159`；
+  157/158 已通过
+- C2 管理面取证（历史关键证据，供平台请求用）：
+  `ctrlq send msg failed, ret=-2` → `get tpid list failed, ret=-2` →
+  `ubcore_get_tp_list: Failed to get tp list, ret=-2` →
+  `ubcore_import_jetty_compat: Failed to get tp list, ret=-2`
+- C3 重大发现：**urma_admin show 正常工作**——ubep 设备齐全、EID 全部
+  ACTIVE（udma2..11 各多个 eid）⇒ 管理面能看见设备，缺的是 TP 建立相关
+  的配置/动作。urma_admin 是我们尚未探索的管理 CLI（下批探索）
+- D：spdk 依赖未安装（用户未带回授权），构建仍阻塞
+- **外部判读**：133 运行内核 ≠ 本地 urma_driver c12ec44 源码（本地
+  congestion_ctrl_alg=2B/max_eid_cnt=4B，运行内核 spec=4B/8B——运行内核
+  用了更新版驱动源，多字段加宽）。已出 159 修复（umdk 711d4dd，8B 中转）；
+  **为避免逐 type 试错，L-9 要求 dump 运行内核 BTF 拿全部字段精确宽度，
+  一次出齐批量 patch**
+
 ### 回执导入 2026-09-21 #L7（批次 L-7 回执，用户带回）
 
 **判定链：① -j 不解锁（create jetty 仍败）；② R1-c 跳过 type 156 被证伪
@@ -455,6 +479,58 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-21 #27：批次 L-9（159 修复 + 运行内核 BTF 取证 + urma_admin 探索）
+
+**背景**：L-8 证 4B 手法有效、159 是同族问题（已出 711d4dd：8B 中转）。
+133 运行内核的 uburma 源码比本地 urma_driver 新、多字段加宽——**本批拿到
+运行内核的精确字段宽度（BTF），外部即可一次出齐全部批量 patch，终结逐
+type 试错**。同时探索 urma_admin（管理面 CLI，EID ACTIVE 证明它在管设备）。
+
+**A. 应用 159 修复并重编**：
+```bash
+cd /home/tools/app/umdk
+# 编辑 src/urma/lib/urma/core/urma_cmd_tlv.c：
+# 1) MAX_EID_CNT 的 ATTR 行前加：uint64_t max_eid_cnt_8b = arg->out.attr.dev_cap.max_eid_cnt;
+#    ATTR 行第三参改为 max_eid_cnt_8b
+# 2) 函数末尾 return 前的拷回块改为（含 156 与 159 两行）：
+#    int ret = urma_tlv_ioctl(ioctl_fd, URMA_CMD_QUERY_DEV_ATTR, attrs, sizeof(attrs));
+#    if (ret == 0) {
+#        arg->out.attr.dev_cap.congestion_ctrl_alg = (uint16_t)congestion_ctrl_alg_4b;
+#        arg->out.attr.dev_cap.max_eid_cnt = (uint32_t)max_eid_cnt_8b;
+#    }
+#    return ret;
+# （若 atomgit 已有 711d4dd，git pull 即可）
+# 重编 UMDK（cmake -S src ...）+ 确认 provider 目录在
+# 复测 gds 全栈（udma7+udma3）：预期 query 过 159 后报下一个不匹配 type
+#   （dmesg 的 type/field_size 原样带回——它是 BTF 之外的旁证）
+```
+
+**B.【核心】dump 运行内核的精确结构体布局**（按优先级尝试）：
+```bash
+# B1. 若有 bpftool：
+bpftool btf dump file /sys/kernel/btf/uburma format c 2>/dev/null | grep -A50 "struct uburma_cmd_device_cap"
+bpftool btf dump file /sys/kernel/btf/uburma format c 2>/dev/null | grep -A8 "struct ubcore_sl_info"
+# B2. 无 bpftool 试 pahole：pahole -C uburma_cmd_device_cap /sys/kernel/btf/uburma
+# B3. 若有 kernel-devel 头文件：
+grep -n -A45 "struct uburma_cmd_device_cap {" /lib/modules/$(uname -r)/build/include/ub/urma/uburma_cmd.h 2>/dev/null || \
+grep -rn -A45 "struct uburma_cmd_device_cap {" /lib/modules/$(uname -r)/build/ 2>/dev/null | head -60
+# B4. 三者都不可得：ls /lib/modules/$(uname -r)/build 2>/dev/null；rpm -qa | grep -iE "kernel-(devel|debuginfo)"；which bpftool pahole
+# 把拿到的 uburma_cmd_device_cap / ubcore_sl_info 定义**全文原样**带回
+```
+
+**C. urma_admin 探索（管理面 CLI，全只读）**：
+```bash
+urma_admin --help 2>&1 | head -40        # 或 -h；子命令清单全文带回
+urma_admin show 2>&1 | head -30          # 现状（此前已见 EID ACTIVE）
+# 帮助文本中若有 tp/jetty/route/peer 相关的查询类子命令，逐个只读执行并带回
+```
+
+**D.【以用户授权为准】spdk 构建依赖安装**（同 L-8 D 项，未授权跳过）：
+`yum install -y autoconf automake libfuse3-devel nasm yasm` → env_sop 阶段 4。
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 L-9 完毕」+ 判定链
+（159 修复后 query 到哪个 type / B 项内核结构体定义原文 / urma_admin 能力清单）。
 
 ### 指令 2026-09-21 #26：批次 L-8（TLV 修订版验证 + 同设备对照 + 管理面取证）
 
