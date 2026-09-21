@@ -245,6 +245,30 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-21 #L4（批次 L-4 回执，用户带回）
+
+**判定链：L4-b 不通（回环仍失败），但 4096 已消除，根因下移一层；且出现
+一条不需要 gds 版的新路径。**
+
+- L4-a ✅：provider 目录修复生效——/home/lx/UMDK_netlab/lib/urma/ 补上
+  gds 版 liburma_ubagg.so.0.0.3 / liburma-udma.so，4096 彻底消失（init 通过）
+- L4-b1 ❌（gds 并发）：init 过了，但连接建立后两端同时
+  **Failed to query device**——dmesg 铁证：`uburma_cmd_tlv_append_type:
+  Invalid attr, field_size: 4/2, type: 156` → 内核返回 -EINVAL。即 **gds
+  liburma 与已装内核 ubcore/uburma ABI 不匹配**（TLV type 156 field_size
+  用户态 2 vs 内核 4）。gds liburma.so 与系统版二进制确不同（md5/大小）
+- L4-b2 ❌（系统版并发，阶段更深）：**query 通过**（ABI 匹配），卡在
+  **Failed to import jetty: 0**（两端）——jetty/udata 交换失败。外部判读：
+  这与 245 时代 `ubmad_post_send: get primary eid failed` 同族，**高度疑似
+  133 上用户态管理面 agent（ubmad daemon）未运行**（L-3 发现的
+  ub-pkg-manager/ub-pkg-urma/ub-pkg-mem/ub-pkg-virt/ubInsKo.service 均未启动）
+- 内核模块 srcversion 01BA3B8E、vermagic .oe2403sp4 == 系统版 liburma 匹配
+- L4-c~g 未执行（按判定点停止），大页未动；现场已还原（provider 目录保留）
+- **外部决策**：① 新黄金路径 = **系统版 liburma 全链**——urma_perf 经 dlsym
+  改造后 cpu/npu-staged 均可用系统版，gds 仅 -M npu 直连需要（Phase 2 再解
+  ABI）；② 管理面 agent 是 jetty 导入失败的头号嫌疑，下发 L-5（先读懂服务
+  再有条件启动，严格标准，不确定就不动）
+
 ### 回执导入 2026-09-21 #L3（批次 L-3 回执，用户带回）
 
 **核心结论：4096 根因定位到源码级——gds liburma 的 provider 目录缺失，
@@ -355,6 +379,66 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-21 #23：批次 L-5（管理面 agent 定位与有条件启动 + 系统版全链首测）
+
+**背景**：L-4 判定系统版 liburma 与内核 ABI 匹配，只卡 jetty 导入（疑似
+ubmad 用户态 agent 未运行）。**本批新策略：放弃在回环上强推 gds 版——
+urma_perf 已 dlsym 化，cpu/npu-staged 用系统版 liburma 即可**，gds 的 TLV
+156 ABI 问题（仅影响 -M npu 直连）留待 Phase 2。目标：救活管理面 → 系统版
+回环打通 → 全链路首测。
+
+**L5-a.【只读】管理面服务体检**：
+```bash
+for s in ub-pkg-manager ub-pkg-urma ub-pkg-mem ub-pkg-virt ubInsKo; do \
+  echo "== $s =="; systemctl status $s --no-pager 2>&1 | head -8; \
+  systemctl cat $s 2>/dev/null; done
+# 从 unit 文件里找出每个服务实际执行的二进制路径，并 ls -l 之
+journalctl -b --no-pager 2>/dev/null | grep -iE "ub-pkg|ubInsKo|ubmad" | tail -30
+rpm -qf <各二进制路径> 2>/dev/null     # 属于哪个包
+```
+
+**L5-b.【只读】gds ABI 备份线：TLV type 156 定义对比**：
+```bash
+grep -rn "156" /home/lx/UMDK_netlab/src/urma --include=*.h | grep -iE "attr|tlv|field" | head
+grep -rn -B3 -A3 "type.*156\|156.*type" /lib/modules/$(uname -r)/build/include/ub/ 2>/dev/null | head -20
+# 两边定义贴出来，外部判读 gds 侧怎么改
+```
+
+**L5-c.【有条件的批准写操作】启动管理面 agent 并复测**：
+判断标准（先读 L5-a 的 unit 文件内容再决定）：
+- **可启动**：unit 内容显示它是 URMA/UB 用户态管理 agent（二进制名含 mad/
+  manager/mue，功能描述为 UB 设备管理/EID/jetty 协调，只与本机 ubcore 字符
+  设备交互）→ `systemctl start <服务名>` → `systemctl status` 确认运行 →
+  立即复测 b2（系统版 liburma，LD_LIBRARY_PATH=/usr/lib64，并发 server
+  udma7 + client udma3）
+- **不启动**：unit 涉及固件包安装/设备重枚举/内核模块装卸，或描述含糊 →
+  原样回传 unit 内容等外部判读，本批止步于此
+- 复测通过 → 记录服务名；失败 → `systemctl stop` 还原服务状态并记录
+
+**L5-d.【L5-c 通过才做】大页 + target + cpu 回归 + npu-staged 首测**
+（全部用**系统版 liburma**，LD_LIBRARY_PATH 不含 UMDK 目录）：
+```bash
+# d1. 大页（批准写操作②）：sysctl -w vm.nr_hugepages=2048，跑前记录跑后还原
+# d2. head -c 16G /dev/zero > /home/lx/nds/loop.img
+# d3. nvmf_tgt + RPC（bdev_aio_create loop.img aio0 512 + URMA transport +
+#     listen traddr=141.61.133.123 trsvcid=4420
+#     subnqn=nqn.2026-01.io.spdk:urma-gpu-test），参考 target_nvme_takeover.sh
+# d4. cpu 回归（观察 LOC_ACCESS_ERR）：
+LD_LIBRARY_PATH=/home/lx/nds/spdk/build/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+SPDK_URMA_MAX_IO_SIZE=4194304 \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.133.123 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M cpu -t 5
+# d5. 通过 → npu-staged 全链路首测：跑前 npu-smi 选卡（OK 卡 0/1/2），
+#     同命令换 -M npu-staged -g <空闲OK卡号>，观察 507033
+```
+
+**L5-e. 恢复现场**：kill nvmf_tgt；删 loop.img；大页还原为 0；
+L5-c 启动的服务 `systemctl stop` 还原（记录前后状态）；确认无残留。
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 L-5 完毕」+ 判定链
+（管理面服务启动与否/名称 → b2 通/不通 → LOC_ACCESS_ERR → 507033）。
 
 ### 指令 2026-09-21 #22：批次 L-4（provider 目录修复 + 回环复测 + 全链路首测）
 
