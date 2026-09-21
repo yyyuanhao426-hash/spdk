@@ -245,6 +245,33 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-21 #L6（批次 L-6 回执，用户带回）
+
+**⚠️ 头号异常：/home/lx 环境在 L-5→L-6 之间被外部删除**（UMDK_netlab gds
+源码树+构建、nds/spdk 均被删，/home/lx 于 04:12 被重建；uptime 连续未重启；
+全盘无 UMDK 源码副本；系统包 04:12 前后有重装痕迹）。**外部待办：与机器
+管理员确认是否计划内清理，并防止复发**。gds 树有本地副本
+（atomgit TongX123/UMDK_tool_netlab），可完全恢复。
+
+**技术结论**：
+- A：系统版 perftest 失败点**前移**至 create jetty——
+  `Failed to get sl resources` + `rtp should set priority to 255`（非法）+
+  `URMA_TRANSPORT_UB only support share_jfr` → `Failed to create jetty: 0!`。
+  ioctl 28 次全成功 ⇒ 纯用户态问题。注意 L-4 的 gds perftest+系统 liburma
+  曾通过 create 到达 import——**工具二进制差异或缺 -j（share_jfr）参数**
+  是首要怀疑
+- B：错误打印全部来自 perftest 工具（strings/objdump 定位
+  urma_create_jetty@plt 调用点）；udata 交换**走内核 ioctl（ubcore ctrlq）**，
+  无用户态 agent 参与（urma_cmd_udrv_priv_t 随 cmd 经 ioctl 下发）——与 L-5
+  结论闭环
+- C：ubctl 无 check/dump 子命令（参数式语法）；ubctl ls：UB 物理端口基本
+  UP（chip1 9 端口 8 up、chip0 port0/1 up）
+- D：**gds 树、系统头文件、内核结构体三侧 congestion_ctrl_alg 均为
+  uint16_t(2B)** ⇒ L-4 的 spec=4 来自 **netlab 内核自己的 TLV spec 表与自身
+  结构体不一致**（内核侧缺陷）。外部已在 gds 源码（本地副本）出修复：
+  query 请求跳过 type 156（urma_cmd_tlv.c，umdk 提交 94d725d）
+- NPU4 状态恶化为 Critical（原 Warning），后续选卡注意
+
 ### 回执导入 2026-09-21 #L5（批次 L-5 回执，用户带回）
 
 **核心结论：① 133 上不存在 URMA/UB 用户态管理 agent——ubmad 实为内核
@@ -397,6 +424,61 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-21 #25：批次 L-7（环境恢复 + TLV 修复验证 + jetty 归因）
+
+**背景**：① /home/lx 被外部删除（用户去与管理员确认，本批先自力恢复——
+两棵树都有源码仓）；② L-6 确认 netlab 内核 TLV spec 表对 type 156 自相
+矛盾，gds 修复 = query 请求跳过该类型（源码改动见 R1-c）。**批准写操作**：
+git clone ×2、编译、R1-c 的一行源码修改。产物只进 /home/lx/ 自家目录。
+
+**R1. 环境恢复**：
+```bash
+# R1-a. spdk（GitHub 经代理可达）：
+git clone -b nds_v1 https://github.com/yyyuanhao426-hash/spdk.git /home/lx/nds/spdk
+cd /home/lx/nds/spdk && git log --oneline -1     # 应为 b67f955 或更新
+git submodule update --init                       # 7 个 submodule
+# R1-b. UMDK gds 树（atomgit）：
+git clone https://atomgit.com/TongX123/UMDK_tool_netlab.git /home/lx/UMDK_netlab
+git log --oneline -1                              # 记录 HEAD
+# R1-c.【批准的源码修改】gds liburma 跳过 TLV type 156：
+#   编辑 /home/lx/UMDK_netlab/src/urma/lib/urma/core/urma_cmd_tlv.c，
+#   找到 ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_CONGESTION_CTRL_ALG, ...)（约 L1256），
+#   整行注释掉（内核 spec 表 4B vs 自身结构体 2B 自相矛盾，请求必被 -EINVAL 拒绝；
+#   跳过后该能力字段保持 0，对 gds 路径无影响）。
+#   若用户已把修复 push 到 atomgit（HEAD 94d725d），git pull 即可，跳过手工编辑。
+# R1-d. 编译：UMDK 按树内 README/CMake 构建（产出 lib/liburma.so 与
+#   urma_perftest）；spdk 按 env_sop.md 阶段 3~4（依赖库已随 /home/lx 被删，
+#   需重建，isa-l 等按 env_sop 的外部安装模式处理，卡住原样记录）
+```
+
+**R2.【快速验证】系统 perftest 的 -j（share_jfr）参数**（L-6 失败前有
+"URMA_TRANSPORT_UB only support share_jfr" 警告，可能只是缺参数）：
+```bash
+/usr/bin/urma_perftest -h        # 全文带回（关注 -j/--share_jfr 与 priority 参数）
+# 系统版并发（server=udma7 + client=udma3）加 -j 重测：
+#   create jetty 若通过 → 到达 import jetty（回到 L-4 终点）
+#   仍失败 → 原样记录
+```
+
+**R3. gds perftest + 系统 liburma 并发**（复现 L-4 终点，验证恢复后的树
+行为一致）：LD_LIBRARY_PATH 只含 /usr/lib64，运行新构建的 gds perftest
+（udma7+udma3），预期到 `Failed to import jetty: 0`，dmesg 跑后带回。
+
+**R4. gds perftest + gds liburma（含 R1-c 修复）并发**：LD_LIBRARY_PATH 含
+/home/lx/UMDK_netlab/lib，预期 **query 不再报 type 156**；记录 create/import
+jetty 走到哪一步。
+
+**R5.【核心】import jetty 源码级定位**（树已恢复，补 L-6 未竟）：
+```bash
+grep -rn "Failed to import jetty" /home/lx/UMDK_netlab/src/urma/tools --include=*.c
+# 顺调用链找到 import API（urma_import_jetty）在 liburma 的实现
+# （urma_cmd_import_jetty），失败分支前后各 20 行原样摘录（标 文件:行号）
+grep -rn "import_jetty\|exchange" /home/lx/UMDK_netlab/src/urma/lib --include=*.c | head -30
+```
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 L-7 完毕」+ 判定链
+（R2 -j 是否解锁 / R4 query 是否过 / R5 import 失败分支源码）。
 
 ### 指令 2026-09-21 #24：批次 L-6（jetty 导入失败源码级定位 + ubctl 体检，全只读）
 
