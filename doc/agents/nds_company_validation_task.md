@@ -335,6 +335,55 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-21 #21：批次 L-3（UB 管理面深挖，全部只读）
+
+**背景**：L-2 判定同机两 URMA 进程并发 urma_init 即双双 4096（URMA_FAIL），
+疑似管理面未配置/未启动。store 节点协调中，本批在 133 上深挖根因，**全部
+只读**（找到疑似服务也**不要启动**，报告回来等外部决定）。find 一律限定
+路径 + timeout。
+
+**A. 进程与服务全景（找疑似管理面）**：
+```bash
+ps aux | grep -iE "ubmad|ubtool|ubmgt|mue|sentry|fabric" | grep -v grep
+systemctl list-unit-files 2>/dev/null | grep -iE "ub|urma|mad|mue" | head -20
+ls /usr/lib/systemd/system /etc/systemd/system 2>/dev/null | grep -iE "ub|urma|mad" | head
+```
+
+**B. 文件系统定位管理工具/配置**：
+```bash
+timeout 60 find /usr /opt /usr/local -maxdepth 6 \( -name "*ubmad*" -o -name "*ubtool*" -o -name "*ubmgt*" \) 2>/dev/null | head
+timeout 30 find /etc -maxdepth 3 -iname "*ubmad*" -o -iname "*urma*" -o -iname "*ub_*" 2>/dev/null | head -20
+ls /usr/local/Ascend* 2>/dev/null
+```
+
+**C. 内核侧线索**：
+```bash
+modinfo -p ubcore 2>/dev/null | head -30        # 模块参数（有无多进程/管理面开关）
+modinfo -p uburma 2>/dev/null | head -20
+journalctl -b --no-pager 2>/dev/null | grep -iE "ubcore|ubase|urma|mad" | tail -40
+```
+
+**D. 【最高价值】源码级定位 4096 根因**（UMDK 源码树在 /home/lx/UMDK_netlab）：
+```bash
+# D1. urma_init 的实现里哪些分支返回 URMA_FAIL：
+grep -rn "URMA_FAIL" /home/lx/UMDK_netlab/src/urma/lib --include=*.c | head -20
+# D2. 顺着 D1 找到 urma_init 主流程文件后，把返回 URMA_FAIL 的分支
+#     前后各 20 行源码原样摘录（标注 文件:行号）
+# D3. 管理面交互线索：
+grep -rn "primary eid\|primary_eid\|ubmad\|daemon" /home/lx/UMDK_netlab/src --include=*.c | head -30
+```
+（若 urma_perftest -h 帮助文本中有 server/设备/管理面相关参数说明，原样附上）
+
+**E. 可选复现取证**（只做一次）：按 L-2 方式并发 server+client 复现 4096，
+同时 `dmesg --since` 或跑前后各抓 `dmesg | tail -60` 原样带回。
+
+**判定与回传**：
+- 找到疑似管理面服务/工具（A/B 有命中）→ 回传名称与状态，**等外部决定
+  是否启动**（启动属写操作，需单批批准）
+- D 项源码片段是本批核心交付物——外部将据此判定并发失败是"配置缺失"
+  还是"架构限制"，决定单机方案是否可救
+- 全部输出整理成文本交用户带回，注明「批次 L-3 完毕」
+
 ### 指令 2026-09-21 #20：批次 L-2（133 回环连通实测 + 单机全链路首测）
 
 **背景**：L-1 判定无空闲 NVMe 盘，外部已决策：target 侧存储用 **AIO 文件
