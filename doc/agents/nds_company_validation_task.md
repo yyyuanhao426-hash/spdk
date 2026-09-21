@@ -245,6 +245,27 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-21 #L1（批次 L-1 回执，用户带回）
+
+**判定：L-1 不通过——卡在「无空闲 NVMe 盘」**（其余前提满足）。
+
+- Gate 0 ✅：133 可登录（141.61.133.123，root+密码，hostname=localhost.localdomain）；
+  共享机有活跃业务（y00827564 的 rsync 迁移等），NPU 无计算进程
+- A：8×950DT，内核 6.6.0-155.0.0.143.oe2403sp4.aarch64；卡 0/1/2 OK、3~7
+  Warning；HBM 基线约 4123/86016MB
+- B ❌：整机仅 1 块物理 NVMe（nvme0n1 7.68T 系统盘，LVM 承载 /、/boot、/home），
+  **无任何空闲盘可被接管**
+- C ✅：/dev/uburma 下 10 个 udma 设备，空闲 udma2/3/7/8 共 4 个（占用者均为
+  hccn_tool/npu-exporter/npu-smi 监控工具，非业务独占）
+- D：EID 存在（ub_bus_controller0/1，各 udma 下挂多个 eidN）；**未发现
+  ubmad/ubtool 管理面工具**（本机互通是否可行留待实测）
+- E：/home/lx/{nds/spdk（f735190，含全部代码改动）, UMDK_netlab,
+  isal_install} 均在，L-2 前无需重建
+- 测试 Agent 客观备注：回环 target 侧或可用 SPDK malloc/内存 bdev 兜底（超出
+  只读范围，未验证）
+- **外部决策**：target 侧存储改用 **AIO 文件 bdev**（在 /home/lx/nds/ 下建
+  文件，ext4/NVMe 背书，不接管盘、可随时删）为主、malloc bdev 兜底，下发 L-2
+
 ### 回执导入 2026-09-21 #R0-partial（批次 R-0 部分回执，用户带回；卡两卡点未执行 A~E）
 
 **卡点 1：指令 #17 正文未送达**
@@ -291,6 +312,75 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-21 #20：批次 L-2（133 回环连通实测 + 单机全链路首测）
+
+**背景**：L-1 判定无空闲 NVMe 盘，外部已决策：target 侧存储用 **AIO 文件
+bdev**（/home/lx/nds/ 下文件，不接管任何块设备）为主、malloc bdev 兜底。
+本批 = ① 验证本机两个 udmac 能否互通（单机方案成败判定点）；② 若通，
+跑 cpu 回归 + npu-staged 全链路首测。全程遵守共享机守则，只动 /home/lx/nds/
+自家目录，nice -n 10，hugepages 跑前记录跑后恢复。
+
+**Gate 0**：可登录 133；`ps aux | grep nvmf_tgt | grep -v grep` 无残留；
+`fuser -v /dev/uburma/*` 确认 udma2/3/7/8 仍空闲。
+
+**L2-a. 准备**：
+```bash
+cd /home/lx/nds/spdk && git pull origin nds_v1   # 仅文档对齐，代码无变化
+ls -l build/bin/nvmf_tgt build/examples/urma_perf  # 缺则 nice -n 10 make -j16
+df -h /home                                        # 确认空间充足
+head -c 16G /dev/zero > /home/lx/nds/loop.img      # 16G AIO bdev 背书文件
+```
+
+**L2-b. 【成败判定点】本机 udmac 互通实测（urma_perftest，绕开 SPDK）**：
+```bash
+find /home/lx/UMDK_netlab -name "urma_perftest" -type f 2>/dev/null
+# 没有则到 UMDK 树 src/urma/tools/urma_perftest 构建（CMake）
+# 同机起 server 与 client：server 用 udma2、client 用 udma3（按 -h 的设备选择参数，
+# 纯 host 内存最简模式，不带 GPU 参数）
+```
+- **通过** → 本机回环成立，继续 L2-c
+- **失败**（EID 不可达/管理面拒绝）→ **单机方案终结**：原样记录全部报错
+  回传，本批到此为止（外部唯一剩余路径 = 同 UB 域 store 节点，正在协调）
+
+**L2-c. 启动 target（AIO bdev 版）**：
+```bash
+# 起法参考 target_nvme_takeover.sh 内的 RPC 流程（该脚本接管 NVMe 的部分
+# 本机不可用），差异仅两点：① bdev 创建改用 RPC bdev_aio_create
+# /home/lx/nds/loop.img aio0 512（AIO 起不来则改 bdev_malloc_create 16G malloc0）
+# ② 其余（URMA transport、subsystem、listen traddr=141.61.133.123、
+# subnqn=nqn.2026-01.io.spdk:urma-gpu-test）照脚本原样
+LD_LIBRARY_PATH=/usr/lib64 build/bin/nvmf_tgt &    # 或脚本内既有启动方式
+# RPC 配置完成后确认 listen 成功（nvmf_get_subsystems 或日志）
+```
+
+**L2-d. cpu 回归（initiator 用 udma3，与 server/client 实验设备错开）**：
+```bash
+LD_LIBRARY_PATH=/home/lx/nds/spdk/build/lib:/home/lx/UMDK_netlab/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+SPDK_URMA_MAX_IO_SIZE=4194304 \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.133.123 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M cpu -t 5
+# 重点：LOC_ACCESS_ERR 是否复现——若本机回环也复现，则该问题指向 SPDK
+# 注册方式而非 197 内核（重要判据）；若通过 → 继续下步
+```
+
+**L2-e. npu-staged 全链路首测**：
+```bash
+# 跑前 npu-smi info 动态确认选卡：只允许 OK 卡（当前 0/1/2），Warning 卡禁用；
+# hugepages 跑前记录
+# 同 L2-d 命令换 -M npu-staged -g <空闲OK卡号>
+# 观察：507033 是否复现；通过 = NDS 全链路（回环版）首测通过 🎯
+```
+
+**L2-f. E1 liburma 对照（时间富余才做）**：同 L2-e，LD_LIBRARY_PATH 只含
+CANN（标准 liburma）重跑一次，对比 gds 版结果（507033 归因判据）。
+
+**L2-g. 恢复现场**：kill nvmf_tgt；删除 /home/lx/nds/loop.img；hugepages
+恢复到跑前水平；不留临时文件。
+
+**回传**：全部输出整理成文本交用户带回（不 commit/push），注明
+「批次 L-2 完毕」+ 判定结果（L2-b 通过与否 / LOC_ACCESS_ERR / 507033）。
 
 ### 指令 2026-09-21 #19：批次 L-1（133 本机回环可行性探测，只读）
 
