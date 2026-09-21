@@ -245,6 +245,37 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-21 #L7（批次 L-7 回执，用户带回）
+
+**判定链：① -j 不解锁（create jetty 仍败）；② R1-c 跳过 type 156 被证伪
+（内核视其为必需，改报 Failed to match mandatory out type: 156）——正确
+修法 = 按 4B 发送；③ R5 完整定位 import jetty 失败链，且拿到内核级根因。**
+
+- 环境已恢复：/home/tools/app/{spdk(c6c27242), umdk(147fe5a)}，UMDK 编译
+  成功（关键：cmake -S 须指向 /src）；spdk configure 卡缺
+  autoconf/automake、libfuse3、nasm/yasm（安装待授权）
+- R3 重大进展：**gds perftest + 系统 liburma 通过 create jetty**
+  （priority=15 正常，jetty id 1095），死在 import jetty。dmesg 内核级根因：
+  ```
+  ubase: UDMA: ctrlq send msg failed, ret = -2.
+  UDMA: udma ctrlq get tpid list failed, ret = -2.
+  ubcore_get_tp_list: Failed to get tp list, ret: -2.
+  ubcore_import_jetty_compat: Failed to get tp list, ret: -2, tp_cnt: 1.
+  ```
+  **ret=-2(-ENOENT) = 控制面消息找不到投递目标——与 245 时代
+  `get primary eid failed ret=-2` 同签名：133 的 UB 管理面未配置端点路由，
+  内核向管理面查询 TP 列表必然失败。用户态无法修复。**
+- R5 源码链齐备：perftest_resources.c:1624 → urma_cp_api.c:1897(compat) →
+  udma_u_jetty.c:676 → urma_cmd.c:2215（udata 组装）→ urma_cmd_tlv.c:909
+  （TLV ioctl /dev/ubcore）。udata 走内核确认
+- 附带：系统 perftest priority=255 vs gds perftest priority=15（二进制差异，
+  后续统一用 gds perftest）；133 被外部重启 2 次（04:34/05:02，非我方）；
+  UB 设备重启后延迟枚举 5-6 分钟
+- **外部决策**：① 出修订版 TLV patch（4B 中转+回拷，umdk 797593d）；②
+  L-8 做修复验证 + 同设备对照 + 管理面取证；③ import 若仍 -ENOENT（预期），
+  单机方案盖棺，转「平台配置 133 管理面」（133/245 时代方案①复活）+
+  「store 节点」双线——**两者本质是同一请求**
+
 ### 回执导入 2026-09-21 #L6（批次 L-6 回执，用户带回）
 
 **⚠️ 头号异常：/home/lx 环境在 L-5→L-6 之间被外部删除**（UMDK_netlab gds
@@ -424,6 +455,59 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-21 #26：批次 L-8（TLV 修订版验证 + 同设备对照 + 管理面取证）
+
+**背景**：L-7 已证 R1-c 跳过法无效（type 156 必需）、import jetty 根因在
+内核管理面（ctrlq ret=-2）。本批：① 验证修订版 TLV patch（4B 中转）能否
+让 gds 全栈走通 query→create；② 同设备对照排除跨设备因素；③ 管理面取证
+（为向平台发起配置请求攒证据）。**批准写操作**：R1-c 源码二次修改 + 重编
+UMDK；spdk 依赖安装以用户带回的授权为准（未授权则跳过 D）。
+
+**A. 应用修订版 TLV patch 并重编**：
+```bash
+cd /home/tools/app/umdk
+# 编辑 src/urma/lib/urma/core/urma_cmd_tlv.c：
+# 1) 删除 R1-c 加的「整行注释」（恢复 CONGESTION_CTRL_ALG 的 ATTR 行）
+# 2) 在该 ATTR 行之前加一行：  uint32_t congestion_ctrl_alg_4b = arg->out.attr.dev_cap.congestion_ctrl_alg;
+#    并把该 ATTR 行的第三个参数改为 congestion_ctrl_alg_4b
+#    （即：ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_CONGESTION_CTRL_ALG, congestion_ctrl_alg_4b);）
+# 3) 函数末尾 return 前加拷回：
+#    int ret = urma_tlv_ioctl(ioctl_fd, URMA_CMD_QUERY_DEV_ATTR, attrs, sizeof(attrs));
+#    if (ret == 0) arg->out.attr.dev_cap.congestion_ctrl_alg = (uint16_t)congestion_ctrl_alg_4b;
+#    return ret;
+# （若用户已 push umdk 修复 797593d，git pull 即可）
+# 重新编译 UMDK（同 L-7 R1-d 的 cmake 命令）+ 重建 lib/urma provider 目录
+```
+
+**B. gds 全栈复测（gds perftest + gds liburma，server=udma7 + client=udma3）**：
+预期判定链：query 不再报 156 → create jetty（priority=15）→ import jetty。
+- query 仍失败（报其他 type 的 spec/attr 不匹配）→ 原样记录 dmesg 的
+  type/field_size，外部继续出 patch（重点 suspect：PRIORITY_INFO）
+- 走到 import jetty → 抓 dmesg 全量（见 C）——预期仍 -ENOENT
+
+**C. 同设备对照 + 管理面取证**：
+```bash
+# C1. 同设备回环对照：server 与 client 都用 udma7（两进程同设备），
+#     走到 import 则记录是否仍 Failed to get tp list
+# C2. dmesg 取证（import 尝试前后各抓一次）：
+dmesg | grep -iE "ubmad|primary|ctrlq|eid|tp list|enoent" | tail -40
+# C3. EID 现状：
+cat /sys/class/udmac*/ueid 2>/dev/null | head
+ubctl ls 2>&1 | head -20
+```
+
+**D.【以用户授权为准】spdk 构建依赖安装**：
+```bash
+# 用户带回文本若注明"已授权"：
+yum install -y autoconf automake libfuse3-devel nasm yasm   # 包名以 openEuler 仓库为准
+# 然后按 env_sop 阶段 4 继续 spdk configure/make（--with-urma 指向新树）
+# 未授权则跳过，spdk 构建留待下批
+```
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 L-8 完毕」+ 判定链
+（修订 patch 后 query/create/import 各到哪一步 / 同设备对照结果 /
+C2 管理面取证原文）。
 
 ### 指令 2026-09-21 #25：批次 L-7（环境恢复 + TLV 修复验证 + jetty 归因）
 
