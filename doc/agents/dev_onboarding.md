@@ -79,7 +79,7 @@
    不能直接调，主攻 CANN dmabuf 导出路线（aclrtMemExportToShareableHandle 等）
 6. **未 push 的本地提交要交接清楚**（写在这里并保持更新）：
    - urma_driver `sp4_driver` 0728ee4：ctrlq 白名单修复（未编译验证，未 push）
-   - spdk-urma `nds_v1` 31901ce/25b7cec：文档（R-0 指令 + 本文）
+   - spdk-urma `nds_v1` 31901ce/25b7cec/0ae1464：R-0 指令 + 根因修正 + 本文
 7. 通用踩坑：Windows SFTP 上传会带 CRLF（configure 必挂，一律 git/scp）；
    md 文件别用转码工具改写（整文件乱码事故）；共享机上产物只进自家目录、
    hugepages 跑前记录跑后恢复、find 限定路径加 timeout
