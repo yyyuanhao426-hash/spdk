@@ -245,6 +245,28 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-21 #L2（批次 L-2 回执，用户带回）
+
+**判定：L2-b 不通过——同机 udmac 两进程并发建链失败，单机回环方案终结。**
+
+- Gate 0/L2-a ✅：133 可登录；udma3/7/8 空闲；二进制齐全；/home 4.9T 可用；
+  loop.img 创建成功；hugepages 基线 0
+- L2-b ❌：urma_perftest（/home/lx/UMDK_netlab/build/urma/tools/ 下现成）——
+  **单独运行任一进程（server 或 client）urma_init 均成功；只有同机两进程
+  并发（server=udma7 + client=udma3）时两端同时 Failed to urma init,
+  status:4096（URMA_FAIL=0x1000）**。多组设备组合复测一致；无残留进程干扰
+- 诊断线索：dmesg 大量 ubcore_disconnect_vtp / ubase UDMA: Completion event
+  for bogus jfcn（建链尝试产物）；/dev/uburma/udmaN 权限 666 正常
+- 另：SPDK urma_perf 因 hugepages=0 无法启动（非 URMA 问题，本批未涉及）
+- L2-c/d/e 未执行（按指令 L2-b 失败即停）；L2-g 恢复现场 ✅（进程/loop.img/
+  hugepages 全还原，日志留 /home/lx/nds/ 作证据）
+- **外部判读**：并发 urma_init 即失败 + 此前未发现 ubmad 管理面工具 + 245
+  时代 "get primary eid failed"，三者共同指向：本 netlab 环境的 UB 管理面
+  **不支持（或未配置）同机多 URMA 进程**。单进程 init 正常说明设备本身健康，
+  但两进程拓扑（nvmf_tgt + urma_perf 必然两进程）无法在 133 单机内成立
+- 测试 Agent 建议（外部采纳为备选）：若管理面有未启动的 daemon，深挖后
+  或可解锁并发——留作 L-3 可选批，由外部决定
+
 ### 回执导入 2026-09-21 #L1（批次 L-1 回执，用户带回）
 
 **判定：L-1 不通过——卡在「无空闲 NVMe 盘」**（其余前提满足）。
