@@ -526,8 +526,11 @@ urma_admin show 2>&1 | head -30          # 现状（此前已见 EID ACTIVE）
 # 帮助文本中若有 tp/jetty/route/peer 相关的查询类子命令，逐个只读执行并带回
 ```
 
-**D.【以用户授权为准】spdk 构建依赖安装**（同 L-8 D 项，未授权跳过）：
-`yum install -y autoconf automake libfuse3-devel nasm yasm` → env_sop 阶段 4。
+**D.【已授权 2026-09-21】spdk 构建依赖安装**：
+```bash
+yum install -y autoconf automake libfuse3-devel nasm yasm   # 包名以 openEuler 仓库为准
+# 然后按 env_sop 阶段 4 继续 spdk configure/make（--with-urma 指向新树）
+```
 
 **回传**：全部输出整理成文本交用户带回，注明「批次 L-9 完毕」+ 判定链
 （159 修复后 query 到哪个 type / B 项内核结构体定义原文 / urma_admin 能力清单）。
