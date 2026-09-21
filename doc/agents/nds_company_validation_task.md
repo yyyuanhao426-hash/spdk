@@ -245,6 +245,27 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-21 #L3（批次 L-3 回执，用户带回）
+
+**核心结论：4096 根因定位到源码级——gds liburma 的 provider 目录缺失，
+属部署/布局问题，非架构限制。单机方案大概率可救。**
+
+- 源码链条：并发 server+client → 两进程 `opendir("<liburma.so 目录>/urma")`
+  ENOENT → `urma_open_drivers()` 返回 -1 → `urma_init()` 命中
+  `return URMA_FAIL`(4096)（urma_main.c L229；opendir 在 L182-183）
+- 关键事实：**gds 版 /home/lx/UMDK_netlab/lib/urma/ 不存在**（provider 实际在
+  build/urma/lib/urma/bond/、build/urma/hw/udma/）；对照**系统版
+  /usr/lib64/urma/ 存在**（liburma_ubagg.so 等，provider 加载正常）
+- strace 实证：单进程 init 成功（opendir 0 次）；并发时各 opendir 1 次 ENOENT。
+  精确机理（为何仅并发触发 opendir）待源码细读，但修复方向明确
+- A：无用户态 ubmad/ubtool；疑似管理面服务（未启动）：ub-pkg-manager/
+  ub-pkg-urma/ub-pkg-mem/ub-pkg-virt/ubInsKo.service；C：ubcore/uburma 模块
+  参数仅日志级，无多进程开关
+- 系统 umdk-urma-* 26.06.0-B003 已安装；4096 为纯用户态判定（dmesg 无新增）
+- **外部决策**：① 不动管理面服务（本批 4096 与其无关）；② 修复 gds
+  provider 目录（自家目录内拷贝 .so）→ 下发 L-4：复测并发 → 通过则一路
+  cpu 回归 + npu-staged 全链路首测
+
 ### 回执导入 2026-09-21 #L2（批次 L-2 回执，用户带回）
 
 **判定：L2-b 不通过——同机 udmac 两进程并发建链失败，单机回环方案终结。**
@@ -334,6 +355,78 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-21 #22：批次 L-4（provider 目录修复 + 回环复测 + 全链路首测）
+
+**背景**：L-3 定位 4096 = gds liburma 的 provider 目录缺失（
+/home/lx/UMDK_netlab/lib/urma/ 不存在）。本批修复后复测并发，通过则直接跑
+全链路。**两项已批准的写操作**（均限自家目录/可还原）：① 拷贝 provider .so
+到自家 lib 目录；② 配置 hugepages（跑前记录、跑后还原）。其余照旧：nice、
+不接管块设备、找不满足即停。
+
+**Gate 0**：可登录 133；无残留进程；udma3/7/8 空闲；hugepages 基线记录。
+
+**L4-a. 修复 provider 目录（批准写操作①）**：
+```bash
+ls /home/lx/UMDK_netlab/build/urma/lib/urma/bond/ /home/lx/UMDK_netlab/build/urma/hw/udma/
+mkdir -p /home/lx/UMDK_netlab/lib/urma
+# 优先拷 gds 构建树里的 provider（与 gds liburma 版本一致）：
+cp -a /home/lx/UMDK_netlab/build/urma/lib/urma/bond/*.so* \
+      /home/lx/UMDK_netlab/build/urma/hw/udma/*.so* /home/lx/UMDK_netlab/lib/urma/ 2>/dev/null
+ls -l /home/lx/UMDK_netlab/lib/urma/        # 应含 liburma_ubagg / liburma-udma 等
+# （若 gds 构建树无 .so，对照拷 /usr/lib64/urma/ 的系统版并在回执中注明）
+```
+
+**L4-b. 回环复测（成败判定点）**：
+```bash
+# b1：gds liburma 并发（同 L-2：server=udma7 + client=udma3，纯 host 内存）
+# b2（b1 仍 4096 时的对照组）：同样并发，LD_LIBRARY_PATH 只含 /usr/lib64
+#     （系统版 liburma，/urma/ 目录完好）——b2 通而 b1 不通 = provider 版本
+#     或路径仍有问题，原样回传
+```
+
+**L4-c. 配大页（批准写操作②，L4-b 通过才做）**：
+```bash
+grep -i huge /proc/meminfo        # 基线（L-2 记录为 0）
+sysctl -w vm.nr_hugepages=2048    # 2MB×2048 = 4GB
+grep -i huge /proc/meminfo        # 确认生效
+```
+
+**L4-d. 起 target（AIO bdev 版，同指令 #20 L2-c）**：
+```bash
+head -c 16G /dev/zero > /home/lx/nds/loop.img
+# nvmf_tgt + RPC：bdev_aio_create /home/lx/nds/loop.img aio0 512，
+# URMA transport + listen（traddr=141.61.133.123, trsvcid=4420,
+# subnqn=nqn.2026-01.io.spdk:urma-gpu-test），其余参考 target_nvme_takeover.sh
+# 注意：nvmf_tgt 与 urma_perf 各自进程的设备选择用 SPDK_URMA_DEV_NAME 错开
+```
+
+**L4-e. cpu 回归**：
+```bash
+LD_LIBRARY_PATH=/home/lx/nds/spdk/build/lib:/home/lx/UMDK_netlab/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+SPDK_URMA_MAX_IO_SIZE=4194304 \
+./build/examples/urma_perf \
+  -r 'trtype:URMA adrfam:IPv4 traddr:141.61.133.123 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+  -M cpu -t 5
+# 重点：LOC_ACCESS_ERR 是否复现（本机回环复现 = 指向 SPDK 注册方式，
+# 外部对照 perftest 修 token_policy；不复现 = 旧问题仅限跨机场景）
+```
+
+**L4-f. npu-staged 全链路首测**：
+```bash
+# 跑前 npu-smi 动态选卡（OK 卡 0/1/2，Warning 禁用），hugepages 已配
+# 同 L4-e 换 -M npu-staged -g <空闲OK卡号>
+# 通过 = NDS 全链路（回环版）首测通过 🎯
+```
+
+**L4-g. E1 对照（时间富余才做）**：LD_LIBRARY_PATH 只含 CANN 重跑 L4-f，
+对比 507033 归因。
+
+**L4-h. 恢复现场**：kill nvmf_tgt；删 loop.img；
+`sysctl -w vm.nr_hugepages=<基线值>`；确认无残留。
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 L-4 完毕」+ 判定链
+（L4-b 通/不通 → LOC_ACCESS_ERR 有/无 → 507033 有/无）。
 
 ### 指令 2026-09-21 #21：批次 L-3（UB 管理面深挖，全部只读）
 
