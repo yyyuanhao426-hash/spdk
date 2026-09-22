@@ -245,6 +245,38 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-22 #P20（批次 P2-0 回执，用户带回）
+
+**判定：运行内核 URMA 栈（uburma/ubcore/udma 及全部 17 个 UB 模块）无任何
+dma-buf 导入路径（A 全空）→「CANN 导出 fd + URMA 内核 import」路线需开发
+内核模块。但两个附加发现改变了路线选择：**
+
+- B ✓ CANN 9.1.0 导出 API 齐全（aclrtMemExportToShareableHandle/V2、
+  aclrtMallocPhysical 等）；C ✓ 内核 dma-buf 框架在位（kallsyms 83 条）
+- **附加发现 1（钥匙）：NPU 侧已有已导出的 pages/p2p API**——asdrv_svm 导出
+  `hal_kernel_p2p_get_pages / hal_kernel_p2p_put_pages / devmm_get_pages_list /
+  hal_kernel_svm_get_user_pages / hal_kernel_svm_dev_va_to_dma_addr`；
+  ascend_adapter 导出 `adap_get_p2p_capability / adap_enable_p2p` 等；
+  asdrv_ub 导出 `ubdrv_flush_p2p`。**（此前"pin 符号未导出"的约束仅指
+  vdavinci_pin_pages，这些高层 API 是导出的！）**
+- **附加发现 2：本机有 UB 原生内存导出体系**（obmm 导出/mmap、ubdevshm
+  register_segment/grant_access、ubmempfd get_user_pages_fast+iommu map
+  产出 fd、ummu/iommufd）
+- NPU 内核驱动侧同样无 dmabuf 符号（nm+strings 双空）
+- **外部判读 + 本地源码核验（urma_driver）**：Phase 2 正解 =
+  **`udma_npu_bridge.ko`，照抄 udma_nv_p2p_bridge.c 模式**（约 200 行独立
+  小模块）：实现 `struct udma_gpu_p2p_ops{get_pages/put_pages/free_page_table/
+  owner}`，get_pages 调 hal_kernel_p2p_get_pages 钉 HBM 页 → 产出
+  page_table（udma 核心只读 entries/page_size/pages[i]->physical_address
+  三个公开字段）→ `udma_register_gpu_p2p_ops()` 注册（GPL 导出，-EBUSY
+  单槽）。**is_gpu_seg 的用户态→内核标记通道（udrv_data 侧信道）在
+  c12ec44 已全实现**（udma_gpu_p2p.c/h、UBCORE_REG_SEG_GPU_VA），用户态
+  无需改动
+- 待验证前置（P2-1）：① 133 运行 udma.ko 是否含 gpu_p2p 框架符号（此前
+  只查了 uburma/ubcore，漏了 udma.ko）；② hal_kernel_p2p_get_pages 的
+  函数签名（驱动头文件/反汇编）；③ page_table 布局兼容性（nv-p2p.h）；④
+  模块装卸授权（需与管理员协调）
+
 ### 回执导入 2026-09-22 #L15（批次 L-15 回执，用户带回）—— ✅ Phase 1 正式收官
 
 **稳健性复测 7 组全部通过（FAILED=0），测试 Agent 转待命。**
@@ -614,6 +646,58 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-22 #35：批次 P2-1（NPU 桥接模块前置侦察，全只读）
+
+**背景**：Phase 2 路线已定 = 照抄 udma_nv_p2p_bridge.c 模式写
+`udma_npu_bridge.ko`（get_pages → hal_kernel_p2p_get_pages）。本地源码
+（urma_driver c12ec44）已核验：is_gpu_seg 标记通道 + udma_gpu_p2p 框架 +
+`struct udma_gpu_p2p_ops{get_pages/put_pages/free_page_table/owner}` 契约
+全部在位。本批侦察 4 个前置条件，**全只读**。
+
+**A.【判定项 1】133 运行 udma.ko 是否含 gpu_p2p 框架**（此前只查了
+uburma/ubcore，漏 udma）：
+```bash
+cd /home/tools/app/p20_log
+find /lib/modules/$(uname -r) -name "udma.ko*" -exec sh -c 'xz -dk {} 2>/dev/null || zstd -d {} 2>/dev/null || cp {} .' \;
+nm udma.ko | grep -iE "gpu_p2p|p2p_ops|build_sg_table|pin_seg" | head -20
+strings udma.ko | grep -iE "gpu_p2p|nv_p2p|nvidia" | head -10
+# 判定：有 udma_register_gpu_p2p_ops（T/d/r 导出）→ 路线成立；
+# 全空 → 运行内核 udma 编译时 UDMA_GPU_P2P_ENABLE=0，桥接无注册入口（重大分叉，回传等外部）
+```
+
+**B.【判定项 2】hal_kernel_p2p_get_pages 的函数签名**：
+```bash
+# B1. 驱动头文件（华为 NPU 驱动常带 devmm/svm 头）：
+timeout 60 find /usr/local/Ascend /usr/src /lib/modules/$(uname -r)/build \
+  -name "*.h" 2>/dev/null | xargs grep -ln "hal_kernel_p2p_get_pages\|devmm_svm_get_pages\|devmm_get_pages" 2>/dev/null | head
+# 命中则把函数声明上下文（±10 行）原样带回
+# B2. 头文件没有则从模块反汇编推签名（参数个数/寄存器用法）：
+find /lib/modules/$(uname -r) -name "asdrv_svm.ko*" -exec sh -c 'xz -dk {} 2>/dev/null; cp {}*.ko .' \; 2>/dev/null
+nm asdrv_svm.ko | grep -E "hal_kernel_p2p_get_pages|devmm_get_pages_list"
+objdump -d asdrv_svm.ko --start-address=<hal_kernel_p2p_get_pages 地址> --stop-address=<+0x60> | head -40
+# B3. kallsyms 地址与大小：
+grep -E "hal_kernel_p2p_get_pages|hal_kernel_p2p_put_pages|devmm_get_pages_list" /proc/kallsyms
+# B4. 模块间符号链接条件：
+find /lib/modules/$(uname -r) -name "Module.symvers" | head -5
+find / -maxdepth 6 -name "Module.symvers" -path "*ascend*" 2>/dev/null | head -3
+```
+
+**C.【判定项 3】page_table 布局来源**：
+```bash
+# 运行内核 udma.ko 编译时用的 nv-p2p.h 是否可寻：
+timeout 30 find /usr/src /lib/modules/$(uname -r)/build -name "nv-p2p.h" 2>/dev/null
+# udma.ko 内 strings 找结构体线索：
+strings udma.ko | grep -iE "nvidia_p2p|page_table|physical_address" | head -10
+# （外部已有本地 nv-p2p 布局知识，确认来源即可）
+```
+
+**D. 现状记录（只读）**：当前 lsmod 里 gpu/peer 相关模块；
+`modinfo asdrv_svm`（vermagic/license——决定我们模块的 LICENSE 声明与依赖）。
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 P2-1 完毕」+ 4 个
+判定项结论。外部据此出 `udma_npu_bridge.ko` 的完整设计 + Phase 2 立项材料
+（含机器/装卸授权需求）。
 
 ### 指令 2026-09-22 #34：批次 P2-0（Phase 2 立项侦察：运行内核 dmabuf 能力，全只读）
 
