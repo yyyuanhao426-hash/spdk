@@ -245,6 +245,36 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-22 #P21（批次 P2-1 回执，用户带回）
+
+**判定项 1（重大分叉）：133 运行 udma.ko 无 gpu_p2p 框架**——nm/readelf/
+strings 三重实证：无 gpu 符号、无导出（__ksymtab 计数 0）、无 p2p/nvidia
+串；仅局部 `udma_pin_seg_pages`（走 umem/GUP 路径）。即运行内核 udma 编译
+时 UDMA_GPU_P2P_ENABLE=0（或其源码版本无此框架）→ **桥接模块在 133 现状
+下没有注册入口，直连必须换装带 gpu_p2p 的 udma.ko**。
+
+**好消息（桥接下游全部就绪）**：
+- 判定项 2 ✓：机上头文件 `ascend_kernel_hal.h`（/usr/local/Ascend/driver/
+  kernel/dev_inc/inc/，/usr/src/davinci_ascend-1.0 同步副本）给出**精确签名
+  与结构体**：`int hal_kernel_p2p_get_pages(u64 va, u64 len, void
+  (*free_callback)(void*), void *data, struct p2p_page_table **pt)`；
+  `struct p2p_page_table{version; u64 page_size; struct p2p_page_info*
+  pages_info({u64 pa; u64 reserved[4]}); u64 page_num}`；**GPL 导出**
+  （__ksymtab_gpl，桥接须 MODULE_LICENSE("GPL")+可能 MODULE_IMPORT_NS）；
+  va/len 须设备 4KB 对齐、仅真实设备物理内存、与 put_pages 配对
+- 判定项 3 ✓：机上无 nv-p2p.h（但无关紧要——我们自己构建 udma.ko 与桥接
+  模块用同一份自备头，布局自洽；udma 核心只读 entries/page_size/
+  pages[i]->physical_address 三个公开字段）
+- 判定项 4：**模块装卸授权未取得**（用户协调项）；但**内核 build 树 +
+  Module.symvers 在位 → 133 上可离线编译 out-of-tree 模块**；asdrv_svm
+  license GPL、vermagic 匹配
+
+**外部路线决策**：直连 = 必然涉及 udma.ko 兼容构建试验（c12ec44 源码 +
+133 kernel-devel 构建，ENABLE=1 + 自备 nv-p2p.h），**离线兼容性检查**
+（CRC 对比）可零风险先做；试载/换装需管理员窗口 + C-2 式回滚预案。
+ Phase 2 设计蓝图：udma.ko(ENABLE=1) + `udma_npu_bridge.ko`
+（get_pages → hal_kernel_p2p_get_pages，产出 nv-p2p 布局 page_table）。
+
 ### 回执导入 2026-09-22 #P20（批次 P2-0 回执，用户带回）
 
 **判定：运行内核 URMA 栈（uburma/ubcore/udma 及全部 17 个 UB 模块）无任何
@@ -646,6 +676,91 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-22 #36：批次 P2-2（udma.ko 兼容构建试验，零机器风险）
+
+**背景**：P2-1 判定 133 运行 udma.ko 无 gpu_p2p 框架（直连必须换装）。
+本批**离线验证**：用 c12ec44 源码 + 133 kernel-devel + 自备 nv-p2p.h 构建
+ENABLE=1 版 udma.ko，并与运行版做 CRC/vermagic 兼容性对比——**全程只
+编译不装载**，零机器风险。兼容则下一步（需授权窗口）试载。
+
+**A. 获取源码与头文件**：
+```bash
+mkdir -p /home/tools/app/p22_nv
+git clone https://atomgit.com/TongX123/urma_driver_netlab.git /home/tools/app/urma_driver
+cd /home/tools/app/urma_driver && git log --oneline -1     # 记录 HEAD（应 c12ec44）
+# 自备最小 nv-p2p.h（canonical 公开布局，udma 核心只读 entries/page_size/
+# pages[i]->physical_address 三字段；见下）：
+cat > /home/tools/app/p22_nv/nv-p2p.h <<'EOF'
+#ifndef _NV_P2P_H_
+#define _NV_P2P_H_
+#include <linux/types.h>
+#define NVIDIA_P2P_PAGE_SIZE_4KB    0
+#define NVIDIA_P2P_PAGE_SIZE_64KB   1
+#define NVIDIA_P2P_PAGE_SIZE_128KB  2
+#define NVIDIA_P2P_PAGE_SIZE_MAX    3
+#define NVIDIA_P2P_GPU_UUID_LEN     16
+struct nvidia_p2p_page {
+    u64 physical_address;
+    u32 valid;
+    u32 padding[5];
+};
+struct nvidia_p2p_page_table {
+    u32 version;
+    u32 page_size;
+    u8  gpu_uuid[NVIDIA_P2P_GPU_UUID_LEN];
+    u32 entries;
+    struct nvidia_p2p_page **pages;
+    void (*callback)(void *data);
+    void *data;
+    u32 status;
+};
+struct nvidia_p2p_params {
+    u32 version;
+    u32 page_size;
+};
+int nvidia_p2p_get_pages(u64 p2p_token, u32 va_space, u64 virtual_address,
+    u64 length, struct nvidia_p2p_page_table **page_table,
+    void (*free_callback)(void *data), void *data);
+int nvidia_p2p_put_pages(u64 p2p_token, u32 va_space, u64 virtual_address,
+    struct nvidia_p2p_page_table *page_table);
+int nvidia_p2p_free_page_table(struct nvidia_p2p_page_table *page_table);
+#endif /* _NV_P2P_H_ */
+EOF
+```
+
+**B. 构建 ENABLE=1 版 udma.ko**：
+```bash
+cd /home/tools/app/urma_driver
+make NV_P2P_HEADER_PATH=/home/tools/app/p22_nv \
+     NV_MODULE_SYMVERS=/dev/null \
+     KDIR=/lib/modules/$(uname -r)/build 2>&1 | tail -20
+# 若 Makefile 的 NV_MODULE_SYMVERS test 失败：/dev/null 满足 test -f；仍不行则
+# touch 一个空文件替代
+# 找产出：
+find . -name "udma.ko" | head -3
+nm <udma.ko路径> | grep -E "udma_register_gpu_p2p_ops|udma_unregister_gpu_p2p_ops"   # 期望出现
+nm <udma.ko路径> | grep -c __ksymtab   # 对比运行版（0）
+```
+
+**C. 离线兼容性判定（核心交付）**：
+```bash
+# C1. vermagic 对比：
+modinfo -F vermagic <新构建udma.ko> ; modinfo -F vermagic /lib/modules/$(uname -r)/kernel/drivers/ub/urma/hw/udma/udma.ko.xz 2>/dev/null || modinfo -F vermagic /home/tools/app/p21_log/../../*/udma.ko
+# C2. 导入符号 CRC 对比（modversions 表）——两边各自 dump __versions 段并 diff：
+objdump -s -j __versions <新构建udma.ko> | sort > /tmp/v_new.txt
+objdump -s -j __versions <运行udma.ko（p21_log 解压副本或再解压一份）> | sort > /tmp/v_run.txt
+diff /tmp/v_new.txt /tmp/v_run.txt && echo "CRC-COMPATIBLE" || echo "CRC-DIFF"
+# （__versions 段不存在=未开 modversions，记录后以 vermagic+符号集合比对代替）
+# C3. 依赖符号集合对比：
+nm <新构建udma.ko> | grep " U " | awk '{print $2}' | sort > /tmp/u_new.txt
+nm <运行udma.ko> | grep " U " | awk '{print $2}' | sort > /tmp/u_run.txt
+diff /tmp/u_new.txt /tmp/u_run.txt
+```
+
+**判定与回传**：构建成功 + vermagic 一致 + CRC/依赖符号无差异 = **兼容性
+成立**，外部出试载批（需管理员窗口，含 C-2 式回滚预案）；任何差异原样
+带回。注明「批次 P2-2 完毕」。
 
 ### 指令 2026-09-22 #35：批次 P2-1（NPU 桥接模块前置侦察，全只读）
 
