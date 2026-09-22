@@ -330,6 +330,27 @@ dma-buf 导入路径（A 全空）→「CANN 导出 fd + URMA 内核 import」�
   函数签名（驱动头文件/反汇编）；③ page_table 布局兼容性（nv-p2p.h）；④
   模块装卸授权（需与管理员协调）
 
+### 回执导入 2026-09-22 #P23（批次 P2-3 回执，用户带回）—— ✅ 桥接侧全部就绪
+
+**udma_npu_bridge.ko 在 133 离线构建通过**（未装载），桥接侧 100% 就绪。
+
+- A：3 文件创建 ✓（nv-p2p.h 复用 p22_nv）
+- B：两处合理修正后编译通过——① 占位 symvers 为 5 段格式
+  （crc⇥symbol⇥module⇥EXPORT_TYPE⇥），非指令的双 tab；② 未解析符号实为
+  4 个（另含 udma_register/unregister_gpu_p2p_ops，属未来 ENABLE=1
+  udma.ko），已补齐 4 行 crc=0 占位
+- C：产物核验全符合预期——udma_npu_bridge.ko 323680B，npu_* 本地符号 ✓、
+  4 个外部符号 U（udma gpu_p2p 注册对 ×2 + hal ×2）✓、vermagic 与运行
+  内核一致 ✓、license GPL、depends udma,asdrv_svm
+- 环境异常：133 又被外部重启一次（非内核崩溃，pstore/crash 均空；时钟再次
+  回落 2000-05-29 且 NTP 未同步；重启后 NPU 栈未就绪 dcmi -8005）——机器
+  稳定性成为持续性风险，建议纳入与平台的沟通
+- 本批未装载任何模块；未 commit/push
+
+**Phase 2 状态汇总**：桥接侧 ✅ 就绪（npu_bridge/ 模块 + 装载期 CRC 取真值
+方法已明确）；阻塞项 = ① 运行 udma.ko 无 gpu_p2p 框架（等驱动源码/带
+GDR 构建——用户协调同事A/平台）② 模块装卸授权窗口（管理员）。
+
 ### 回执导入 2026-09-22 #L15（批次 L-15 回执，用户带回）—— ✅ Phase 1 正式收官
 
 **稳健性复测 7 组全部通过（FAILED=0），测试 Agent 转待命。**
