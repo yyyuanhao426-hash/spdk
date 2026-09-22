@@ -245,6 +245,28 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-22 #L14（批次 L-14 回执，用户带回）—— 🎯 Phase 1 验证完成
+
+**NDS npu-staged 全链路首测通过 🎯**
+
+- A：修复拉取（6a5028e）+ 增量重编 OK
+- B：大页 2048 → loop.img → nvmf_tgt+AIO → CPU 回归快验 ✓（errors=0）→
+  **npu-staged 首测 ✓（-g 0，卡 0）**：
+  - aclrtCreateContext 通过（无 107001）
+  - **507033/HDC 未复现**（dmesg 计数 0）——该历史问题关闭
+  - 4 线程 errors=0；Preflight staged WRITE+READ verification passed
+  - 带宽 8.43 MiB/s / 2157 IOPS（回环+AIO 模拟盘拓扑，非真实性能）
+  - staged_copy DtoH n=23119（HBM→host 中转路径有实际数据流）
+- b6：-M npu 直连按预期失败（Verification WRITE failed，15 个 I/O 后中止）
+  ——Phase 2 输入已采集
+- 现场完全恢复（大页 0 / loop.img 删 / nvmf_tgt 停）
+
+**Phase 1 验证目标（任务书第 0 节）达成情况**：
+① 环境确认 ✅ ② 编译通过 ✅ ③ 跑通测试 ✅（cpu 回归 + npu-staged 全链路，
+回环拓扑）④ 硬件验证项数据 ✅（davinci pin 符号、CANN dmabuf 接口、
+HBM 页粒度均已在前序批次采集）。**Phase 1 就此收官**；后续方向：
+-M npu 直连（Phase 2 内核 NPU bridge）与真实远端拓扑（需 UB 互联存储节点）。
+
 ### 回执导入 2026-09-22 #L13（批次 L-13 回执，用户带回）—— 🎯 单机回环全链路打通
 
 **判定链全部通过：query 语义正确（ceq_cnt=1 等 sysfs 全对齐）→ create ✓
