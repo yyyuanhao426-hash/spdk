@@ -245,6 +245,25 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-21 #L9（批次 L-9 回执，用户带回）
+
+- A：159 修复有效（dmesg type 159 消失）→ query 前进到 **type 160
+  （PAGE_SIZE_CAP，spec 4B vs gds 8B）**。已出修复（umdk 57b7801，4B 中转）
+- B：运行内核**无模块 BTF**、kernel-devel 无 uburma_cmd.h → 精确 spec 表
+  不可得。kernel-devel 的 ubcore_device_cap（L636-694）与 TLV spec 互相
+  矛盾（page_size_cap 结构体 8B / type160 spec 4B；max_eid_cnt 结构体 4B /
+  type159 spec 8B）⇒ **运行内核的驱动源与所有已知源码树（本地 c12ec44、
+  OLK-6.6 主线）都不一致，枚举顺序/宽度有自有改动** → 外部决定改用
+  **反汇编运行内核 uburma.ko 提取 spec 表**（fill_spec 调用序列中
+  type/field_size 为立即数，可解析），终结逐 type 试错
+- C：urma_admin 全貌 = show/dev/eid 三类；`dev set <dev> sl --sl --priority`
+  与 `dev expose/unexpose` 为潜在写命令；priority 表 16 项全 CTP 无 RTP
+  （解释系统 perftest priority=255）；show topo 报 netlink -28
+- D：**spdk 构建全通**（依赖已装、urma_perf/nvmf_tgt 产出，-M 全模式在位）。
+  注意：urma_perf 默认解析到系统 liburma，跑 gds 栈须
+  LD_LIBRARY_PATH=/home/tools/app/umdk/lib
+- 环境怪象：133 系统时钟被外部设为 2000 年（已用 touch 归一化构建元数据）
+
 ### 回执导入 2026-09-21 #L8（批次 L-8 回执，用户带回）
 
 **判定链：TLV 4B 修订有效（type 156 彻底消失 ✅）→ query 前进到 type 159
@@ -479,6 +498,69 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-21 #28：批次 L-10（160 修复 + uburma.ko spec 表提取 + 冲刺全链）
+
+**背景**：L-9 后 query 卡 type 160（spec 4B vs gds 8B），已出修复
+（umdk 57b7801）。为终结逐 type 试错，本批**从运行内核 uburma.ko 反汇编
+提取完整 spec 表**（fill_spec 的 type/field_size 是编译进二进制的立即数，
+objdump 可读），外部据此一次出齐所有剩余 patch。
+
+**A. 应用 160 修复并重编**：
+```bash
+cd /home/tools/app/umdk
+# 编辑 src/urma/lib/urma/core/urma_cmd_tlv.c：
+# 1) PAGE_SIZE_CAP 的 ATTR 行前加：uint32_t page_size_cap_4b;
+#    ATTR 行改为 ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_PAGE_SIZE_CAP, page_size_cap_4b);
+# 2) 函数末尾拷回块补一行：arg->out.attr.dev_cap.page_size_cap = page_size_cap_4b;
+# （即 if (ret == 0) { ...156 回拷...; ...159 回拷...; ...160 回拷... }）
+# （若 atomgit 已有 57b7801 则 git pull）
+# 重编 UMDK（cmake -S src）+ provider 目录确认
+# 复测 gds 全栈（udma7+udma3）：dmesg 下一个不匹配 type 原样带回
+```
+
+**B.【核心】提取运行内核 uburma 的 query-dev-attr spec 表**：
+```bash
+mkdir -p /home/tools/app/l10_log && cd /home/tools/app/l10_log
+# B1. 找到并解压模块：
+find /lib/modules/$(uname -r) -name "uburma.ko*"
+# 若为 .xz/.zst：xz -dk <文件>（或 zstd -d）得到明文 .ko
+# B2. 找符号（模块通常带 symtab）：
+nm uburma.ko | grep -iE "query_dev|fill_spec|tlv" | head -20
+# B3. 反汇编 spec 填充函数（按 nm 结果定位地址范围）：
+objdump -d uburma.ko --start-address=<起始> --stop-address=<结束> > query_spec.dis
+#    判据：函数体内出现大量 "mov w1, #<type>" + "mov w2, #<size>" 后跟
+#    "bl <fill_spec>" 的序列；把该函数反汇编**全文**带回（预计百余行）
+# B4. 若 nm 无符号：objdump -d 整个 uburma.ko 太大，则
+#    objdump -d uburma.ko | grep -B8 "bl .*fill_spec" 的方式截取（fill_spec
+#    符号若也无，改用 PLT 序号定位并带回样例片段，外部给进一步指引）
+```
+
+**C.【A 复测若 query 全通则执行】create → import → 管理面判定**：
+```bash
+# gds 全栈并发（udma7+udma3）：
+# - create jetty 成功 → import：dmesg 抓 "get tp list"/"primary eid"/ctrlq 原文
+# - 若 import 仍 ret=-2 → 单机建链被管理面阻断实锤（urma_admin dev expose
+#   等写命令留待外部批准后单独验证，本批不执行）
+# - 若 import 通过 → 直接进 D
+```
+
+**D.【仅当 C 的 import 通过】全链路首测**（同 L-4 L5-d 流程）：
+```bash
+# d1. sysctl -w vm.nr_hugepages=2048（跑前记录基线）
+# d2. head -c 16G /home/tools/app/loop.img（注意放在 app 下）
+# d3. nvmf_tgt + RPC：bdev_aio_create ... aio0 512 + URMA transport +
+#     listen traddr=141.61.133.123 trsvcid=4420
+#     subnqn=nqn.2026-01.io.spdk:urma-gpu-test
+# d4. cpu 回归：LD_LIBRARY_PATH=/home/tools/app/umdk/lib:...CANN... \
+#     SPDK_URMA_MAX_IO_SIZE=4194304 urma_perf -M cpu -t 5（traddr 同上）
+# d5. 通过 → npu-staged（npu-smi 选 OK 卡 0/1/2，-g 显式）
+# d6. 恢复：kill nvmf_tgt、删 loop.img、大页归零
+```
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 L-10 完毕」+ 判定链
+（B 项反汇编原文 / query 是否全通 / import 管理面判定 / 若进 D 则 cpu 回归
+与 npu-staged 结果）。
 
 ### 指令 2026-09-21 #27：批次 L-9（159 修复 + 运行内核 BTF 取证 + urma_admin 探索）
 
