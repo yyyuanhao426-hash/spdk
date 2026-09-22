@@ -245,6 +245,22 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-22 #L11（批次 L-11 回执，用户带回）
+
+- A：最终 patch 5 处编辑生效、重编 OK；163 消除 → query 前进到 **type 164：
+  field_size 4/4（✓）但 array_size 8/1（✗）**
+- B【决定性补强】：反汇编 `uburma_cmd_tlv_append_type` 拿到 array_size 位域
+  （(spec>>32)&0xFFF；el_num=(spec>>44)&0xFFF），**修正版 spec 表全解码**：
+  5 个 port_attr 数组条目（field 4 / array 8）+ 其余全标量 + 0x1b1=128
+- 根因（测试 agent 判定，外部采纳）：**gds 枚举多一个
+  QUERY_DEVICE_OUT_PORT_CNT（164），尾部全体错位一格**——port_attr 数组
+  撞上内核标量槽。修正：删该枚举项 → port_attr 对齐 0x1a4-0x1a8、
+  JETTY_MIN/MAX 对齐 0x1a9/0x1aa、caps 对齐 0x1ab-0x1af、TP_FEATURE 回归
+  176、PRIORITY_INFO 自然落 177
+- 外部已出 patch（umdk c306c72）：删枚举项 + 回退 L-11 的两个临时手法
+  （literal 177、port_cnt 4B 中转）
+- C/D 未触发（query 未全通）；现场无副作用
+
 ### 回执导入 2026-09-22 #L10（批次 L-10 回执，用户带回）
 
 **核心交付达成：运行内核 uburma 的完整 query-dev-attr spec 表已反汇编提取
@@ -516,6 +532,60 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-22 #30：批次 L-12（枚举对齐 patch + 冲刺全链路）
+
+**背景**：L-11 定位根因 = gds 枚举多一项 PORT_CNT 致尾部错位。外部已出
+patch（umdk c306c72）：删 QUERY_DEVICE_OUT_PORT_CNT 枚举项 + 回退 L-11 的
+临时手法。本批应用后 query 应全通，条件链直冲全链路首测。
+
+**A. 应用 patch（4 处手工编辑）**：
+```bash
+cd /home/tools/app/umdk
+# 1) urma_cmd_tlv.h：删除枚举行「QUERY_DEVICE_OUT_PORT_CNT,」（约 L1141，
+#    在 MAX_NETADDR_CN 与 PORT_ATTR_MAX_MTU 之间）
+# 2) urma_cmd_tlv.c：删除 PORT_CNT 相关的三行——
+#      uint32_t port_cnt_4b = arg->out.attr.dev_cap.port_cnt;
+#      ATTR(a++, QUERY_DEVICE_OUT_PORT_CNT, port_cnt_4b);
+#      及其上方的「type 164 PORT_CNT...」注释（若有）
+# 3) urma_cmd_tlv.c：末尾拷回块删除一行
+#      arg->out.attr.dev_cap.port_cnt = (uint8_t)port_cnt_4b;
+# 4) urma_cmd_tlv.c 尾部：删除字面量行「ATTR(a++, 177, ...priority_info);」
+#    及其注释，恢复两行常规写法：
+#      ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_TP_FEATURE, arg->out.attr.dev_cap.tp_feature.value);
+#      ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_PRIORITY_INFO, arg->out.attr.dev_cap.priority_info);
+#    （枚举删项后 TP_FEATURE=176、PRIORITY_INFO=177，与内核 spec 自然对齐）
+# 重编 UMDK（cmake -S src）+ provider 目录确认
+```
+
+**B. gds 全栈复测（udma7+udma3），条件链**：
+```bash
+# B1. query：预期全通（若仍报错，dmesg 原样带回）
+# B2. create jetty（预期 priority=15）
+# B3. import jetty：
+#     - 通过 → **回环建链打通，立即进 C**
+#     - 仍 get tp list ret=-2 → dmesg 管理面原文带回即止（管理面阻断实锤）
+```
+
+**C.【仅当 import 通过】全链路首测**：
+```bash
+# c1. sysctl -w vm.nr_hugepages=2048（跑前记录，跑后归零）
+# c2. head -c 16G /home/tools/app/loop.img
+# c3. nvmf_tgt + RPC：bdev_aio_create /home/tools/app/loop.img aio0 512 +
+#     URMA transport + listen（traddr=141.61.133.123, trsvcid=4420,
+#     subnqn=nqn.2026-01.io.spdk:urma-gpu-test），RPC 参考 target_nvme_takeover.sh
+# c4. cpu 回归：
+#     LD_LIBRARY_PATH=/home/tools/app/umdk/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+#     SPDK_URMA_MAX_IO_SIZE=4194304 \
+#     ./build/examples/urma_perf \
+#       -r 'trtype:URMA adrfam:IPv4 traddr:141.61.133.123 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+#       -M cpu -t 5
+# c5. 通过 → npu-staged：npu-smi 选 OK 卡（0/1/2），-M npu-staged -g <卡号>
+# c6. 恢复：kill nvmf_tgt、删 loop.img、大页归零
+```
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 L-12 完毕」+ 判定链
+（query/create/import 各步；若进 C：cpu 回归与 npu-staged 结果）。
 
 ### 指令 2026-09-22 #29：批次 L-11（最终 TLV patch + 冲刺全链路）
 
