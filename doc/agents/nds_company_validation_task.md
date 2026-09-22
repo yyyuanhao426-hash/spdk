@@ -245,6 +245,28 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-22 #L13（批次 L-13 回执，用户带回）—— 🎯 单机回环全链路打通
+
+**判定链全部通过：query 语义正确（ceq_cnt=1 等 sysfs 全对齐）→ create ✓
+（jetty id 36907）→ import ✓（get tp list ret=-2 未复现）→ CPU 回归 ✓。**
+
+- **管理面阻断假设被证伪**：此前 L-6/L-7 的「get tp list -ENOENT = 管理面
+  未配置」实为 TLV 语义错位的下游表象；RESERVED 错位修复后 create→import
+  自然打通，未做任何管理面写操作
+- **C4 CPU 回归通过**：-M cpu，completed=1844 errors=0，
+  **LOC_ACCESS_ERR 未复现**（该历史问题就此关闭——它伴随语义错位一并消失）。
+  host → URMA → 模拟盘整条链路功能正确（带宽 1.38MiB/s 为回环+AIO 模拟值，
+  不代表真实性能）
+- C5 npu-staged ❌：aclrtCreateContext failed: aclError 107001
+  （ACL_ERROR_RT_INVALID_DEVICEID）。根因 = **SPDK 侧
+  urma_perf_npu.c L52 的函数指针 typedef 少了 deviceId 参数**（CANN 真实
+  签名为 2 参），调用时 deviceId 为寄存器垃圾值；最小程序 2 参签名实证可过
+- A 项备注：指令中 port_cnt 应为 arg->out.attr.port_cnt（非 dev_cap 成员），
+  测试 agent 已按可编译写法修正；外部 umdk 仓已同步（40b4f50）
+- 现场已恢复（大页 0 / loop.img 删 / nvmf_tgt 停）
+- **外部已出 SPDK 修复**（nds_v1 6a5028e：typedef 补 2 参签名 + 调用传
+  device_id）→ L-14 重跑 npu-staged
+
 ### 回执导入 2026-09-22 #L12（批次 L-12 回执，用户带回）
 
 **里程碑：query 全通**（dmesg 无任何 Invalid attr）——但暴露语义错位：
@@ -547,6 +569,43 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-22 #32：批次 L-14（create_context 修复 + npu-staged 全链路首测）
+
+**背景**：L-13 单机回环建链全通、CPU 回归通过（LOC_ACCESS_ERR 关闭）。
+npu-staged 卡在 SPDK 侧 bug：urma_perf_npu.c 的 aclrtCreateContext 函数
+指针 typedef 少 deviceId 参数。**外部已修复并 push**（nds_v1 6a5028e）。
+
+**A. 拉取修复并重编 SPDK**：
+```bash
+cd /home/tools/app/spdk && git pull origin nds_v1
+git log --oneline -1        # 应为 6a5028e 或更新（含 fix(nds): pass device_id...）
+nice -n 10 make -j16 2>&1 | tail -5   # 增量编译 urma_perf
+```
+
+**B. 全链路首测（npu-staged）**：
+```bash
+# b1. sysctl -w vm.nr_hugepages=2048（跑前记录，跑后归零）
+# b2. head -c 16G /home/tools/app/loop.img
+# b3. nvmf_tgt + RPC（同 L-13 c3：bdev_aio_create + URMA transport +
+#     listen traddr=141.61.133.123 trsvcid=4420
+#     subnqn=nqn.2026-01.io.spdk:urma-gpu-test）
+# b4. cpu 回归快验（确认修复未破坏既有通路）：
+#     LD_LIBRARY_PATH=/home/tools/app/umdk/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+#     SPDK_URMA_MAX_IO_SIZE=4194304 \
+#     ./build/examples/urma_perf \
+#       -r 'trtype:URMA adrfam:IPv4 traddr:141.61.133.123 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+#       -M cpu -t 5
+# b5. **npu-staged 首测**：npu-smi 选 OK 卡（当前 0/1/2），同命令换
+#     -M npu-staged -g <空闲OK卡号> -t 5
+#     （重点：aclrtCreateContext 是否通过；507033/HDC 问题是否复现；
+#       通过 = **NDS npu-staged 全链路首测通过 🎯**）
+# b6. 时间富余：-M npu 收集 peermem 直连路线报错（Phase 2 输入，预期失败，原样记录）
+# b7. 恢复：kill nvmf_tgt、删 loop.img、大页归零
+```
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 L-14 完毕」+ 判定链
+（cpu 回归 / npu-staged 结果 / CreateContext 是否通过）。
 
 ### 指令 2026-09-22 #31：批次 L-13（RESERVED 修正 + 冲刺 create/import/全链路）
 
