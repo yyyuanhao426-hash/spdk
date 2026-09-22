@@ -330,6 +330,29 @@ dma-buf 导入路径（A 全空）→「CANN 导出 fd + URMA 内核 import」�
   函数签名（驱动头文件/反汇编）；③ page_table 布局兼容性（nv-p2p.h）；④
   模块装卸授权（需与管理员协调）
 
+### 回执导入 2026-09-22 #P24（批次 P2-4 回执，用户带回）—— 部分完成（B 被 NPU 降级阻断）
+
+**✅ 最大正面信号：libhcomm.so 在 133 上且 API 完整**——
+/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64/libhcomm.so（12.5MB），
+HcommEndpointCreate/MemReg/MemUnreg/MemExport/MemImport/MemGrant 全部导出，
+依赖确认链接同款 URMA 栈（liburma.so.0 + libascendcl.so）；探针
+dlopen/dlsym 全通过（required 18 + optional 5 全加载）。
+
+**⛔ 但 MemReg 取证被 NPU 降级阻断**：外部重启的后遗症——
+host_sys_init.service 超时失败（5min TERM）→ /dev/davinci0..7 缺失 →
+aclrtSetDevice=107001 / aclrtMalloc=107002 → HBM 分配不了 → 探针未走到
+HcommMemReg。dmesg：hdcdrv "Current connection protocol is not ub"×35、
+dms_module 符号缺失。这正是 L-14/L-15 能跑 npu-staged 而现在跑不了的原因。
+
+- A ✓ libhcomm 在位 + 符号齐全；memfabric 已 clone（dl_hcomm_api.h 取得，
+  REG_MR_FLAG_HBM 使用点确认）
+- B ⛔ HBM 分配失败（NPU 降级），strace 未取得
+- C 未执行（前置未满足）
+- 测试 agent 恢复评估：**标准服务重启（systemctl restart host_sys_init）
+  即可恢复，非重启机器**——公用机需授权，未擅自执行
+- 探针与脚本已就绪，NPU 恢复后重跑即可补 MemReg 取证 + C 项
+- 另：#37 的占位 symvers 格式/符号数笔误已由外部修正入档
+
 ### 回执导入 2026-09-22 #P23（批次 P2-3 回执，用户带回）—— ✅ 桥接侧全部就绪
 
 **udma_npu_bridge.ko 在 133 离线构建通过**（未装载），桥接侧 100% 就绪。
@@ -721,6 +744,38 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-22 #39：批次 P2-5（NPU 栈恢复 + MemReg 取证补测 + memfabric 实测）
+
+**背景**：P2-4 因 133 NPU 栈降级（host_sys_init.service 超时 → davinci
+节点缺失）被阻断；libhcomm 本体已确认在位且 API 齐全。本批 = 恢复 NPU 栈
+→ 补 MemReg 取证 → memfabric 实测。
+
+**Gate 0【需用户带回的授权】**：用户已授权执行 NPU 栈恢复（重启
+host_sys_init 服务，标准恢复动作非重启机器）。**未带回授权则整批中止**。
+另：先 `npu-smi info` 探测——若 NPU 栈已自行恢复则跳过 A 直接进 B。
+
+**A. NPU 栈恢复（授权后执行）**：
+```bash
+systemctl status host_sys_init --no-pager | head -8     # 确认现状
+systemctl restart host_sys_init
+sleep 60 && systemctl status host_sys_init --no-pager | head -5
+ls /dev/davinci0..7 && npu-smi info | head -15          # 恢复判定
+# 若服务仍失败 → 原样带回（可能需管理员整机处理），止步
+```
+
+**B. 补 P2-4 的 MemReg 取证**（NPU 恢复后重跑探针，探针已就绪）：
+```bash
+cd /home/tools/app && strace -f -e trace=ioctl ./p24_probe 2>&1 | tail -40
+# 判定：HcommMemReg 对 HBM 成功与否 + 走的哪个内核接口（davinci_manager?
+# uburma? 新 ioctl 号?）
+```
+
+**C. memfabric 部署实测（B 成功后做）**：同 P2-4 C 项——
+pip install memfabric-hybrid（或源码构建）→ 跑
+examples/hbm_share_memory/ShiftPutGet → strace 取证 → 恢复。
+
+**回传**：A 项恢复结果 + B/C 判定链，注明「批次 P2-5 完毕」。
+
 ### 指令 2026-09-22 #38：批次 P2-4（libhcomm/HBM 注册机制运行时验证）
 
 **背景介绍（先读这段，否则本批看不懂）**：
@@ -994,8 +1049,10 @@ clean:
 cd /home/tools/app/npu_bridge && make 2>&1 | tail -15
 # 预期产物 udma_npu_bridge.ko。MODPOST 若报
 #   "no symbol version for hal_kernel_p2p_get_pages"
-# 则创建 /home/tools/app/p23_nv/Module.symvers（crc 先填 0，装载期再取真值）：
-#   printf '0x00000000\thal_kernel_p2p_get_pages\t\tasdrv_svm\n0x00000000\thal_kernel_p2p_put_pages\t\tasdrv_svm\n' > /home/tools/app/p23_nv/Module.symvers
+# 则创建 /home/tools/app/p23_nv/Module.symvers（crc 先填 0，装载期再取真值）。
+# 注意（L-13 实测修正）：① 格式为 5 段（crc⇥symbol⇥module⇥EXPORT_TYPE⇥）；
+# ② 未解析符号共 4 个（另含 udma_register/unregister_gpu_p2p_ops）：
+#   printf '0x00000000\thal_kernel_p2p_get_pages\tasdrv_svm\tEXPORT_SYMBOL_GPL\t\n0x00000000\thal_kernel_p2p_put_pages\tasdrv_svm\tEXPORT_SYMBOL_GPL\t\n0x00000000\tudma_register_gpu_p2p_ops\tudma\tEXPORT_SYMBOL\t\n0x00000000\tudma_unregister_gpu_p2p_ops\tudma\tEXPORT_SYMBOL\t\n' > /home/tools/app/p23_nv/Module.symvers
 #   并在 make 命令追加 KBUILD_EXTRA_SYMBOLS=/home/tools/app/p23_nv/Module.symvers
 # 产物核验：
 nm udma_npu_bridge.ko | grep -E "npu_get_pages|npu_ops|register_gpu_p2p" | head
