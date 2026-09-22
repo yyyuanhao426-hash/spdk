@@ -245,7 +245,22 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
-### 回执导入 2026-09-22 #L11（批次 L-11 回执，用户带回）
+### 回执导入 2026-09-22 #L12（批次 L-12 回执，用户带回）
+
+**里程碑：query 全通**（dmesg 无任何 Invalid attr）——但暴露语义错位：
+**create jfc 失败，ceq_cnt 被读成 0**（udma_u_check_jfc_cfg: ceqn 0 >=
+cap ceq_cnt 0）。测试 agent 用最小复现程序对 sysfs 真值逐字段对照，定位
+**真正的根因 = gds 多一个 QUERY_DEVICE_OUT_DEV_CAP_RESERVED（type 155）**：
+
+- 运行内核 ubcore_device_cap 无 reserved（trans_mode, congestion_ctrl_alg,
+  ceq_cnt 直排）；gds 多出的 reserved 使其后所有字段语义错位一格
+- L-8~L-11 的宽度中转把"尺寸"补齐了，所以 query 不再报错，但"值"全错
+  （gds congestion=内核 ceq_cnt=1、gds ceq=内核 tp_in_tpg=0……证据链闭环）
+- 修正方案（测试 agent 提出、外部核算确认）：删 RESERVED 枚举+ATTR、
+  恢复 PORT_CNT（uint8_t 天然 1B）、**撤销全部 4 处宽度中转**——对齐后
+  155:2 / 156:4 / 157:4 / 158:4 / 159:8 / 160:4 / 161:4 / 162:4 / 163:1 /
+  164-168 数组:8 / 169-176:4 / 177:128 全部自然吻合，无需任何中转
+- 外部已出 patch（umdk cdb80bd，净删 23 行）；C/D 未触发（未到 import）
 
 - A：最终 patch 5 处编辑生效、重编 OK；163 消除 → query 前进到 **type 164：
   field_size 4/4（✓）但 array_size 8/1（✗）**
@@ -532,6 +547,66 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-22 #31：批次 L-13（RESERVED 修正 + 冲刺 create/import/全链路）
+
+**背景**：L-12 定位真根因 = gds 多一个 RESERVED out-type（语义错位）。
+外部已出最终修正 patch（umdk cdb80bd）——对齐后全部 50 条 spec 自然吻合、
+零中转。本批应用后：create jfc 应通过（ceq_cnt 拿到真值）→ import 判定 →
+通过则当场全链路首测。
+
+**A. 应用修正 patch（4 组手工编辑）**：
+```bash
+cd /home/tools/app/umdk
+# 1) urma_cmd_tlv.h：删除枚举行「QUERY_DEVICE_OUT_DEV_CAP_RESERVED,」（约 L1132）
+# 2) urma_cmd_tlv.h：在 MAX_NETADDR_CN 之后恢复一行「QUERY_DEVICE_OUT_PORT_CNT,」
+#    （即 L-12 删掉的那行加回来）
+# 3) urma_cmd_tlv.c 的 urma_ioctl_query_dev_attr 内：
+#    a. 删除 ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_RESERVED, ...) 整行
+#    b. 撤销 4 处宽度中转，恢复普通写法（删掉 uint32_t congestion_ctrl_alg_4b/
+#       uint64_t max_eid_cnt_8b/uint32_t page_size_cap_4b/uint8_t
+#       max_netaddr_cnt_1b 四个临时变量及其注释，ATTR 第三参改回原字段）：
+#       ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_CONGESTION_CTRL_ALG, arg->out.attr.dev_cap.congestion_ctrl_alg);
+#       ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_MAX_EID_CNT, arg->out.attr.dev_cap.max_eid_cnt);
+#       ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_PAGE_SIZE_CAP, arg->out.attr.dev_cap.page_size_cap);
+#       ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_MAX_NETADDR_CN, arg->out.attr.dev_cap.max_netaddr_cnt);
+#    c. 在 MAX_NETADDR_CN 的 ATTR 之后恢复：
+#       ATTR(a++, QUERY_DEVICE_OUT_PORT_CNT, arg->out.attr.dev_cap.port_cnt);
+#    d. 末尾 if (ret == 0) { ... } 拷回块整块删除，恢复为：
+#       return urma_tlv_ioctl(ioctl_fd, URMA_CMD_QUERY_DEV_ATTR, attrs, sizeof(attrs));
+# 重编 UMDK（cmake -S src）+ provider 目录确认
+```
+
+**B. gds 全栈复测（udma7+udma3），条件链**：
+```bash
+# B1. query：应全通且语义正确（可用最小复现程序对照 sysfs：ceq_cnt 应=1）
+# B2. create jetty：预期 jfc 创建成功（ceq_cnt=1 > ceqn=0）；
+#     若 priority 相关仍报错，加 --ctp 重试并记录
+# B3. import jetty：
+#     - 通过 → **回环建链打通，立即进 C**
+#     - 仍 get tp list ret=-2 → dmesg 管理面原文带回即止（管理面阻断实锤，
+#       urma_admin dev expose 验证留待下批，需外部批准）
+```
+
+**C.【仅当 import 通过】全链路首测**：
+```bash
+# c1. sysctl -w vm.nr_hugepages=2048（跑前记录，跑后归零）
+# c2. head -c 16G /home/tools/app/loop.img
+# c3. nvmf_tgt + RPC：bdev_aio_create /home/tools/app/loop.img aio0 512 +
+#     URMA transport + listen（traddr=141.61.133.123, trsvcid=4420,
+#     subnqn=nqn.2026-01.io.spdk:urma-gpu-test），RPC 参考 target_nvme_takeover.sh
+# c4. cpu 回归：
+#     LD_LIBRARY_PATH=/home/tools/app/umdk/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+#     SPDK_URMA_MAX_IO_SIZE=4194304 \
+#     ./build/examples/urma_perf \
+#       -r 'trtype:URMA adrfam:IPv4 traddr:141.61.133.123 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+#       -M cpu -t 5
+# c5. 通过 → npu-staged：npu-smi 选 OK 卡（0/1/2），-M npu-staged -g <卡号>
+# c6. 恢复：kill nvmf_tgt、删 loop.img、大页归零
+```
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 L-13 完毕」+ 判定链
+（query 语义校验 / create / import 各步；若进 C：cpu 回归与 npu-staged 结果）。
 
 ### 指令 2026-09-22 #30：批次 L-12（枚举对齐 patch + 冲刺全链路）
 
