@@ -49,7 +49,7 @@ typedef acl_error_t (*acl_init_fn)(const char *config_path);
 typedef acl_error_t (*acl_finalize_fn)(void);
 typedef acl_error_t (*aclrt_set_device_fn)(int32_t device_id);
 typedef acl_error_t (*aclrt_reset_device_fn)(int32_t device_id);
-typedef acl_error_t (*aclrt_create_context_fn)(aclrt_context_t *context);
+typedef acl_error_t (*aclrt_create_context_fn)(aclrt_context_t *context, int32_t device_id);
 typedef acl_error_t (*aclrt_destroy_context_fn)(aclrt_context_t context);
 typedef acl_error_t (*aclrt_set_current_context_fn)(aclrt_context_t context);
 typedef acl_error_t (*aclrt_malloc_fn)(void **dev_ptr, size_t size, int policy);
@@ -174,7 +174,7 @@ npu_driver_init(int32_t device_id)
 		goto fail;
 	}
 	g_npu.device_set = true;
-	err = g_npu.create_context(&g_npu.context);
+	err = g_npu.create_context(&g_npu.context, device_id);
 	if (err != NPU_ACL_SUCCESS) {
 		fprintf(stderr, "aclrtCreateContext failed: aclError %d\n", err);
 		goto fail;
