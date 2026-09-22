@@ -592,6 +592,52 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-22 #33：批次 L-15（Phase 1 稳健性复测，精简版）
+
+**背景**：L-14 npu-staged 首测通过（单次）。本批用 5~6 组参数复测，确认
+结论稳健。**一次性部署、连跑、一次性恢复**：全程约 1 小时，每轮测试窗口
+仅数秒到 1 分钟，资源占用与 L-13/L-14 同量级。
+
+**Gate 0**：可登录；无残留进程；npu-smi 确认 OK 卡（0/1/2 中至少一张空闲）；
+hugepages 基线记录。
+
+**A. 一次性部署（本轮只做一次）**：
+```bash
+sysctl -w vm.nr_hugepages=2048
+head -c 16G /dev/zero > /home/tools/app/loop.img
+# nvmf_tgt + RPC（同 L-14 b3：bdev_aio_create aio0 512 + URMA transport +
+# listen 141.61.133.123:4420 + subnqn），**保持运行**，后续各组测试共用
+```
+
+**B. 测试矩阵（每轮间隔观察 dmesg/状态，异常即停）**：
+```bash
+export LD_LIBRARY_PATH=/home/tools/app/umdk/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64
+export SPDK_URMA_MAX_IO_SIZE=4194304
+R="trtype:URMA adrfam:IPv4 traddr:141.61.133.123 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test"
+
+# 1. CPU 基线（4 线程）
+./build/examples/urma_perf -r "$R" -M cpu -t 5
+# 2. npu-staged 复现（卡 0，默认 4K/4 线程——与 L-14 同参数，验证可复现性）
+./build/examples/urma_perf -r "$R" -M npu-staged -g 0 -t 5
+# 3. npu-staged 换卡（OK 卡中另选一张，验证卡无关性）
+./build/examples/urma_perf -r "$R" -M npu-staged -g <另一张OK卡号> -t 5
+# 4. npu-staged 单线程
+./build/examples/urma_perf -r "$R" -M npu-staged -g 0 -t 5 -T 1
+# 5. npu-staged 8 线程（观察扩展性；若影响他人业务立即停）
+./build/examples/urma_perf -r "$R" -M npu-staged -g 0 -t 5 -T 8
+# 6. 稳定性长跑（1 分钟）
+./build/examples/urma_perf -r "$R" -M npu-staged -g 0 -t 60
+# 附：./build/examples/urma_perf -h 若有 I/O 长度/批量参数（如 -o/-q），
+#     加跑一组 64K 并记录；无则注明未覆盖
+# （-T 为线程数参数名以 -h 为准；若工具不支持 -T，记录后跳过 4/5）
+```
+
+**C. 恢复现场**：kill nvmf_tgt；删 loop.img；大页归零；确认无残留。
+
+**回传**：结果矩阵表（每组：errors/completed/带宽/IOPS/延迟分位）+
+异常原文（若有），注明「批次 L-15 完毕」。全部通过则 **Phase 1 正式
+收官**，测试 Agent 转待命。
+
 ### 指令 2026-09-22 #32：批次 L-14（create_context 修复 + npu-staged 全链路首测）
 
 **背景**：L-13 单机回环建链全通、CPU 回归通过（LOC_ACCESS_ERR 关闭）。
