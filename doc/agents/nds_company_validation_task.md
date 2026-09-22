@@ -615,6 +615,48 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-22 #34：批次 P2-0（Phase 2 立项侦察：运行内核 dmabuf 能力，全只读）
+
+**背景**：Phase 1 收官，启动 Phase 2（-M npu 直连）。本地侦察发现 gds 的
+dmabuf 注册链是**未启用的脚手架**（liburma 桩 / provider ops 注释掉 /
+urma_driver 仓无 seg_dmabuf 内核路径）。**Phase 2 的路线分叉取决于：运行
+内核（比 urma_driver c12ec44 新）是否已内置 dma-buf 导入**——是则只写
+用户态（批级），否则需开发内核模块（月级，且需可装卸模块的机器）。本批
+全只读取证。
+
+**A. 运行内核模块的 dmabuf 符号检查**（用 L-10 留档的 uburma.ko 或重新解压）：
+```bash
+cd /home/tools/app/l10_log
+nm uburma.ko | grep -iE "dmabuf|dma_buf" | head -20
+strings uburma.ko | grep -iE "dmabuf|dma.buf|REGISTER.*SEG" | head -20
+# ubcore 也查（导入逻辑可能在 ubcore 层）：
+find /lib/modules/$(uname -r) -name "ubcore.ko*" -exec sh -c 'xz -dk {} 2>/dev/null || zstd -d {} 2>/dev/null || cp {} .' \;
+nm ubcore.ko 2>/dev/null | grep -iE "dmabuf|dma_buf" | head -20
+strings ubcore.ko | grep -iE "dmabuf|dma.buf" | head -20
+# 顺带查 GPU peer-memory 框架是否在：
+nm uburma.ko ubcore.ko 2>/dev/null | grep -iE "gpu_p2p|peer_mem|npu" | head -20
+```
+
+**B. CANN 侧导出能力**（dmabuf fd 的源头）：
+```bash
+nm -D /usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64/libascendcl.so \
+  | grep -iE "export|shareable|dmabuf|physical" | head -20
+# 已知候选：aclrtMemExportToShareableHandle / aclrtMallocPhysical —— 确认符号在位
+```
+
+**C. dma-buf 框架现状**：
+```bash
+ls /sys/kernel/debug/dma_buf 2>/dev/null || ls /sys/kernel/dma_buf 2>/dev/null
+grep -i dma_buf /proc/kallsyms | head -5     # 内核 dma-buf 框架符号
+```
+
+**判定与回传**：
+- A 项命中（运行内核有 dmabuf 导入符号）→ 回传符号清单，外部走「用户态
+  实现」路线（Phase 2 批级）
+- A 项全空 → 内核需开发 dmabuf 导入（或评估其他路线），回传后外部出
+  立项材料
+- 全部输出整理成文本交用户带回，注明「批次 P2-0 完毕」
+
 ### 指令 2026-09-22 #33：批次 L-15（Phase 1 稳健性复测，精简版）
 
 **背景**：L-14 npu-staged 首测通过（单次）。本批用 5~6 组参数复测，确认
