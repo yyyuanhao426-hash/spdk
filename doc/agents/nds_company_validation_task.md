@@ -245,6 +245,29 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-22 #P22（批次 P2-2 回执，用户带回）
+
+**判定：兼容性不成立——但性质是"源码/内核头版本错配"，非 ABI 差异。**
+c12ec44 源码无法对 133 kernel-devel 编译：① 缺 include/ub/urma/ubcore_perf.h
+（仓库与内核头树都没有）；② 133 内核 ummu 无 ummu_sva_matt_map_phys_sg/
+unmap_phys_sg（GDR 物理 SG 映射 API，CONFIG_UMMU_MATT_PHYS_SG 门控）；③
+安装的 udma_abi.h 比 c12ec44 源码旧（struct udma_create_ctx_resp 缺 3 成员）。
+
+**推论（关键）**：运行内核的 ub 驱动源是华为内部版本（与 c12ec44/OLK-6.6
+主线都不一致且不可公开获得）→ **即使源码可编译，光换装 udma.ko 也不够，
+还需 ummu/头版本同步升级（整机内核变更）**。Phase 2 直连路线被
+「运行内核驱动源不可得」阻塞。
+
+**外部路线决策**：
+1. 桥接模块**不依赖 ub 源码树**（只需 hal 签名 + 自备 nv-p2p.h + 自定义
+   ops 结构）→ **立即可离线开发构建**。外部已写出完整模块
+   （urma_driver npu_bridge/ 24a1014，322 行：64KB 物理连续性分组校验、
+   hal 调用、nv-p2p 布局合成）
+2. 硬缺口只剩「运行 udma.ko 的 gpu_p2p 框架」→ 解锁途径 = 向
+   同事A/平台索取 133 内核 ub 驱动源码（或带 GDR/ENABLE=1 的驱动构建）
+   ——**用户协调项， lead time 长，建议立即启动**
+3. 下批 P2-3：桥接模块在 133 上离线编译验证（不装载）
+
 ### 回执导入 2026-09-22 #P21（批次 P2-1 回执，用户带回）
 
 **判定项 1（重大分叉）：133 运行 udma.ko 无 gpu_p2p 框架**——nm/readelf/
@@ -676,6 +699,219 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-22 #37：批次 P2-3（NPU 桥接模块离线构建验证，不装载）
+
+**背景**：P2-2 确认 udma.ko 无法从公开源码对 133 内核编译（真根因 =
+运行内核 ub 驱动源不可得），直连路线的解锁依赖向同事A/平台索取驱动源码
+（用户协调中， lead time 长）。**桥接模块本身不依赖 ub 源码树**，外部已
+写好完整实现（urma_driver npu_bridge/ 24a1014）。本批在 133 上离线编译
+验证该模块（**不装载**），使桥接侧全部就绪，等 udma.ko 框架解锁即可联调。
+
+**A. 创建模块目录与文件（3 个文件，内容如下，atomgit 无此目录需手工创建；
+nv-p2p.h 复用 P2-2 的 /home/tools/app/p22_nv/nv-p2p.h）**：
+
+```bash
+mkdir -p /home/tools/app/npu_bridge
+```
+
+**A1. /home/tools/app/npu_bridge/udma_gpu_p2p_ops.h**：
+```c
+#ifndef _UDMA_GPU_P2P_OPS_H_
+#define _UDMA_GPU_P2P_OPS_H_
+#include <linux/types.h>
+#include <linux/module.h>
+#include "nv-p2p.h"
+
+struct udma_gpu_p2p_ops {
+	int (*get_pages)(uint64_t gpu_va, uint64_t length,
+			 struct nvidia_p2p_page_table **page_table,
+			 void (*free_callback)(void *data), void *data);
+	int (*put_pages)(uint64_t gpu_va, struct nvidia_p2p_page_table *page_table);
+	int (*free_page_table)(struct nvidia_p2p_page_table *page_table);
+	struct module *owner;
+};
+
+int udma_register_gpu_p2p_ops(const struct udma_gpu_p2p_ops *ops);
+void udma_unregister_gpu_p2p_ops(const struct udma_gpu_p2p_ops *ops);
+
+#endif
+```
+
+**A2. /home/tools/app/npu_bridge/udma_npu_bridge.c**：
+```c
+// SPDX-License-Identifier: GPL-2.0
+/* NPU HBM peer-memory bridge for udma.ko gpu_p2p framework.
+ * get_pages pins Ascend HBM via hal_kernel_p2p_get_pages (asdrv_svm, GPL)
+ * and groups the 4KB hal pages into 64KB physically-contiguous chunks
+ * (udma core contract: page_size==NVIDIA_P2P_PAGE_SIZE_64KB). */
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/errno.h>
+#include <linux/string.h>
+#include "nv-p2p.h"
+#include "udma_gpu_p2p_ops.h"
+
+struct hal_p2p_page_info { u64 pa; u64 reserved[4]; };
+struct hal_p2p_page_table {
+	u32 version; u64 page_size;
+	struct hal_p2p_page_info *pages_info;
+	u64 page_num; u64 reserved[4];
+};
+extern int hal_kernel_p2p_get_pages(u64 va, u64 len,
+		void (*free_callback)(void *), void *data,
+		struct hal_p2p_page_table **pt);
+extern int hal_kernel_p2p_put_pages(struct hal_p2p_page_table *pt);
+
+#define NPU_PAGE_SHIFT		12
+#define NPU_PAGE_SIZE		(1u << NPU_PAGE_SHIFT)
+#define BRIDGE_PAGE_SHIFT	16
+#define BRIDGE_PAGE_SIZE	(1u << BRIDGE_PAGE_SHIFT)
+#define BRIDGE_PAGES_PER	(BRIDGE_PAGE_SIZE >> NPU_PAGE_SHIFT)
+
+struct npu_bridge_state {
+	struct hal_p2p_page_table *hal_pt;
+	u64 va; u64 len;
+};
+
+static int npu_get_pages(uint64_t va, uint64_t len,
+		struct nvidia_p2p_page_table **page_table,
+		void (*free_callback)(void *), void *data)
+{
+	struct hal_p2p_page_table *hal_pt = NULL;
+	struct nvidia_p2p_page_table *pt = NULL;
+	struct nvidia_p2p_page **pages = NULL;
+	struct npu_bridge_state *st = NULL;
+	u64 npu_page_size, n, i, j;
+	int ret;
+
+	if (!page_table || !len || (va & (NPU_PAGE_SIZE - 1)) ||
+	    (len & (BRIDGE_PAGE_SIZE - 1)))
+		return -EINVAL;
+
+	ret = hal_kernel_p2p_get_pages(va, len, free_callback, data, &hal_pt);
+	if (ret)
+		return ret;
+	npu_page_size = hal_pt->page_size ? hal_pt->page_size : NPU_PAGE_SIZE;
+	if (npu_page_size != NPU_PAGE_SIZE) {
+		ret = -EINVAL; goto err_hal;
+	}
+	n = len >> BRIDGE_PAGE_SHIFT;
+	if (!hal_pt->pages_info || hal_pt->page_num < n * BRIDGE_PAGES_PER) {
+		ret = -EINVAL; goto err_hal;
+	}
+	pt = kzalloc(sizeof(*pt), GFP_KERNEL);
+	pages = kcalloc(n, sizeof(*pages), GFP_KERNEL);
+	if (!pt || !pages) { ret = -ENOMEM; goto err_alloc; }
+	for (i = 0; i < n; i++) {
+		struct nvidia_p2p_page *pg = kzalloc(sizeof(*pg), GFP_KERNEL);
+		u64 base = hal_pt->pages_info[i * BRIDGE_PAGES_PER].pa;
+		if (!pg) { ret = -ENOMEM; goto err_alloc; }
+		for (j = 0; j < BRIDGE_PAGES_PER; j++) {
+			if (hal_pt->pages_info[i * BRIDGE_PAGES_PER + j].pa !=
+			    base + ((u64)j << NPU_PAGE_SHIFT)) {
+				pr_err("npu_bridge: 64KB chunk %llu not contiguous\n", i);
+				kfree(pg); ret = -EINVAL; goto err_alloc;
+			}
+		}
+		pg->physical_address = base;
+		pg->valid = 1;
+		pages[i] = pg;
+	}
+	st = kzalloc(sizeof(*st), GFP_KERNEL);
+	if (!st) { ret = -ENOMEM; goto err_alloc; }
+	st->hal_pt = hal_pt; st->va = va; st->len = len;
+	pt->version = 0;
+	pt->page_size = NVIDIA_P2P_PAGE_SIZE_64KB;
+	pt->entries = n; pt->pages = pages;
+	pt->callback = free_callback; pt->data = data;
+	*page_table = pt;
+	return 0;
+err_alloc:
+	if (pages) { for (i = 0; i < n; i++) kfree(pages[i]); kfree(pages); }
+	kfree(pt);
+err_hal:
+	hal_kernel_p2p_put_pages(hal_pt);
+	return ret;
+}
+
+static int npu_release(struct nvidia_p2p_page_table *pt, int put_hal)
+{
+	struct npu_bridge_state *st;
+	u64 i;
+	if (!pt) return -EINVAL;
+	st = pt->data;
+	if (st && st->hal_pt && put_hal)
+		hal_kernel_p2p_put_pages(st->hal_pt);
+	if (pt->pages) {
+		for (i = 0; i < pt->entries; i++) kfree(pt->pages[i]);
+		kfree(pt->pages);
+	}
+	kfree(st); kfree(pt);
+	return 0;
+}
+static int npu_put_pages(uint64_t va, struct nvidia_p2p_page_table *pt)
+{ return npu_release(pt, 1); }
+static int npu_free_page_table(struct nvidia_p2p_page_table *pt)
+{ return npu_release(pt, 0); }
+
+static const struct udma_gpu_p2p_ops npu_ops = {
+	.get_pages = npu_get_pages,
+	.put_pages = npu_put_pages,
+	.free_page_table = npu_free_page_table,
+	.owner = THIS_MODULE,
+};
+
+static int __init npu_bridge_init(void)
+{
+	int ret = udma_register_gpu_p2p_ops(&npu_ops);
+	if (ret == -EBUSY)
+		pr_err("npu_bridge: provider already registered\n");
+	else if (ret)
+		pr_err("npu_bridge: register failed ret=%d (udma gpu_p2p "
+		       "framework present?)\n", ret);
+	else
+		pr_info("npu_bridge: NPU HBM provider registered\n");
+	return ret;
+}
+static void __exit npu_bridge_exit(void)
+{
+	udma_unregister_gpu_p2p_ops(&npu_ops);
+	pr_info("npu_bridge: unregistered\n");
+}
+module_init(npu_bridge_init);
+module_exit(npu_bridge_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Ascend NPU HBM peer-memory bridge for udma gpu_p2p");
+```
+
+**A3. /home/tools/app/npu_bridge/Makefile**：
+```make
+obj-m := udma_npu_bridge.o
+KDIR ?= /lib/modules/$(shell uname -r)/build
+ccflags-y += -I$(src) -I/home/tools/app/p22_nv
+all:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+```
+
+**B. 离线编译（不装载）**：
+```bash
+cd /home/tools/app/npu_bridge && make 2>&1 | tail -15
+# 预期产物 udma_npu_bridge.ko。MODPOST 若报
+#   "no symbol version for hal_kernel_p2p_get_pages"
+# 则创建 /home/tools/app/p23_nv/Module.symvers（crc 先填 0，装载期再取真值）：
+#   printf '0x00000000\thal_kernel_p2p_get_pages\t\tasdrv_svm\n0x00000000\thal_kernel_p2p_put_pages\t\tasdrv_svm\n' > /home/tools/app/p23_nv/Module.symvers
+#   并在 make 命令追加 KBUILD_EXTRA_SYMBOLS=/home/tools/app/p23_nv/Module.symvers
+# 产物核验：
+nm udma_npu_bridge.ko | grep -E "npu_get_pages|npu_ops|register_gpu_p2p" | head
+# 预期：npu_* 为本地 T；udma_register_gpu_p2p_ops 为 U（未解析=正常，它属于未来的 ENABLE=1 udma.ko）
+modinfo -F vermagic udma_npu_bridge.ko    # 应与运行内核一致
+```
+
+**回传**：编译输出 + nm 核验 + vermagic，注明「批次 P2-3 完毕」。模块编译
+通过 = 桥接侧全部就绪（装载等 udma.ko 框架解锁 + 管理员窗口）。
 
 ### 指令 2026-09-22 #36：批次 P2-2（udma.ko 兼容构建试验，零机器风险）
 
