@@ -245,6 +245,24 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-09-22 #L10（批次 L-10 回执，用户带回）
+
+**核心交付达成：运行内核 uburma 的完整 query-dev-attr spec 表已反汇编提取
+（50 条，type/field_size/array 全解码），逐 type 试错终结。**
+
+- A：160 修复有效（156/159/160 全部归零）→ query 前进到 **type 163
+  （MAX_NETADDR_CN，内核 spec 1B vs gds 4B）**
+- B：uburma.ko.xz 解压（not stripped）→ `uburma_query_device_fill_spec_out`
+  @0x3318-0x3738 反汇编全文存档（l10_log/query_spec.dis）→ 解码出完整
+  spec 表。关键结论：**内核 type = 用户 type + 0x100**（4 个 dmesg 实证
+  吻合）；port_attr 数组条目 el_num=8/el_size=20（与 gds 的
+  MAX_PORT_CNT=8、元素 20B 完全一致）；**尾部枚举错位：内核无 TP_FEATURE，
+  其 177 = PRIORITY_INFO(128B)**
+- C/D 未触发（query 未全通）
+- 外部已据此出**最终批量 patch**（umdk aa9f10a）：163 用 1B 中转、164 用
+  4B 中转、删 TP_FEATURE 并将 PRIORITY_INFO 改按内核编号 177 发送。
+  逐项核对后 gds 与内核 spec 的全部差异仅此三处，165-169 天然匹配
+
 ### 回执导入 2026-09-21 #L9（批次 L-9 回执，用户带回）
 
 - A：159 修复有效（dmesg type 159 消失）→ query 前进到 **type 160
@@ -498,6 +516,67 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-22 #29：批次 L-11（最终 TLV patch + 冲刺全链路）
+
+**背景**：spec 表已提取，外部已出**最终批量 patch**（umdk aa9f10a）——
+经逐项核对，gds 与运行内核 spec 的全部差异仅 3 处（163/164/尾部），修完
+query 应全通。本批：应用 patch → **一口气走完 query→create→import 判定**，
+import 通则当场打全链路首测。
+
+**A. 应用最终 patch（3 处手工编辑，均在 urma_cmd_tlv.c 的
+urma_ioctl_query_dev_attr 内）**：
+```bash
+cd /home/tools/app/umdk
+# 1) MAX_NETADDR_CN 的 ATTR 行前加：
+#      uint8_t max_netaddr_cnt_1b = (uint8_t)arg->out.attr.dev_cap.max_netaddr_cnt;
+#    ATTR 行第三参改为 max_netaddr_cnt_1b
+# 2) PORT_CNT 的 ATTR 行前加：
+#      uint32_t port_cnt_4b = arg->out.attr.dev_cap.port_cnt;
+#    ATTR 行第三参改为 port_cnt_4b
+# 3) 尾部：整行删除 ATTR(a++, QUERY_DEVICE_OUT_DEV_CAP_TP_FEATURE, ...)，
+#    并把 PRIORITY_INFO 的 ATTR 行改为：
+#      ATTR(a++, 177, arg->out.attr.dev_cap.priority_info);
+#    （内核枚举无 TP_FEATURE，其 177 = PRIORITY_INFO 128B——这是 spec 表实锤）
+# 4) 末尾拷回块（if (ret == 0) { ... }）补两行：
+#      arg->out.attr.dev_cap.max_netaddr_cnt = max_netaddr_cnt_1b;
+#      arg->out.attr.dev_cap.port_cnt = (uint8_t)port_cnt_4b;
+# 重编 UMDK（cmake -S src ...）+ provider 目录确认
+```
+
+**B. gds 全栈复测（udma7+udma3），按结果走条件链**：
+```bash
+# B1. query：应全通（若仍报不匹配 type，dmesg 原样带回——外部兜底）
+# B2. query 过 → create jetty（预期 priority=15 正常）
+# B3. create 过 → import jetty：
+#     - 通过 → **回环建链打通，立即进 C**
+#     - 仍 Failed（预期可能报 get tp list ret=-2）→ dmesg 抓
+#       "tp list/primary eid/ctrlq" 全文带回——单机建链被管理面阻断实锤，
+#       本批到此为止（urma_admin dev expose 验证留待下批，需外部批准）
+```
+
+**C.【仅当 import 通过】全链路首测**：
+```bash
+# c1. sysctl -w vm.nr_hugepages=2048（跑前记录基线，跑后归零）
+# c2. head -c 16G /home/tools/app/loop.img
+# c3. nvmf_tgt + RPC：bdev_aio_create /home/tools/app/loop.img aio0 512 +
+#     URMA transport + listen（traddr=141.61.133.123, trsvcid=4420,
+#     subnqn=nqn.2026-01.io.spdk:urma-gpu-test），RPC 流程参考
+#     target_nvme_takeover.sh（盘接管部分不用）
+# c4. cpu 回归：
+#     LD_LIBRARY_PATH=/home/tools/app/umdk/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64 \
+#     SPDK_URMA_MAX_IO_SIZE=4194304 \
+#     ./build/examples/urma_perf \
+#       -r 'trtype:URMA adrfam:IPv4 traddr:141.61.133.123 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
+#       -M cpu -t 5
+#     （重点：LOC_ACCESS_ERR 是否复现）
+# c5. 通过 → npu-staged 首测：npu-smi 选 OK 卡（0/1/2），同命令换
+#     -M npu-staged -g <空闲OK卡号>（重点：507033 是否复现）
+# c6. 恢复：kill nvmf_tgt、删 loop.img、大页归零
+```
+
+**回传**：全部输出整理成文本交用户带回，注明「批次 L-11 完毕」+ 判定链
+（query/create/import 各步结果；若进 C：cpu 回归与 npu-staged 结果）。
 
 ### 指令 2026-09-21 #28：批次 L-10（160 修复 + uburma.ko spec 表提取 + 冲刺全链）
 
