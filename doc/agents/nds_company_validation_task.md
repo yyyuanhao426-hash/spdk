@@ -723,12 +723,37 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ### 指令 2026-09-22 #38：批次 P2-4（libhcomm/HBM 注册机制运行时验证）
 
-**背景（外部源码分析结论）**：memfabric 的 HBM 直连机制链 =
-memfabric(用户态编排) → devmm ioctl(VA→PA 翻译) → **libhcomm.so
-(HcommMemReg——HBM 注册给 URMA DMA 的黑盒，dlopen 使用)** → 内核。
-memfabric 的 dl_hcomm_api.h 完整记录了 libhcomm 的 API 签名。**如果
-libhcomm 在 133 的 CANN/HCCL 包里且可用，Phase 2 直连可以基于它实现
-（SPDK provider 复用其注册能力），无需华为提供驱动源码。**
+**背景介绍（先读这段，否则本批看不懂）**：
+
+Phase 1 已收官（npu-staged 中转路线全链路通过）。Phase 2 的目标是直连路线
+`-M npu`：让 NPU HBM 直接注册给 URMA 设备做 DMA，省掉 host 中转拷贝。
+
+此前方案（自研内核桥接模块 udma_npu_bridge.ko）已**受阻**：它需要
+udma.ko 里的 gpu_p2p 注册框架，而 133 运行的 udma.ko 编译时未启用该框架
+（编译开关 UDMA_GPU_P2P_ENABLE=0，因打包机器缺 nv-p2p.h 自动降级）；
+重新编译 udma.ko 又需要华为内部版本的驱动源码（公开仓 c12ec44 与 133
+内核头版本错配，P2-2 已验证编译不过）。
+
+**新线索 = memfabric_hybrid**：华为官方开源项目（MulanPSL2，atomgit
+TongX123/memfabric_hybrid，PyPI 也有包），定位是"DRAM&HBM 混合池化 +
+跨机内存直接访问"，是 vLLM-ascend 的 KV pool 后端。**关键：它在 133 同款
+的 URMA 栈上实现了 HBM 直接访问**——本批要验证的正是它的机制能否被
+NDS 复用。其机制链（外部已读源码确认）：
+
+```
+memfabric 用户态（HBM 注册请求，REG_MR_FLAG_HBM 标志）
+  → devmm ioctl（/dev/davinci_manager，VA→PA 翻译，纯用户态）
+  → libhcomm.so（HcommMemReg——把 HBM 注册给 URMA DMA 的实现方，
+    dlopen 使用，API 签名完整记录在 memfabric 的 dl_hcomm_api.h）
+  → 内核（具体内核接口未知，本批用 strace 揭晓）
+```
+
+若 libhcomm 在 133 的 CANN 包里且可用，SPDK 的 NPU provider 可复用它
+注册 HBM——直连路线不需要华为提供驱动源码，也不需要装卸内核模块。
+（参考：memfabric_hybrid 源码可从 atomgit TongX123/memfabric_hybrid
+克隆，或 pip install memfabric-hybrid。）
+
+**验证任务（三步，如下）**：
 
 **A. libhcomm 在位检查**：
 ```bash
