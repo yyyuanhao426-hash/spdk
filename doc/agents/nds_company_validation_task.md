@@ -721,6 +721,53 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-22 #38：批次 P2-4（libhcomm/HBM 注册机制运行时验证）
+
+**背景（外部源码分析结论）**：memfabric 的 HBM 直连机制链 =
+memfabric(用户态编排) → devmm ioctl(VA→PA 翻译) → **libhcomm.so
+(HcommMemReg——HBM 注册给 URMA DMA 的黑盒，dlopen 使用)** → 内核。
+memfabric 的 dl_hcomm_api.h 完整记录了 libhcomm 的 API 签名。**如果
+libhcomm 在 133 的 CANN/HCCL 包里且可用，Phase 2 直连可以基于它实现
+（SPDK provider 复用其注册能力），无需华为提供驱动源码。**
+
+**A. libhcomm 在位检查**：
+```bash
+timeout 60 find /usr/local/Ascend -name "libhcomm*" 2>/dev/null
+find /home/tools/app/_cann_extract -name "libhcomm*" 2>/dev/null   # 若做过包解压
+ls /usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64/ | grep -iE "hcomm|hccl" | head
+# 命中则：nm -D <libhcomm.so> | grep -iE "MemReg|EndpointCreate|MemExport" | head -15
+```
+
+**B. 最小探针程序（用 memfabric 的 dl_hcomm_api.h 里的签名）**：
+```bash
+# B1. 从 memfabric 克隆取 dl_hcomm_api.h（或由用户带回的 _p2_recon 拷贝）：
+#     /home/tools/app/_mf/memfabric_hybrid/src/hybm/csrc/under_api/dl_hcomm_api.h
+# B2. 写最小程序 probe.c：dlopen libhcomm.so → 按 dl_hcomm_api 的加载顺序
+#     dlsym 全部符号（记录哪些能拿到/哪些缺失）→ 若 MemReg 可加载：
+#     EndpointCreate → 分配一段 HBM（aclrtMalloc 64KB 对齐）→ HcommMemReg
+#     （memTag=addr，mem.addr=HBM device VA，flag=HBM）→ 记录返回值
+#     → HcommMemUnreg → 收尾。全程原样输出。
+# B3. strace -f -e trace=ioctl ./probe 2>&1 | grep -vE "ENOTTY|ENOENT" | tail -60
+#     （捕获 HcommMemReg 走了哪个内核接口——davinci_manager? uburma? 新 ioctl?）
+```
+
+**C. memfabric 部署实测（B 成功后做，验证端到端）**：
+```bash
+# 优先 pip install memfabric-hybrid（PyPI 有 wheel），或源码构建：
+cd /home/tools/app && git clone --depth 1 https://atomgit.com/TongX123/memfabric_hybrid.git
+cd memfabric_hybrid && bash script/build_and_pack_run.sh 2>&1 | tail -10
+# （构建依赖 CMake≥3.12/GCC≥11.4；异常原样带回）
+# 部署后跑 examples 里的 hbm_share_memory/ShiftPutGet（HBM 注册+读写示例），
+# strace 捕获内核接口，原样带回
+```
+
+**判定与回传**：
+- libhcomm 在 133 且 MemReg 对 HBM 成功 → **Phase 2 直连路线解锁**：
+  SPDK NPU provider 基于 libhcomm 复用其注册能力（外部出实现设计）
+- libhcomm 不在或 MemReg 失败 → 原样带回报错，外部评估剩余选项
+- 全部输出（含 strace 的内核接口证据）整理成文本交用户带回，注明
+  「批次 P2-4 完毕」
+
 ### 指令 2026-09-22 #37：批次 P2-3（NPU 桥接模块离线构建验证，不装载）
 
 **背景**：P2-2 确认 udma.ko 无法从公开源码对 133 内核编译（真根因 =
