@@ -401,6 +401,29 @@ kernel 未编译安装（源码/ini/CMake 目标齐全，缺 libcann_hybm_kernel
 设备 kernel 承载（AscendC），SPDK 集成需引入设备 kernel 编译链——这是
 Phase 2 的方向决策点（三种数据面方案已呈用户）。
 
+### 回执导入 2026-09-23 #P213（批次 P2-13 回执，用户带回）—— 用户目录路径全部无效，直连在 133 定局
+
+- A ✅：customize 官方布局 + cust 镜像 + 包形态 + custom_latest 四种配置
+  全部布置到位（零系统写入）
+- B ❌：五种配置启动探针结果**完全一致**——host 链全 0（Load→GetFunction→
+  Args→Launch），SyncStream=507018；**设备侧 "open so failed" errcode=11002**
+  （.so 根本没送达设备）
+- **机制揭晓（TSD/TDT 日志）**：设备侧 .so 送达 = TSD 包机制——只认
+  $ASCEND_HOME_PATH/conf/ascend_package_load.ini + $ASCEND_HOME_PATH/opp/
+  下的包；ASCEND_CUSTOM_OPP_PATH / ASCEND_LATEST_INSTALL_PATH 均不触发
+  （5 次运行零 TSD 活动）
+- ⛔ **第二道门槛（历史日志铁证）**：2026-09-20 同场景日志显示，即便走
+  系统 ini 机制，设备侧仍以 **CMS 签名校验** 拒绝自建包（verifyFlag
+  [Huawei or Community]；"host and device checkcode compare failed"）——
+  即**系统级安装也需华为/社区签名包**
+- 现场零写入证实；自家目录保留 custom_opp/custom_latest/p213_log
+
+**外部最终判定**：**直连路线在 133（借用+保密约束）上定局——无法完成**。
+完整阻塞链：① 用户目录免安装路径不存在（TSD 只认系统 ini）；② 系统级
+安装需签名包（CMS 校验拒自建包）；③ 签名包需向华为/memfabric 社区获取；
+④ 系统级安装本身触保密红线。**机制链 9 个批次已全部验证至 kernel 启动，
+剩余为纯环境/行政问题，非技术问题。** Phase 2 直连转入结题/换环境决策。
+
 ### 回执导入 2026-09-23 #P212（批次 P2-12 回执，用户带回）
 
 **判定：官方安装路线（ini/TSD）无用户目录选项——package_path 一律相对
