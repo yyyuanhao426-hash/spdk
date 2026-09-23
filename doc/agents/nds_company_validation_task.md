@@ -330,6 +330,29 @@ dma-buf 导入路径（A 全空）→「CANN 导出 fd + URMA 内核 import」�
   函数签名（驱动头文件/反汇编）；③ page_table 布局兼容性（nv-p2p.h）；④
   模块装卸授权（需与管理员协调）
 
+### 回执导入 2026-09-23 #P25（批次 P2-5 回执，用户带回）—— 🎯 直连路线解锁
+
+**判定链全部通过：NPU 已被他人恢复 ✓ → HcommMemReg 对 HBM 注册成功 ✓ →
+内核接口取证完成 ✓。**
+
+- Gate 0：NPU 被管理方/他人修复（davinci0..7 于 22:44 创建；卡 0/1/2 OK），
+  我方零修复动作，直接进 B——与预判一致
+- **B（核心）**：探针实测——dlopen libhcomm 全符号加载 ✓ → aclInit/
+  SetDevice/Malloc HBM 全过（addr=0x120000016000）→
+  **HcommMemReg(HBM)=0（handle=0x36633900）→ HcommMemUnreg=0**
+- strace 取证（MemReg 窗口 300µs，精确框定）：**走的全是标准接口**——
+  /dev/davinci_manager（devmm VA→PA）、/dev/uburma/*（URMA_CMD，
+  magic 'U'=0x55，与 SPDK/liburma 同一通道）、/dev/ummu/tid、anon_inode:[jfce]；
+  **无任何未公开的新 ioctl/新设备** → SPDK NPU provider 存在复用 libhcomm
+  的路径（无需内核模块、无需驱动源码）
+- C：memfabric 部署成功（pip + py3.11 venv；默认 python 3.14 无 wheel 的坑
+  已绕过），HBM 实际分配发生（4123→4339MB）；但示例止步于
+  data operator init ret=-3（**DRAM 示例同样失败 → 非 HBM 特有，属
+  memfabric 自身环境配置问题**，与 libhcomm 结论无关）
+- 低可见度确认：无残留进程、大页 0、未动系统状态
+- **外部判定：Phase 2 直连解锁。下一步 P2-6 = libhcomm 深探（MemExport/
+  memDesc 内容 + 完整 URMA_CMD 序列对比），确定 SPDK 集成形态**
+
 ### 回执导入 2026-09-22 #P24（批次 P2-4 回执，用户带回）—— 部分完成（B 被 NPU 降级阻断）
 
 **✅ 最大正面信号：libhcomm.so 在 133 上且 API 完整**——
@@ -743,6 +766,44 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-23 #40：批次 P2-6（libhcomm 深探——确定 SPDK 集成形态）
+
+**背景**：P2-5 证实 libhcomm 的 HcommMemReg 可在 133 标准 URMA_CMD 通道上
+注册 HBM。**SPDK 集成的核心未知数**：hcomm 注册产生的"内存句柄/描述符"
+里是什么——若能提取出 URMA seg token/EID 等标准要素，SPDK 的 URMA 传输层
+（jetty 读写）即可直接使用；若是纯私有通道，则需两端都挂 hcomm（架构改动
+更大）。本批用升级版探针取证，全只读。
+
+**A. 探针升级（在 P2-5 探针基础上追加）**：
+```c
+// HcommMemReg 成功后追加调用：
+// A1. HcommMemExport(endpoint, handle, &memDesc, &memDescLen)
+//     → 把 memDesc 内容 hexdump 全文带回（找 EID/PA 列表/token 特征）
+// A2. HcommMemGetAllMemHandles → 原样带回
+// A3. MemReg 前后各 dump 一次 /proc/self/maps 中 HBM 段（对照）
+```
+
+**B. 完整 ioctl 序列取证**：
+```bash
+strace -f -y -ttt -e trace=ioctl ./probe2 2>&1 > p26_seq.log
+# 把 HcommMemReg + HcommMemExport 全窗口的 ioctl 序列（设备/magic/nr/长度）
+# 全文带回——与 gds liburma is_gpu_seg 注册路径（L-14 b6 时序）对比，
+# 判定 hcomm 内部是否就是 urma_register_seg（什么 flag/参数）
+```
+
+**C. 对照组（gds 路径基线）**：
+```bash
+# 用 L-14 的 urma_perf -M npu（gds liburma）重跑一次失败场景，
+# strace 同样取证 → 两边的 URMA_CMD 序列并排对比（外部做 diff）
+```
+
+**回传**：A1 memDesc hexdump / A2 输出 / B 序列 / C 对照，注明
+「批次 P2-6 完毕」。外部据此出 SPDK 集成设计（批级实现计划）。
+
+**另**：memfabric data operator ret=-3 属 memfabric 自身环境配置问题
+（DRAM 示例同样失败），与直连路线无关；测试 agent 建议的排查
+（传输类型/交换空间环境变量/DEVICE_SDMA 对照）留待有需要时再做。
 
 ### 指令 2026-09-22 #39（修订）：批次 P2-5（NPU 状态复测 + MemReg 取证补测 + memfabric 实测）
 
