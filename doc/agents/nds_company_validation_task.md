@@ -330,6 +330,25 @@ dma-buf 导入路径（A 全空）→「CANN 导出 fd + URMA 内核 import」�
   函数签名（驱动头文件/反汇编）；③ page_table 布局兼容性（nv-p2p.h）；④
   模块装卸授权（需与管理员协调）
 
+### 回执导入 2026-09-23 #P27（批次 P2-7 回执，用户带回）—— 🎯 non_pin=1 注册成功，SPDK 形态确定
+
+**双进程实验三问全答：**
+
+| 问题 | 结果 |
+|------|------|
+| ① CASM 导入成功否 | ✅ HcommMemImport=0，outMem type=0(DEVICE_HBM) addr=0x120000016000 size=65536 |
+| ② 导入映射数据访问 | ❌ CPU 读 = SIGSEGV；aclrtMemcpy = 107000——**导入 VA 属设备 VA 空间，CPU/ACL 常规通路不可访问（正常属性非缺陷）**；对照组证明非 target ACL 坏（自建 HBM 读写 MATCH） |
+| ③ 能否 URMA 标准注册 | 默认 flag ✗；**non_pin=1 → 注册成功**（tseg=0x21767230）|
+
+**关键附带发现**：target 侧 aclrtMalloc 返回的 device VA 与导入 VA **完全相同**（0x120000016000）——HBM device VA 是全局 SVM 空间语义，导入与本地分配会同址 → 数据通路必须走 URMA 设备侧（jetty），不能走 CPU/aclrtMemcpy。
+
+**外部判定（直连形态收敛）**：
+1. **最简直连候选（新）**：SPDK NPU provider 不走 is_gpu_seg/gds 路径，改用 **urma_register_seg(non_pin=1) 直接注册 HBM device VA**——P2-7 已证明该注册在 133 内核上可行。若 URMA jetty DMA 能正确读写该段，则 **无需 hcomm/无需桥接模块/无需驱动源码**，SPDK 侧改动仅为注册 flag。
+2. hcomm/CASM 导入路线降级为备选（用于跨进程 HBM 共享场景）。
+3. 待验证 = non_pin 注册段的 jetty DMA 正确性（P2-8 双进程 URMA 读写回环）。
+
+测试 agent 三问回复：① non_pin=1 为必需（导入映射无结构页可 pin）；is_gpu_seg/user_iova/token 在新形态下均不需要（实证 non_pin 单独成功）；② 数据一致性权威验证 = 真实 URMA jetty 读写回环（P2-8 执行）；③ 同址冲突确认——新形态下 target 侧不做本地 aclrtMalloc（HBM 仅 initiator 持有），无冲突。
+
 ### 回执导入 2026-09-23 #P26（批次 P2-6 回执，用户带回）—— 🔬 机制黑盒完全打开
 
 **一句话：hcomm 的 HBM 注册走的根本不是 URMA seg 注册，而是
@@ -798,6 +817,50 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-23 #42：批次 P2-8（non_pin 注册 HBM 的 URMA 读写回环——直连最终判决实验）
+
+**背景**：P2-7 证明 HBM device VA 可被 `urma_register_seg(non_pin=1)` 注册
+成功（imported VA 实证；自有 aclrtMalloc VA 同为 SVM 空间语义，预期同样
+可行）。**最后一个未知数 = non_pin 注册段上的 URMA jetty DMA 是否数据
+正确**。本批双进程读写回环实验给出最终判决：
+- 数据正确 → **直连路线确认，SPDK NPU provider 改动仅为注册 flag
+  （non_pin=1，替代 is_gpu_seg），无需 hcomm/桥接/驱动源码**
+- 数据错误或 IO 失败 → non_pin 段不可 DMA，回退 hcomm/CASM 导入架构
+
+**参考实现**：probe 的 jetty/TP/读写流程照抄 urma_perftest 源码
+（/home/tools/app/umdk/src/urma/tools/urma_perftest/——TCP 交换 jetty
+描述 + urma_import_jetty + post URMA READ/WRITE 的既有代码可直接裁剪）。
+
+**A. 单进程快验（先行）**：
+```c
+// aclrtMalloc HBM 64KB → urma ctx(udma3) → urma_register_seg(HBM VA,
+// non_pin=1) → 是否成功？（P2-7 只测过 imported VA，自有 VA 预期一致）
+```
+
+**B. 双进程读写回环（核心判决）**：
+```text
+P1（initiator，udma3）：
+  aclrtMalloc HBM 64KB → aclrtMemcpy H2D 写入已知 pattern（0xA5+偏移）
+  → urma ctx → urma_register_seg(HBM VA, non_pin=1)
+  → create jetty → TCP server 交换 jetty/段描述
+P2（target，udma7）：
+  host 缓冲 64KB → urma ctx → 注册 host 缓冲（默认 flag）
+  → TCP client → urma_import_jetty(P1 jetty)
+  → post URMA READ：把 P1 的 HBM 段读到 P2 host 缓冲
+  → 逐字节对比 pattern → 再 post URMA WRITE（把另一 pattern 写入 HBM 段）
+  → P1 侧 aclrtMemcpy D2H 读回验证
+```
+
+**C. 判定与回传**：
+```text
+READ 数据一致 + WRITE 后 P1 读回一致 → **直连路线确认 🎯**
+（外部立即出 SPDK provider 修改：non_pin 注册 + 重编 + 全链路首测）
+任一环节失败 → 原样带回（错误码/dmesg/数据 dump），外部评估
+hcomm 导入架构 fallback
+```
+
+**回传**：A/B 全输出 + 判定，注明「批次 P2-8 完毕」。
 
 ### 指令 2026-09-23 #41：批次 P2-7（CASM 导入实验——确定 SPDK 数据通路形态）
 
