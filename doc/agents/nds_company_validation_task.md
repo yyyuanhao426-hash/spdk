@@ -330,6 +330,34 @@ dma-buf 导入路径（A 全空）→「CANN 导出 fd + URMA 内核 import」�
   函数签名（驱动头文件/反汇编）；③ page_table 布局兼容性（nv-p2p.h）；④
   模块装卸授权（需与管理员协调）
 
+### 回执导入 2026-09-23 #P28（批次 P2-8 回执，用户带回）—— 最简直连路线最终判决：❌ 不成立
+
+**判定：non_pin 注册 HBM 段可注册成功，但不能作为 URMA 单边 READ/WRITE 的
+DMA 目标——「标准 URMA jetty 直接读写 non_pin HBM」路线否决（证据充分，
+三组对照排除探针自身问题），按预案回退 hcomm/CASM 导入架构。**
+
+- A ✅：自有 HBM VA（aclrtMalloc）与 P2-7 imported VA 行为一致——non_pin=1
+  是唯一决定性 flag（default/is_gpu=1 单独均失败；non_pin+is_gpu 亦成功）
+- B ❌：CTP 解锁 import_jetty 后（平台 UB 传输必须 CTP，RTP 在内核
+  get_tp_list 即失败——重要平台特性），READ/WRITE 提交成功但：
+  - 跨设备（udma3↔udma7）：cr.status=4 = URMA_CR_LOC_ACCESS_ERR（两 EID
+    子网前缀不同 …0600 vs …7f0200）
+  - 同设备（udma3↔udma3）：无 CQE 超时 + "Completion event for bogus jfcn"
+- 对照组三连（排除探针问题）：① stock urma_sample 同设备 CTP 完全跑通；
+  ② 自研探针 host→host 同设备全通；③ host→host 跨设备同样
+  LOC_ACCESS_ERR（与缓冲区类型无关）
+- **根因认知（与 P2-7 发现互证）**：HBM device VA 是进程内 SVM 语义，
+  不是 fabric 级可寻址地址——这正是 hcomm 要走 CASM 生成共享 key 而非
+  裸 VA 注册的原因
+- **重要副产品**：本平台 URMA jetty 通路必须 tp_type=CTP（含既有 SPDK
+  URMA transport 需确认 tp_type 设置）
+
+**外部决策**：Phase 2 直连架构定型为 **hcomm/CASM 数据路径**（SPDK 控制
+面 + hcomm 通道搬 HBM 数据）。P2-2 发现的 memfabric data operator ret=-3
+根因已本地定位：其 swap memory 分配带 **MEM_PAGE_HUGE** flag，而 133
+HugePages_Total=0 → 分配必败。下批 P2-9：大页修复 → memfabric 复测 →
+hcomm 双进程通道实验（HBM 数据搬运判决）。
+
 ### 回执导入 2026-09-23 #P27（批次 P2-7 回执，用户带回）—— 🎯 non_pin=1 注册成功，SPDK 形态确定
 
 **双进程实验三问全答：**
@@ -817,6 +845,43 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-23 #43：批次 P2-9（大页修复 + memfabric 复测 + hcomm 通道判决）
+
+**背景**：① P2-8 最终判决：标准 URMA jetty 不能 DMA non_pin HBM 段（HBM
+device VA 是进程内 SVM 语义）→ 直连架构定型 = **hcomm/CASM 数据路径**
+（SPDK 控制面 + hcomm 通道搬 HBM 数据）。② memfabric data operator
+ret=-3 根因已本地定位：其 swap memory 分配带 MEM_PAGE_HUGE flag，133
+大页=0 必败。
+
+**A. 大页修复并复测 memfabric**：
+```bash
+grep -i huge /proc/meminfo                      # 基线（0）
+sysctl -w vm.nr_hugepages=1024                  # 2GB 大页（memfabric swap 默认
+                                                # 大小若更大按需调整，跑完还原）
+# 重跑 memfabric 示例（py3.11 venv 环境）：
+#   先 DRAM 池示例（01_single_device_dram_pool）——预期 data operator init
+#   通过（L-12 时 DRAM 示例同样 -3，此为根因验证）
+#   再 HBM 池示例（03_single_device_hbm_pool）——HBM 池化+访问端到端
+```
+
+**B. hcomm 双进程通道实验（SPDK 集成的数据路径判决）**：
+```text
+参照 memfabric examples/hbm_share_memory/ShiftPutGet 的通道用法：
+P1（initiator）：aclrtMalloc HBM 64KB → 写 pattern → HcommMemReg →
+  HcommMemExport（memDesc 存文件）→ EndpointCreate + ChannelCreate → 存活
+P2（target）：读 memDesc → HcommMemImport → EndpointCreate + ChannelCreate
+  + Connect(P1) → Hcomm 通道 READ（把 P1 的 HBM 数据拉到 P2 host 缓冲）
+  → 逐字节比对 pattern → Hcomm 通道 WRITE（另一 pattern 写入 HBM）
+  → P1 aclrtMemcpy D2H 读回验证
+判定：双向数据一致 = **hcomm 数据路径可用，Phase 2 直连架构确认 🎯**
+（SPDK 集成设计随后出：NPU provider 挂 hcomm，数据面走 hcomm 通道）
+```
+
+**C. 恢复现场**：kill 全部进程、删 loop/共享文件、大页归零。
+
+**回传**：A 项 memfabric 前后对比 + B 项双向数据判定，注明
+「批次 P2-9 完毕」。
 
 ### 指令 2026-09-23 #42：批次 P2-8（non_pin 注册 HBM 的 URMA 读写回环——直连最终判决实验）
 
