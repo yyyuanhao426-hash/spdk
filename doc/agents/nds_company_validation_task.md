@@ -401,6 +401,31 @@ kernel 未编译安装（源码/ini/CMake 目标齐全，缺 libcann_hybm_kernel
 设备 kernel 承载（AscendC），SPDK 集成需引入设备 kernel 编译链——这是
 Phase 2 的方向决策点（三种数据面方案已呈用户）。
 
+### 回执导入 2026-09-23 #P212（批次 P2-12 回执，用户带回）
+
+**判定：官方安装路线（ini/TSD）无用户目录选项——package_path 一律相对
+${install_path}（/usr/local/Ascend/latest），ini 必须落在系统 conf/。
+但发现用户侧加载杠杆：ASCEND_CUSTOM_OPP_PATH（CANN 官方自定义算子
+vendor 树，用户可定义目录，被 libge_runner/libregister/libmmpa 消费）。**
+
+- A ✓ 官方安装脚本逆向：写 4 项（opp/vendors/cust/ 下包体+json+版本、
+  conf/ascend_package_load.ini 追加 5 行块，幂等、--uninstall 可还原）；
+  权限 440/750；无任何用户目录选项
+- B ✓ ini 语义：11 条现有条目 package_path 全相对路径；消费者 =
+  libtsdclient.so（唯一引用者）；环境变量 ASCEND_LATEST_INSTALL_PATH /
+  ASCEND_AICPU_PATH 等；**ASCEND_CUSTOM_OPP_PATH 为用户侧路径变量**
+- C ✓ CANN 自带 AICPU hcomm 包在位（aicpu_hcomm.tar.gz 7.7MB +
+  cann-hcomm-compat.tar.gz 3.8MB，均为加密 .run 不可直接提取）；
+  memfabric 树内无未加密同内容
+- D ✓ 关键不确定性：HYBM 设备 kernel 打的是 AICPU compat 包（经 ini/TSD
+  加载）而非自定义算子——ASCEND_CUSTOM_OPP_PATH/TsdFileLoad 能否承载
+  HYBM 包未验证，需一次写权限实验（用户目录内，非系统目录）
+
+**外部决策**：P2-13 = **ASCEND_CUSTOM_OPP_PATH 用户目录加载实验**——
+env 指向用户目录 + 官方 customize 布局放置 HYBM kernel + 重跑启动探针，
+看 AICPU 侧 hcomm weak 符号是否解析（507018 是否消失）。全程零系统
+写入（env 为进程局部 + 文件在自家目录），红线内。
+
 ### 回执导入 2026-09-23 #P211（批次 P2-11 回执，用户带回）—— 机制链全通，最后一步触红线停手
 
 - **A ✅：memfabric 修复验证通过**——env 逃生门
