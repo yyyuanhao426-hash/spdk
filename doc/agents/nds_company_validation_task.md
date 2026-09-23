@@ -358,6 +358,27 @@ DMA 目标——「标准 URMA jetty 直接读写 non_pin HBM」路线否决（�
 HugePages_Total=0 → 分配必败。下批 P2-9：大页修复 → memfabric 复测 →
 hcomm 双进程通道实验（HBM 数据搬运判决）。
 
+### 回执导入 2026-09-23 #P210（批次 P2-10 回执，用户带回）—— 两项定性完成
+
+**A ✅（决定性）：memfabric ret=-3 根因锁定 = halMemAlloc 不支持
+MEM_PAGE_HUGE flag**。flag 矩阵实证：MEM_PAGE_HUGE（bit17）无论尺寸
+（128MB/16MB）、类型（DDR/HBM）一律返回 0xFFFE=DRV_ERROR_NOT_SUPPORT
+（非 OOM）；去掉该 flag 立即成功（128MB/16MB 双双通过）。四组对照
+（空闲卡/减容/大页开/关）全部同一失败点——排除卡负载/容量/大页。
+→ 修法 = memfabric 源码改 swap 分配 flag（或用其自带逃生门
+MF_HYBM_RDMA_SWAP_SPACE_SIZE=0 跳过 swap 分配，代码已核：为 0 时直接
+初始化成功）。P2-9 的大页假设彻底否定（机制级）。
+
+**B ✅：AscendC/AICPU 工具链全在位**——bisheng/ccec（clang 15.0.5
+aarch64）、CANN compiler/ascendc、AICPU 交叉编译器
+aarch64-target-linux-gnu-g++ 均在位。唯一缺口 = memfabric 的 AICPU
+kernel 未编译安装（源码/ini/CMake 目标齐全，缺 libcann_hybm_kernel.so
+与 cann-hybm-compat.tar.gz 产物；构建目标 cann_hybm_kernel 即可产出）。
+
+**外部判定**：hcomm/AICPU 数据面的工具链前提全部满足 → P2-11 可进入
+「构建 AICPU kernel + hcomm 通道 HBM 数据搬运验证」。memfabric 侧先用
+环境变量逃生门绕过 swap 分配。
+
 ### 回执导入 2026-09-23 #P29（批次 P2-9 回执，用户带回）—— 两个假设均被证伪，数据面定性完成
 
 - **A：大页假设证伪**——配 1024 大页（2GB 空闲）后 memfabric 两个示例仍在
@@ -867,6 +888,45 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-23 #45：批次 P2-11（memfabric 修复 + hcomm 通道 HBM 数据搬运判决）
+
+**背景**：P2-10 锁定 memfabric ret=-3 根因（MEM_PAGE_HUGE 不受支持）且
+发现逃生门；AscendC/AICPU 工具链全在位。本批 = ① memfabric 修复 + HBM
+示例复测；② **hcomm 双进程通道 HBM 数据搬运判决**（SPDK 集成设计前的
+最后一项机制验证）。
+
+**A. memfabric 修复与复测**：
+```bash
+# A1. 环境变量逃生门：MF_HYBM_RDMA_SWAP_SPACE_SIZE=0（跳过 MEM_PAGE_HUGE
+#     分配，源码已核：为 0 时直接初始化成功）
+#     （可选：源码修正 hybm_data_op_device_rdma.cpp 的 AllocSwapMemory
+#      去掉 MEM_PAGE_HUGE——外部建议正式修法，但 A1 先跑通要紧）
+# A2. 大页 1024（HBM 池示例可能需要）→ 重跑 DRAM 池示例 → 预期 init 通过
+# A3. 重跑 HBM 池示例（03_single_device_hbm_pool）→ 观察能否端到端
+```
+
+**B. hcomm 双进程通道 HBM 数据搬运判决（核心）**：
+```text
+参照 memfabric examples（hbm_share_memory/ShiftPutGet 的通道用法）：
+P1（initiator）：aclrtMalloc HBM 64KB → 写 pattern → HcommMemReg →
+  HcommMemExport（memDesc 存文件）→ EndpointCreate（EID 取
+  /etc/hccl_rootinfo.json）→ ChannelCreate（engine=AICPU）→ 存活
+P2（target）：读 memDesc → HcommMemImport → EndpointCreate + ChannelCreate
+  （AICPU）+ Connect(P1) → 数据搬运：
+  - 已定性：hcomm 数据搬运 = 设备侧 AICPU kernel 原语（host 侧接口为
+    weak 占位，直接调用 SIGSEGV）——需仿 memfabric 用
+    aclrtLaunchKernelWithConfig 启动其 AscendC kernel
+    （HybmBatchRead/HybmBatchWrite，源码与 json 在 memfabric 树内，
+    AICPU 交叉编译器在位），把 thread/channel 作为 kernel 参数
+  → 数据到达 P2 host 缓冲后逐字节比对 pattern → 反向 WRITE + P1 读回验证
+判定：双向数据一致 = hcomm 数据路径可用 🎯（SPDK 集成设计随即出）
+```
+
+**C. 恢复现场**（同前：进程/大页/文件清理）。
+
+**回传**：A 项前后对比 + B 项双向数据判定 + kernel 启动方式说明，
+注明「批次 P2-11 完毕」。
 
 ### 指令 2026-09-23 #44：批次 P2-10（HalMemAlloc 65534 诊断 + AscendC 工具链检查，全只读/低风险）
 
