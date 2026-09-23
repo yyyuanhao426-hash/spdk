@@ -330,6 +330,38 @@ dma-buf 导入路径（A 全空）→「CANN 导出 fd + URMA 内核 import」�
   函数签名（驱动头文件/反汇编）；③ page_table 布局兼容性（nv-p2p.h）；④
   模块装卸授权（需与管理员协调）
 
+### 回执导入 2026-09-23 #P26（批次 P2-6 回执，用户带回）—— 🔬 机制黑盒完全打开
+
+**一句话：hcomm 的 HBM 注册走的根本不是 URMA seg 注册，而是
+/dev/davinci_manager 上的 svm「CASM」（跨服务器地址空间）机制——
+CREATE_KEY + CS_QUERY_SRC 产出跨设备/跨机可共享的 key。**
+
+- A1：HcommMemExport 成功，memDesc = 262B（开头两处 HBM device VA
+  0x120000016000、0x28-0x4c 区段含疑似 key/属性 blob；无明显 EID）——
+  **纯用户态导出，零 ioctl**
+- A2：HcommMemGetAllMemHandles 正常（count=1）
+- A3：/proc/self/maps 对照：HBM 在设备 VA 区 120000000000-124000000000
+  （rw-s /dev/davinci_manager，128GB 设备窗口）；MemReg 前后无新增用户态
+  映射 → **注册纯在内核侧（CASM key）**
+- B：ioctl 序列精确命名（用机上驱动头 casm_ioctl.h）——
+  HcommMemReg 窗口仅 2 条且全在 /dev/davinci_manager：
+  `SVM_CASM_CREATE_KEY (0xC0285500)` + `SVM_CASM_CS_QUERY_SRC (0xC0385506)`；
+  HcommMemUnreg = `SVM_CASM_DESTROY_KEY`；**MemReg 窗口完全不碰
+  /dev/uburma（0 条 URMA_CMD）**——hcomm 的 uburma 活动只在 EndpointCreate
+  （建 ctx/jfc/jetty），与 seg 注册解耦
+- C 对照组：gds liburma -M npu 失败场景成功复现（Verification WRITE
+  failed，register cache miss n=5），其注册走 /dev/uburma/udmaN 的
+  URMA_CMD（REGISTER_SEG，is_gpu_seg）——**两套完全不同的注册机制，一成一败**
+- 结构体（机上 casm_ioctl.h 原文）：svm_casm_create_key_para{task_type,
+  va, size, key, rsv}；svm_casm_cs_query_src_para{key, src_va, owner_pid}
+
+**外部判定**：SPDK 集成应**复用 hcomm 的 CASM 路径**（CREATE_KEY/
+QUERY_SRC + memDesc），而非 URMA seg 注册。**下一未知数**：CASM key 被
+远端/对端 import 后，导入方拿到的 HBM 映射能否（a）正常读写（b）被标准
+URMA seg 注册（含 non_pin flag）——这决定 SPDK 的数据通路形态。下批
+P2-7 双进程导入实验回答。
+
+
 ### 回执导入 2026-09-23 #P25（批次 P2-5 回执，用户带回）—— 🎯 直连路线解锁
 
 **判定链全部通过：NPU 已被他人恢复 ✓ → HcommMemReg 对 HBM 注册成功 ✓ →
@@ -766,6 +798,44 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-23 #41：批次 P2-7（CASM 导入实验——确定 SPDK 数据通路形态）
+
+**背景**：P2-6 证实 hcomm 的 HBM 注册走 svm/CASM 机制（CREATE_KEY 产出
+跨设备/跨机可共享 key，memDesc 262B 可导出）。**SPDK 集成的最后一个
+未知数**：对端进程用 HcommMemImport 导入该 key 后，拿到的 HBM 映射——
+(a) 能否正常读写（数据正确性）；(b) 能否再被标准 URMA seg 注册（含
+non_pin flag），从而让 URMA 传输层直接对它做 jetty 读写。本批双进程实验
+回答，全只读（HBM 上写已知 pattern，无系统改动）。
+
+**A. 探针改造为双进程模型**：
+```c
+// 进程 1（initiator 角色）：
+//   aclrtMalloc HBM 64KB → memset 已知 pattern（如 0xA5 序列 + 偏移标记）
+//   → HcommMemReg → HcommMemExport → 把 memDesc(262B) 写文件 /home/tools/app/p27_share/memdesc.bin
+//   → sleep 保持存活（等待进程 2 验证完）
+// 进程 2（target 角色）：
+//   读 memdesc.bin → HcommMemImport(memDesc) → 记录返回值
+//   - 成功 → 读导入映射的前 256B（对照 pattern！）→ 写入不同 pattern 再读回
+//     → /proc/self/maps 中新增映射段原样带回
+//     → 尝试 urma 标准注册该 VA（gds liburma，flag 默认；再试 non_pin 置位）→ 记录成败
+//   - 失败 → 原样带回错误码
+// （两进程间 memDesc 经文件传递即可；进程 2 无需 NPU 分配，只做导入）
+```
+
+**B. 判定与回传**：
+```text
+情形 1：import 成功 + 数据一致 + 可被 URMA 注册 → SPDK 集成形态 =
+  「initiator hcomm 注册/导出 + target 导入 + 标准 URMA jetty 读写」
+  （改动最小，外部直出 SPDK 集成设计与实现计划）
+情形 2：import 成功 + 数据可读写 + 不可 URMA 注册 → 数据通路改为
+  「target 经导入映射直接 memcpy HBM」（零拷贝直达 initiator HBM），
+  SPDK 集成需评估该形态
+情形 3：import 失败 → CASM key 仅限特定进程/机制使用，原样带回错误码
+```
+
+**回传**：双进程实验全输出（含 maps/dump/注册尝试），注明
+「批次 P2-7 完毕」+ 命中情形编号。
 
 ### 指令 2026-09-23 #40：批次 P2-6（libhcomm 深探——确定 SPDK 集成形态）
 
