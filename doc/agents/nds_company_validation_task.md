@@ -401,6 +401,33 @@ kernel 未编译安装（源码/ini/CMake 目标齐全，缺 libcann_hybm_kernel
 设备 kernel 承载（AscendC），SPDK 集成需引入设备 kernel 编译链——这是
 Phase 2 的方向决策点（三种数据面方案已呈用户）。
 
+### 回执导入 2026-09-23 #P211（批次 P2-11 回执，用户带回）—— 机制链全通，最后一步触红线停手
+
+- **A ✅：memfabric 修复验证通过**——env 逃生门
+  MF_HYBM_RDMA_SWAP_SPACE_SIZE=0 有效（源码核验：为 0 跳过
+  MEM_PAGE_HUGE 分配），DRAM + HBM 两示例端到端通过（池化/往返/断言
+  全过；退出期 double-free 噪声不影响结论）。正式修法仍建议源码去
+  MEM_PAGE_HUGE。
+- **B：hcomm/AICPU 数据面——机制链全通，执行被 AICPU 环境阻断**：
+  - AICPU kernel 交叉编译 ✅（libcann_hybm_kernel.so 19272B，HybmBatchRead/
+    Write 导出，hcomm 原语为 weak 符号）
+  - 完整启动链 ✅：aclrtBinaryLoadFromFile→GetFunction→Args→
+    LaunchKernelWithConfig 全 0（kernel 已在 AICPU 上执行）
+  - 控制面全通：Endpoint/MemImport/ThreadAlloc(AICPU)/ChannelCreate(AICPU)
+    →status=0 READY
+  - ⛔ 执行抛 ACL_ERROR_RT_AICPU_EXCEPTION(507018)：kernel 内 hcomm weak
+    符号（HcommReadOnThread 等）在 AICPU 侧未解析——HYBM 的 AICPU 侧
+    hcomm 实现包（aicpu_hcomm.tar.gz / cann-hmm-compat.tar.gz）未装入
+    CANN OPP 树
+- **⛔ 最后一步 = 系统级安装**（script/kernel/install.sh 写
+  /usr/local/Ascend/cann-9.1.0/opp/... 与 conf/ascend_package_load.ini）
+  ——触碰低可见度红线，测试 agent 正确停手未执行
+- 现场干净；未 commit/push
+
+**外部判定**：Phase 2 机制链验证**全部完成**——从 libhcomm 到 AICPU
+kernel 启动的每一步都有实证；唯一未完成的双向数据判决被「系统级安装 vs
+保密红线」的决策阻断。三个选项呈用户（见 #46）。
+
 ### 回执导入 2026-09-23 #P27（批次 P2-7 回执，用户带回）—— 🎯 non_pin=1 注册成功，SPDK 形态确定
 
 **双进程实验三问全答：**
@@ -888,6 +915,49 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-23 #46：批次 P2-12（AICPU 免安装加载方式侦察，全只读）
+
+**背景**：P2-11 机制链全通，最后一步（HYBM AICPU kernel 包装入 CANN OPP
+树）是系统级安装，触碰保密红线。本批只读侦察：**是否存在免安装/用户侧
+的 AICPU 扩展加载路径**，为红线决策补料。
+
+**A. 安装脚本逆向（读 memfabric 的官方安装到底改了什么）**：
+```bash
+cat /home/tools/app/memfabric_hybrid/script/kernel/install.sh
+# 列出它写入的全部路径与配置项（OPP 目录、ascend_package_load.ini 格式）
+cat /home/tools/app/memfabric_hybrid/script/kernel/*.sh 2>/dev/null | head -80
+```
+
+**B. ascend_package_load.ini 语义**：
+```bash
+find /usr/local/Ascend/cann-9.1.0 -name "ascend_package_load.ini" 2>/dev/null
+cat <找到的文件> | head -30          # 现有条目格式
+# 该 ini 是否支持指向用户目录的路径（而非必须 /usr/local/Ascend 下）？
+strings /usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64/libruntime.so 2>/dev/null | grep -i "package_load\|aicpu" | head -10
+```
+
+**C. AICPU 侧 hcomm 实现包内容**：
+```bash
+# C1. CANN 自带包（加密 .run）在位确认：
+ls -la /usr/local/Ascend/cann-9.1.0/opp/built-in/op_impl/aicpu/kernel/aicpu_hcomm.tar.gz 2>/dev/null
+ls -la /usr/local/Ascend/cann-9.1.0/opp/built-in/compat/cann-hcomm-compat.tar.gz 2>/dev/null
+# C2. memfabric 树内是否自带未加密的同内容（可直接提取到用户目录）：
+find /home/tools/app/memfabric_hybrid -name "*hcomm*" | head -10
+file <找到的 tar.gz/so>
+```
+
+**D. AICPU 自定义库加载的环境变量/机制侦察**：
+```bash
+# 查 CANN 对 AICPU 自定义库路径的支持（环境变量/配置项）：
+grep -rn "aicpu" /usr/local/Ascend/cann-9.1.0/aarch64-linux/include/ 2>/dev/null | grep -iE "path|env|load|custom" | head -10
+# py3.11 venv 的 memfabric 包内也可能有安装/加载逻辑可参考：
+grep -rn "package_load\|aicpu_kernel" /home/tools/app/mf_py311/lib/python3.11/site-packages/memfabric_hybrid/ 2>/dev/null | head -10
+```
+
+**回传**：A-D 全输出，注明「批次 P2-12 完毕」。外部据 B/C 判定：
+存在用户侧加载路径 → 出免安装方案（红线内完成最后一步）；
+不存在 → 把「系统级安装 vs 保密红线」的决策材料整理呈用户。
 
 ### 指令 2026-09-23 #45：批次 P2-11（memfabric 修复 + hcomm 通道 HBM 数据搬运判决）
 
