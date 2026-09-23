@@ -358,6 +358,28 @@ DMA 目标——「标准 URMA jetty 直接读写 non_pin HBM」路线否决（�
 HugePages_Total=0 → 分配必败。下批 P2-9：大页修复 → memfabric 复测 →
 hcomm 双进程通道实验（HBM 数据搬运判决）。
 
+### 回执导入 2026-09-23 #P29（批次 P2-9 回执，用户带回）—— 两个假设均被证伪，数据面定性完成
+
+- **A：大页假设证伪**——配 1024 大页（2GB 空闲）后 memfabric 两个示例仍在
+  同一处失败：HalMemAlloc(134217728, MEM_HOST|DDR|PAGE_HUGE) ret=65534
+  （HAL 层分配失败，与大页无关）。→ 待查 HAL 错误码含义/空闲卡复测/减小
+  swap size 对照。
+- **B：hcomm 数据路径定性（关键）**——控制面全通（Endpoint 需用
+  /etc/hccl_rootinfo.json 的 EID，urma EID 不可用；MemReg(HBM)/Export/
+  Import/ThreadAlloc/ChannelCreate(AICPU 引擎)→status=0 READY），但
+  **host 侧 HcommReadOnThread/ReadNbi = SIGSEGV**——根因：**hcomm 的
+  数据搬运是设备侧 AICPU kernel 原语**（memfabric 源码实锤：实际搬运用
+  aclrtLaunchKernelWithConfig 启动 AscendC kernel HybmBatchRead/Write，
+  host 侧 Read 只是 weak 占位）。host 直接调用即段错误。
+- 附带确认：① hcomm Endpoint EID 必须取自 /etc/hccl_rootinfo.json；
+  ② 通道引擎必须 AICPU（CPU 引擎建连即 HCCL_E_TCP_CONNECT 失败）；
+  ③ NPU0 HBM 近满（85499/86016MB）致 aclrtSetDevice(0)=507033，换空闲卡可用。
+- 现场干净，低可见度保持。
+
+**外部判定**：hcomm/CASM 架构的控制面可行性**完全确认**；但数据面 =
+设备 kernel 承载（AscendC），SPDK 集成需引入设备 kernel 编译链——这是
+Phase 2 的方向决策点（三种数据面方案已呈用户）。
+
 ### 回执导入 2026-09-23 #P27（批次 P2-7 回执，用户带回）—— 🎯 non_pin=1 注册成功，SPDK 形态确定
 
 **双进程实验三问全答：**
@@ -845,6 +867,36 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 - 四项交付物：NPU 相关三项无法交付（无 NPU 机器）；编译受阻待修。
 
 ## 10. 外部 AI 指令区
+
+### 指令 2026-09-23 #44：批次 P2-10（HalMemAlloc 65534 诊断 + AscendC 工具链检查，全只读/低风险）
+
+**背景**：P2-9 定性 hcomm 数据面为设备 kernel 承载。本批两项低成本取证，
+为方向决策补料。
+
+**A. memfabric HalMemAlloc ret=65534 诊断**：
+```bash
+# A1. 错误码含义（机上 HAL 错误码表）：
+grep -rn "65534\|0xFFFE" /usr/local/Ascend/driver/kernel/dev_inc/inc/ascend_kernel_hal.h \
+  /usr/src/davinci_ascend-1.0/dev_inc/inc/ 2>/dev/null | head -10
+grep -rn -B2 -A2 "HalMemAlloc" /usr/local/Ascend/driver/kernel/dev_inc/inc/ascend_kernel_hal.h | head -20
+# A2. 换空闲卡复测（NPU0 HBM 近满嫌疑）：
+#   探针/memfabric 示例里 aclrtSetDevice 改空闲卡（npusmi 确认），看 ret 是否变化
+# A3. 减小 swap 对照：MF_HYBM_RDMA_SWAP_SPACE_SIZE=16 重跑 DRAM 示例
+#     （128MB→16MB，排除容量因素）
+# A4. 大页保持 1024 与归零各跑一次对照（彻底关闭大页假设）
+```
+
+**B. AscendC 设备 kernel 工具链在位检查（hcomm 数据面集成的编译前提）**：
+```bash
+which bisheng ccec 2>/dev/null; ls /usr/local/Ascend/ascend-compiler* 2>/dev/null
+ls /usr/local/Ascend/cann-9.1.0/compiler 2>/dev/null | head
+# memfabric 构建时是否已产出 AICPU kernel 二进制：
+find /home/tools/app/memfabric_hybrid -name "*.o" -path "*aicpu*" 2>/dev/null | head -3
+find /home/tools/app/memfabric_hybrid -name "*hybm_kernel*" 2>/dev/null | head -5
+```
+
+**回传**：A1-A4 / B 全输出，注明「批次 P2-10 完毕」。外部据 B 判定
+hcomm 数据面集成的工具链前提是否满足。
 
 ### 指令 2026-09-23 #43：批次 P2-9（大页修复 + memfabric 复测 + hcomm 通道判决）
 
