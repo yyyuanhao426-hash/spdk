@@ -941,6 +941,54 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-23 #47：批次 P2-13（ASCEND_CUSTOM_OPP_PATH 用户目录加载实验——红线内完成最后一步）
+
+**背景**：P2-12 发现 CANN 官方支持用户侧自定义算子安装路径
+ASCEND_CUSTOM_OPP_PATH（被 libge_runner/libregister/libmmpa 消费）。
+本批实验：把 HYBM AICPU kernel 按 customize 布局放进**用户目录**，env
+指向它，重跑启动探针——看 AICPU 侧 hcomm weak 符号是否解析
+（507018 是否消失）。**全程零系统写入**（env 为进程局部、文件在自家
+目录），红线内。
+
+**A. 布置用户侧 OPP 树（仿官方 customize 安装布局）**：
+```bash
+COPP=/home/tools/app/custom_opp
+mkdir -p $COPP/vendors/customize/op_impl/aicpu/kernel
+mkdir -p $COPP/vendors/customize/op_impl/aicpu/config
+# P2-11 已交叉编译的 kernel 与 memfabric 的 json/ini 拷入：
+cp /home/tools/app/p211_kernel/libcann_hybm_kernel.so $COPP/vendors/customize/op_impl/aicpu/kernel/
+cp /home/tools/app/umdk/../memfabric_hybrid/src/hybm/ops/hybm_kernel/libcann_hybm_kernel.json \
+   $COPP/vendors/customize/op_impl/aicpu/config/ 2>/dev/null || \
+   find /home/tools/app/memfabric_hybrid -name "libcann_hybm_kernel.json" -exec cp {} $COPP/vendors/customize/op_impl/aicpu/config/ \;
+cp <同目录的 .ini> $COPP/vendors/customize/op_impl/aicpu/config/ 2>/dev/null
+find $COPP -type f | sort                    # 记录布局
+```
+
+**B. env 指向用户目录 + 重跑启动探针（P2-11 的探针已就绪）**：
+```bash
+export ASCEND_CUSTOM_OPP_PATH=$COPP
+export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest   # 保持原值
+# 重跑 P2-11 的启动链探针（aclrtBinaryLoadFromFile 用用户目录的 json）：
+#   预期：Launch 成功后 SyncStream 不再 507018（hcomm weak 符号经
+#   customize vendor 树解析）→ kernel 正常执行
+# 若仍 507018：dmesg + AICPU 日志原样带回；再试把 customize 布局
+#   镜像到 $COPP/vendors/cust/（memfabric 官方布局的 cust 名）再测一次
+```
+
+**C. kernel 执行成功后的数据判决（同 P2-11 B3 设计）**：
+```text
+P2 侧 AICPU kernel 读 P1 导入的 HBM → 数据到 P2 host 缓冲 → 比对 pattern
+→ 反向 WRITE + P1 读回验证
+双向一致 = **hcomm/CASM 直连数据路径端到端确认 🎯**
+```
+
+**D. 恢复**：进程退出即完（env 局部）；custom_opp 目录保留（自家目录）。
+
+**回传**：布局记录 + 探针全输出（507018 有无）+ 数据判决，注明
+「批次 P2-13 完毕」。若仍失败，AICPU 侧日志原样带回（外部分析 weak
+符号解析机制）。
+
+### 指令 2026-09-23 #46：批次 P2-12（AICPU 免安装加载方式侦察，全只读）
 ### 指令 2026-09-23 #46：批次 P2-12（AICPU 免安装加载方式侦察，全只读）
 
 **背景**：P2-11 机制链全通，最后一步（HYBM AICPU kernel 包装入 CANN OPP
