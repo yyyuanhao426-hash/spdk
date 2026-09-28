@@ -45,6 +45,8 @@ typedef CUresult (*cuda_pointer_set_attribute_fn)(const void *value, int attribu
 typedef CUresult (*cuda_get_dmabuf_fn)(void *handle, CUdeviceptr ptr, size_t size,
 		int handle_type, unsigned long long flags);
 typedef CUresult (*cuda_get_error_string_fn)(CUresult error, const char **message);
+typedef CUresult (*cuda_mem_host_register_fn)(void *ptr, size_t size, unsigned int flags);
+typedef CUresult (*cuda_mem_host_unregister_fn)(void *ptr);
 
 struct cuda_driver {
 	void *library;
@@ -60,6 +62,8 @@ struct cuda_driver {
 	cuda_memcpy_d2h_fn memcpy_d2h;
 	cuda_pointer_set_attribute_fn pointer_set_attribute;
 	cuda_get_dmabuf_fn get_dmabuf;
+	cuda_mem_host_register_fn mem_host_register;
+	cuda_mem_host_unregister_fn mem_host_unregister;
 	cuda_get_error_string_fn get_error_string;
 };
 
@@ -93,6 +97,8 @@ struct worker {
 	struct spdk_nvme_urma_memory_region *region;
 	/* Modified By Yida: posix(新语义) 的 HBM 影子缓冲 + 分级拷贝耗时统计 */
 	struct gpu_allocation gpu_alloc;
+	/* Modified By Yida(B): 暂存缓冲是否已 cuMemHostRegister（清理时配对注销） */
+	bool cuda_host_pinned;
 	uint64_t copy_ticks;
 	uint64_t copy_ios;
 	struct io_task *tasks;
@@ -218,6 +224,10 @@ cuda_driver_init(uint32_t gpu_id)
 				       cuda_load_symbol("cuPointerSetAttribute", NULL);
 	g_cuda.get_dmabuf = (cuda_get_dmabuf_fn)
 			      cuda_load_symbol("cuMemGetHandleForAddressRange", NULL);
+	g_cuda.mem_host_register = (cuda_mem_host_register_fn)
+				   cuda_load_symbol("cuMemHostRegister_v2", "cuMemHostRegister");
+	g_cuda.mem_host_unregister = (cuda_mem_host_unregister_fn)
+				     cuda_load_symbol("cuMemHostUnregister_v2", "cuMemHostUnregister");
 	g_cuda.get_error_string = (cuda_get_error_string_fn)
 				  cuda_load_symbol("cuGetErrorString", NULL);
 
@@ -294,7 +304,10 @@ cuda_alloc_buffer(struct gpu_allocation *allocation, size_t size)
 			goto fail;
 		}
 	}
-	if (g_cuda.get_dmabuf != NULL) {
+	/* Modified By Yida: 仅 dmabuf 路线需要导出 dmabuf——peermem 走 nvidia_p2p
+	 * 注册（provider 无 export_dmabuf）、posix 影子缓冲不参与传输；GeForce 上
+	 * 导出必然 801，跳过即消除打印噪音。 */
+	if (g_mem_type == URMA_PERF_MEM_DMABUF && g_cuda.get_dmabuf != NULL) {
 		int fd = -1;
 
 		result = g_cuda.get_dmabuf(&fd, ptr, allocation->alloc_size,
@@ -326,6 +339,33 @@ cuda_free_buffer(struct gpu_allocation *allocation)
 	}
 	memset(allocation, 0, sizeof(*allocation));
 	allocation->dmabuf_fd = -1;
+}
+
+/* Modified By Yida(B): posix 暂存缓冲 CUDA pin —— spdk_dma 大页物理连续但 NVIDIA
+ * 驱动不认识，cuMemcpy 走 pageable bounce 路径（实测 ~5.9 GiB/s）；hostRegister
+ * 后走 pinned DMA 路径。失败由调用方告警并降级为未 pin（正确性不受影响）。 */
+static int
+cuda_pin_host_buffer(void *addr, size_t size)
+{
+	CUresult result;
+
+	if (g_cuda.mem_host_register == NULL) {
+		return -ENOTSUP;
+	}
+	result = g_cuda.mem_host_register(addr, size, 0);
+	if (result != URMA_PERF_CUDA_SUCCESS) {
+		cuda_print_error("cuMemHostRegister", result);
+		return -EIO;
+	}
+	return 0;
+}
+
+static void
+cuda_unpin_host_buffer(void *addr)
+{
+	if (g_cuda.mem_host_unregister != NULL) {
+		g_cuda.mem_host_unregister(addr);
+	}
 }
 
 static struct gpu_allocation *
@@ -496,8 +536,10 @@ io_complete(void *arg, const struct spdk_nvme_cpl *completion)
 		worker->errors++;
 		atomic_store_explicit(&g_failed, true, memory_order_release);
 	} else {
-		/* Modified By Yida: posix 模式读方向把落到 host 暂存缓冲的数据搬回 HBM */
-		if (staged_copy(worker, task, false) != 0) {
+		/* Modified By Yida: posix 模式读方向把落到 host 暂存缓冲的数据搬回 HBM。
+		 * 仅读需要：写完成后暂存与影子缓冲内容本就一致，回拷是纯浪费
+		 * （实测纯 write 负载 copy_ios = 2×completed）。 */
+		if (!task->write && staged_copy(worker, task, false) != 0) {
 			atomic_store_explicit(&g_failed, true, memory_order_release);
 		}
 		if (worker->measuring) {
@@ -1224,6 +1266,15 @@ prepare_workers(void)
 					      (size_t)g_io_size * g_batch_size) != 0) {
 				return -ENOMEM;
 			}
+			/* Modified By Yida(B): 暂存缓冲做 cuMemHostRegister，cuMemcpy
+			 * 走 pinned 路径；失败告警并降级为未 pin（不影响正确性） */
+			if (cuda_pin_host_buffer(worker->allocation.addr,
+						 worker->allocation.alloc_size) == 0) {
+				worker->cuda_host_pinned = true;
+			} else {
+				fprintf(stderr, "Worker %u: staging buffer NOT CUDA-pinned, "
+					"cuMemcpy takes the slow pageable path\n", worker->id);
+			}
 		} else if (cuda_alloc_buffer(&worker->allocation,
 					     (size_t)g_io_size * g_batch_size) != 0) {
 			return -ENOMEM;
@@ -1285,6 +1336,11 @@ cleanup_workers(void)
 		if (g_mem_type == URMA_PERF_MEM_CPU) {
 			spdk_dma_free(g_workers[i].allocation.addr);
 		} else if (g_mem_type == URMA_PERF_MEM_POSIX) {
+			/* Modified By Yida(B): 先注销 CUDA pin 再释放大页（配对） */
+			if (g_workers[i].cuda_host_pinned) {
+				cuda_unpin_host_buffer(g_workers[i].allocation.addr);
+				g_workers[i].cuda_host_pinned = false;
+			}
 			spdk_dma_free(g_workers[i].allocation.addr);
 			cuda_free_buffer(&g_workers[i].gpu_alloc);
 		} else {
