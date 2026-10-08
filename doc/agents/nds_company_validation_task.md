@@ -1010,6 +1010,67 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-23 #48：批次 P2-16（同事C NPU-direct-SSU 代码仓侦察，全只读）
+
+**背景（供理解侦察目的）**：我们正在做 NDS（NPU HBM 经 URMA 直连远端
+NVMe）。Phase 1 中转路线已验证通过；Phase 2 直连路线卡在最后一环：
+HBM 的跨进程共享与数据搬运需要华为的 CASM/libhcomm/AICPU kernel 体系，
+而其部署需要系统级安装 + 华为/社区签名包（借用机保密红线内无法完成）。
+
+**同事C 的 NPU-direct-SSU（带 UB 插口的硬盘）与我们的目标高度接近，且
+可能有不同的架构解法**——如果 SSD 本身是 UB 端点，数据通路可能完全绕开
+"HBM 注册给 URMA"这个问题。本批只读侦察该代码仓，回答四个问题。
+
+**A. 获取与结构**（仓地址由用户带回提供）：
+```bash
+git clone --depth 1 <同事C仓库地址> /home/tools/app/colleague_c_repo
+cd /home/tools/app/colleague_c_repo
+git log --oneline -5
+find . -maxdepth 2 -type d | sort | head -30
+cat README*.md 2>/dev/null | head -80
+```
+
+**B. 架构与数据通路识别（核心）**：
+```bash
+# B1. 关键词扫描——识别 HBM 访问与传输机制：
+grep -rln -iE "hbm|casm|hcomm|aicpu|devmm|p2p|dmabuf|dma_buf" \
+  --include="*.c" --include="*.cpp" --include="*.h" --include="*.py" . | head -20
+grep -rn -iE "urma_register|register_seg|import_seg|non_pin|is_gpu_seg" \
+  --include="*.c" --include="*.cpp" --include="*.h" . | head -15
+# B2. 数据通路关键词：
+grep -rln -iE "ssu|ub.*ssd|ssd.*ub|ublock|ubdi" --include="*.c" --include="*.h" --include="*.md" . | head -10
+# B3. 是否有内核模块/设备侧组件：
+find . -name "Kbuild" -o -name "Makefile" -path "*kernel*" -o -name "*.ko" 2>/dev/null | head
+find . -iname "*aicpu*" -o -iname "*kernel*.cc" -o -iname "*kernel*.cpp" | head -10
+```
+
+**C. 部署与环境要求（对照我们的三重阻塞）**：
+```bash
+# C1. 是否需要内核模块装卸/自定义内核：
+find . -iname "install*.sh" -o -iname "deploy*.sh" | head -5
+grep -rn -iE "insmod|rmmod|modprobe|kernel|opp|vendors" --include="*.sh" . | head -15
+# C2. 是否涉及签名/CMS/包校验：
+grep -rn -iE "cms|verify|sign|package_load" --include="*.sh" --include="*.py" --include="*.md" . | head -10
+# C3. 硬件要求：是否需要特定 UB 盘/硬件（README/doc 中的硬件清单）
+grep -rn -iE "hardware|硬件|ssu|盘" README*.md docs/ 2>/dev/null | head -10
+```
+
+**D. 与我们方案的对照表（回传时填写）**：
+```text
+| 我们的阻塞点 | 同事C 的解法（如有） |
+| HBM 跨进程共享（CASM/libhcomm） | ? |
+| 数据搬运（AICPU kernel） | ? |
+| AICPU 包装载（系统级安装+签名） | ? |
+| UB 存储（SSU 是否原生 UB 端点） | ? |
+```
+
+**回传**：A-D 全输出 + 对照表 + 仓库结构概览，注明「批次 P2-16 完毕」。
+若仓库在内部 git 上无法直接 clone，把仓库页面/路径带回由用户协调。
+
+**注意**：全程只读；仓内容属同事C 的工作，只做架构侦察，不修改、不
+外传、不评价代码质量——目的是找"HBM 直连的解法"。
+
+### 指令 2026-09-23 #47：批次 P2-13（ASCEND_CUSTOM_OPP_PATH 用户目录加载实验——红线内完成最后一步）
 ### 指令 2026-09-23 #47：批次 P2-13（ASCEND_CUSTOM_OPP_PATH 用户目录加载实验——红线内完成最后一步）
 
 **背景**：P2-12 发现 CANN 官方支持用户侧自定义算子安装路径
