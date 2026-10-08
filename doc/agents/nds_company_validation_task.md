@@ -468,6 +468,26 @@ vLLM 生产负载在跑 NPU0/2/3/4/5）。测试 agent 主动复验 Phase 2 全�
 ① 写方向（HBM→盘）验证；② 文件路径 FIEMAP 缺陷（同事C 代码，可绕过/
 反馈）；③ SPDK 集成形态设计。
 
+### 回执导入 2026-09-23 #P220（批次 P2-20 回执，用户带回）—— Module A 三缺陷定位（RA 序列缺失）
+
+- ① 增量重编 ✅（urma_perf 5809192B，含 RA/HCCP context ready 字符串——
+  但运行时未触发）
+- ② 单进程快验 ❌：RaCtxInit=128003。测试 agent 二分定位（对照探针：
+  CCDK 完整序列 OK）→ **Module A 的 RA 序列缺失三个前置调用**：
+  ① rtOpenNetService（dlopen libruntime.so，参数 --hdcType=18 len=12）
+  ② aclrtGetPhyDevIdByLogicDevId(device_id, &phy_id)
+  ③ RaGetDevEidInfoNum / RaGetDevEidInfoList（取真实 eid/eidIndex，n=19）
+  且 RaInit/RaCtxInit 参数错（应为实测值：phy_id=实查、
+  nic_position=NETWORK_OFFLINE(1)、hdc_type=18、async=true；mode=
+  NETWORK_OFFLINE(1)、eid_index/eid=查询值）
+- 次要：符号名 "RaCtxDeInit" 应为 "RaCtxDeinit"（小写 i）；RaDeinit 未绑定
+- 环境陷阱：LD_LIBRARY_PATH 含 $UMDK/lib 时 aclrtSetDevice=507033
+  （liburma 冲突）——去掉后正常；urma_perf 应只用
+  CANN/aarch64-linux/lib64:/usr/lib64
+- ③ P2-19 双进程复验 ✅ 无回归（机制判决不变）
+- 建议：libascendcl 的 dlopen 改 RTLD_GLOBAL（潜在项，未证实阻塞）
+- 权威参照：colleague_c_repo/nds/src/nds.c:347 nds_init_ra——修正批照它
+
 ### 回执导入 2026-09-23 #P219（批次 P2-19 回执，用户带回）—— 🎯🎯 NDS-SSD 直连路线确认
 
 **判决实验通过：RA/HCCP 注册的 HBM 可被 URMA jetty（CTP）远端
