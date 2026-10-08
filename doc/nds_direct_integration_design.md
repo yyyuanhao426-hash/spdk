@@ -1,131 +1,114 @@
-# NDS 直连路线集成设计（基于 RA/HCCP 注册 + nvme_nds，v1）
+# NDS 直连路线 SPDK 集成设计 v2（RA/HCCP 注册 + 目标侧导入数据面）
 
-> 状态：设计稿 v1（待评审） ｜ 前置阅读：[nds_phase2_summary.md](nds_phase2_summary.md)
-> 依据：P2-17（盘→HBM 读方向实测一致）、P2-18（HBM→盘 写方向实测一致）、
-> P2-19（RA/HCCP 注册段被 URMA jetty 远端读写判决通过）
+> 状态：实施设计（可执行） ｜ 前置：[nds_phase2_summary.md](nds_phase2_summary.md)、
+> [nds_direct_integration_design.md](nds_direct_integration_design.md)（v1 方案对比，已被本稿取代）
+> 依据：P2-19 判决实验通过——RA/HCCP 注册的 HBM 段可被 URMA jetty（CTP）远端 READ/WRITE
 
-## 1. 已确认的机制基础
+## 1. 设计输入（已确认事实，全部有实测依据）
 
-133 上实测打通的直连数据面（双向逐字节一致）：
+| # | 事实 | 出处 |
+|---|------|------|
+| F1 | HBM device VA 可经 RA/HCCP `RaCtxLmemRegister(nonPin)` 注册，产出 {MemKey, targetSegHandle, eid, uasid, va, token} | P2-19 探针（nds_buf_register=0） |
+| F2 | RA 注册的 HBM 段可被远端 `urma_import_seg(ubva{eid,uasid,va})` + `urma_import_jetty(CTP)` + URMA READ/WRITE 访问，数据逐字节一致 | P2-19 双进程判决 |
+| F3 | 裸 `urma_register_seg(non_pin=1)` 注册的段**不可**被远端 jetty DMA（LOC_ACCESS_ERR/无 CQE）——注册通道的选择是决定性的 | P2-8 判决 |
+| F4 | SPDK 现注册流：非 host 类型 → provider->pin() → urma_register_seg(is_gpu_seg=1)（内核 peer-memory，133 缺框架必败）；export_dmabuf 钩子存在但 CANN 无公开 dmabuf 导出 | nvme_urma_common.c:307-386 |
+| F5 | memfabric 的自动 provision 会写系统 OPP 树+ini（SOP：跑前/跑后检查回滚） | P2-14 |
+| F6 | 编译必须与 CCDK 对齐（-I/usr/include/ub/umdk/urma + liburma.so；umdk/src 头布局不一致会 EPERM） | P2-19 工程要点 |
 
-```
-NPU HBM（aclrtMalloc，HUGE_FIRST）
-  ⇅ RaCtxLmemRegister(nonPin=ENABLE)          ← libra.so（RA/HCCP，dlopen）
-  ⇅ 产出 MemKey / targetSegHandle / 段信息 {eid, uasid, va, token}
-内核 nvme_nds 驱动（NVMe-over-UB）
-  ⇅ NDS_IOCTL_FILE_TRANSFER / 块设备路径       ← /dev/nvme-nds
-UB-SSU 裸盘（/dev/nvme1n1，4G，已挂载 ext4）
-```
-
-关键事实：
-- 该路径**无需** hcomm/CASM 共享、**无需** AICPU kernel、**无需** OPP 安装、
-  **无需** 签名包——绕开了 P2-0~P2-13 的全部部署门槛
-- RA/HCCP 注册的 HBM 段**可被 URMA jetty（CTP）远端读写**（P2-19 判决），
-  而裸 non_pin 注册的段不可（P2-8 判决）——**注册通道的选择是决定性的**
-- 块设备路径（nds_block_io_common）数据正确；文件路径
-  （nds_file_io_common）存在 FIEMAP 翻译缺陷（同事C 代码，返回全 0）
-
-## 2. SPDK 现状：注册流的真实代码路径
-
-`lib/nvme/nvme_urma_common.c: spdk_nvme_urma_register_memory()`：
+## 2. 目标架构（端到端数据通路）
 
 ```
-① 非 host 类型 → 调 provider->pin()            （urma_perf_npu.c 的
-                                                  npu_provider_pin，仅登记）
-② 填 urma_seg_cfg_t：is_gpu_seg=1（非 host），
-   token=DEFAULT、token_policy=NONE、RW|ATOMIC
-③ 若 provider->export_dmabuf != NULL → 走 dma-buf 注册分支
-   （spdk_urma_register_seg_dmabuf）—— NPU provider 当前为 NULL
-④ target_seg==NULL → urma_register_seg(&cfg)   ← 内核 peer-memory 路径
-   （is_gpu_seg=1），依赖 udma.ko 的 gpu_p2p 框架
-   —— **133 内核未启用（ENABLE=0），此路不通（P2-2/P2-8/P2-15）**
+urma_perf（initiator，NPU 侧）                nvmf_tgt（target，host 侧）
+┌────────────────────────────┐          ┌──────────────────────────────┐
+│ aclrtMalloc HBM            │          │                              │
+│   ↓ 写 pattern             │          │  urma_import_seg(ubva{eid,   │
+│ nds_buf_register(HBM)      │          │    uasid,va}, NOMAP)         │
+│   = RaCtxLmemRegister      │   TCP    │    ↓ 导入成功 = 对端 HBM     │
+│     (nonPin)  [libra.so]   │──HELLO──►│      在本进程可寻址           │
+│ URMA jetty(CTP)            │ 段信息交换│  URMA jetty(CTP)             │
+│   （数据原地，零拷贝）       │          │   ↓ URMA READ/WRITE          │
+│                            │          │   iobuf → AIO → NVMe 落盘    │
+└────────────────────────────┘          └──────────────────────────────┘
 ```
 
-即：当前 NPU provider 的 pin() 之后，注册必然落入 ④ 的内核 peer-memory
-路径——在 133 上死路。同时②的 is_gpu_seg=1 走 udrv_data 侧信道，内核
-同样无响应框架。
+**关键语义**：initiator 的 HBM 经 RA 注册后，target 通过 urma_import_seg
+将其映射进**自己的设备地址空间**——此后 target 的 jetty 直接对这段 HBM
+做远端 READ/WRITE（NVMe 数据面），**initiator 进程零参与数据搬运**
+（对比 npu-staged：initiator 每笔 I/O 做 D2H 拷贝）。
 
-## 3. 集成方案对比
+## 3. 模块设计
 
-### 方案 A（推荐）：nds 数据面直驱——SPDK 侧零内核依赖
+### 3.1 模块 A：NPU provider 改造（examples/nvme/urma_perf/urma_perf_npu.c）
 
-urma_perf 的 `-M npu` 数据面改用 **libnds**（同事C 的 CCDK）：
-- HBM 注册：`nds_init` + `nds_buf_register`（内部 RaCtxLmemRegister
-  nonPin——P2-17 实测成功）
-- 数据面：`nds_file_io` / `nds_batch_io`（ioctl NDS_IOCTL_FILE_TRANSFER，
-  内核 nvme_nds 完成 HBM↔UB-SSU 搬运——P2-17 读/P2-18 写实测一致）
-- SPDK 角色：urma_perf 作为 nds 数据面的驱动器与校验框架；SPDK 的
-  NVMe-over-URMA 传输层**保持 host 内存路线不变**（cpu/npu-staged 路线
-  不受影响）
+| 改动点 | 内容 |
+|--------|------|
+| A1 | npu_driver 增加 libra.so 加载（RaInit/RaCtxInit/RaCtxQpCreate，照 CCDK plugin_loader.c 的 dlopen 序列） |
+| A2 | 新增 `npu_nds_register(hbm_va, len)`：封装 RaCtxLmemRegister(nonPin=ENABLE)，flags 照 P2-19（tokenPolicy=NONE/tokenIdValid=DISABLE/RW\|ATOMIC/cacheable=DISABLE），产出段信息存入 npu_alloc_entry |
+| A3 | npu_alloc_entry 增加字段：`struct nds_seg_info {u64 eid[16]; u32 uasid; u64 va; u32 token;}`（P2-19 实测格式） |
+| A4 | provider 接口扩展：新 op `get_segment_info(pin_handle, &seg_info)`——供传输层把段信息交换给对端 |
 
-改动面：仅 urma_perf_npu.c/urma_perf.c（+链接 libnds）；lib/nvme 传输层
-零改动；内核零改动。
-风险：nds 栈依赖 nvme_nds 驱动的 UB-SSU（133 已具备）；文件路径 FIEMAP
-缺陷需绕过（块路径已验证）。
+**不做**：删除 is_gpu_seg 路径（npu-staged 迁移期保留）；不改 aclrtMalloc
+分配逻辑。
 
-### 方案 B：SPDK 深度集成——扩展 nvme_urma 注册流支持 RA 段
+### 3.2 模块 B：段信息交换（lib/nvme/nvme_urma.c）
 
-为 NPU 类型在 nvme_urma_common.c 增加"RA 注册 + 段信息导出"分支：
-- provider 增加 export_segment op（返回 {eid, uasid, va, jetty_id,
-  token_id}）
-- nvmf_tgt 侧 urma_import_seg(ubva) + urma_import_jetty(CTP) 导入后，
-  用 URMA jetty 远端读写 HBM 段（P2-19 判决该组合可行）
-- wire 协议需扩展 HELLO/元数据交换以承载段信息
+HELLO 交换（nvme_urma_exchange_hello）现有 `spdk_urma_endpoint_desc`
+{eid, jetty_id, transport_mode, max_queue_depth, max_io_size}——eid/jetty
+已有，**缺 uasid 与段信息**。
 
-改动面：lib/nvme/nvme_urma.c/common.c + wire 协议 + 双端——工程量大，
-且远端读写语义仍需实测（P2-19 只验证了探针级）。
-定位：方案 A 验证通过后的产品化演进方向。
+| 改动点 | 内容 |
+|--------|------|
+| B1 | endpoint_desc 追加 `u32 uasid`（或新消息类型 SPDK_URMA_MSG_SEG_INFO，避免破坏 packed 布局兼容性——**推荐新消息**，旧对端忽略未知类型即可） |
+| B2 | 新消息 SPDK_URMA_MSG_SEG_INFO：承载 {eid, uasid, va, token, len}（initiator 的 HBM 段），target 收到后执行 urma_import_seg |
 
-### 方案 C：真零拷贝（URMA 设备 DMA 直达 HBM）
+### 3.3 模块 C：target 侧数据面（lib/nvme/nvme_urma.c）
 
-需要 udma.ko 启用 gpu_p2p 框架（源码缺失）或 ummu phys_sg API（内核
-缺失）——**当前平台不可达**，依赖华为驱动源码支持。暂列展望。
+| 改动点 | 内容 |
+|--------|------|
+| C1 | nvmf_tgt 侧收到 SEG_INFO 后：urma_import_seg(ubva{eid,uasid,va}, NON_CACHEABLE, RW\|ATOMIC, SEG_NOMAP) → 本地段句柄 |
+| C2 | I/O 数据面：target 的 jetty 对导入段做 URMA READ（NVMe 写命令：从对端 HBM 拉数据）/ URMA WRITE（NVMe 读命令：把盘数据推进对端 HBM）——**target 主动拉取/推送，initiator 零参与** |
+| C3 | 传输模式分流：NPU 类型内存走 C1/C2 导入路径；host 类型内存保持既有 URMA 传输（npu-staged/cpu 不受影响） |
 
-## 4. 方案 A 实现细节
+### 3.4 模块 D：编译与链接对齐
 
-### 4.1 urma_perf_npu.c 改造点
+- urma_perf/nvmf_tgt 链接：-I/usr/include/ub/umdk/urma + liburma.so
+  （**禁用 umdk/src 的 urma_api.h**——布局不一致 EPERM，P2-19 教训）
+- 新增链接：libra.so（dlopen 则免）
+- 依赖清单：libra.so / liburma.so / libtsdclient.so / libacl_rt.so
+  （133 全在位，P2-16/C 项）
 
-1. **新增 nds 数据面模块**（nds_data_plane.c 或并入 npu provider）：
-   - `nds_init()`：dlopen libra.so（RaInit/RaCtxInit/RaCtxQpCreate，
-     照 CCDK plugin_loader.c）+ 打开 /dev/nvme-nds
-   - `nds_buf_register(hbm_va, len)`：RaCtxLmemRegister(nonPin=ENABLE)
-     （flags 照 P2-19：tokenPolicy=NONE、tokenIdValid=DISABLE、
-     RW|ATOMIC、cacheable=DISABLE）
-   - `nds_transfer_read/write(...)`：nds_file_io_common（块路径，
-     绕过文件路径 FIEMAP 缺陷）或 nds_batch_io
-2. **urma_perf.c 的 -M npu 数据路径分流**：I/O 缓冲 = RA 注册的 HBM；
-     数据面调用 nds_transfer 而非 SPDK NVMe I/O（直连模式）；对比模式
-     （-M npu-staged）保持 SPDK NVMe I/O
-3. **编译**：链接 libnds.so（CCDK 产物）或直接编入 nds 源码；头文件
-   /usr/include/ub/umdk/urma（与 CCDK 对齐，禁用 umdk/src 头——结构体
-   布局不一致会 EPERM，P2-19 教训）
+## 4. 数据通路语义（与 npu-staged 的对照）
 
-### 4.2 两阶段验证设计
+| 维度 | npu-staged（中转） | 本设计（直连） |
+|------|--------------------|----------------|
+| 发起方 | initiator 每笔 I/O 做 D2H 拷贝 | **target 主动拉取/推送，initiator 零参与** |
+| 拷贝次数 | 2（HBM→host、host→target iobuf） | **1**（URMA READ/WRITE 直达 HBM 段） |
+| initiator CPU | 每笔 I/O 参与 | **零参与**（推理主流程不被存储 I/O 打断） |
+| HBM 注册 | host 暂存注册（host 内存） | RA/HCCP 注册 HBM 本体 |
+| 依赖 | 无内核改动 | nvme_nds 驱动（133 已内置） |
+
+## 5. 验证计划
 
 | 阶段 | 内容 | 判定 |
 |------|------|------|
-| V1 功能 | nds_transfer 单块读/写（HBM↔UB-SSU）双向一致 | 复现 P2-18 |
-| V2 性能 | nds-bench 各 I/O 尺寸/队列深度；与 AIO 基线对比 | 产出直连路线性能基线 |
+| V1 | 探针级：RA 注册 + import + 单块读写（=P2-19 已通过） | ✅ 复现 |
+| V2 | SPDK 级：urma_perf -M npu（新数据面）单 I/O 双向数据正确 | NVMe WRITE 后 target 拉取的数据 == HBM pattern |
+| V3 | 全链路：直连版 -M npu 完整跑通（对 npu-staged 同条件对比） | IOPS/延迟/CPU 占用对比报告 |
 
-### 4.3 已知问题
+## 6. 风险与开放问题
 
-1. 文件路径 FIEMAP 翻译缺陷（同事C nds.c）——块路径绕过，缺陷反馈
-   上游
-2. nvme_nds refcount 高（他租户在用）——测试需协调或观察式进行
-3. NPU4 Critical、NPU0 HBM 近满——选卡动态确认
+| # | 风险 | 缓解 |
+|---|------|------|
+| 1 | urma_import_seg 的 ubva 寻址在 SPDK 多队列/多连接场景的语义（每 qpair 一套 uasid？） | V2 首测单 qpair；多 qpair 问题实测暴露后再设计 |
+| 2 | imported 段的生命周期（qpair 断开时 unimport/unreg 顺序） | C3 明确释放顺序，异常路径逐一核对 |
+| 3 | NPU 进程异常退出导致段泄漏 | urma_admin show 巡检 + 重启恢复路径已验证（P2-14） |
+| 4 | 133 生产负载（vLLM）共享 NPU 的资源竞争 | 测试窗口协调，选卡避开在用卡 |
 
-## 5. 实施计划
+## 7. 实施批次
 
-| 批次 | 内容 | 前置 |
-|------|------|------|
-| P2-20 | libnds 集成进 urma_perf（nds_init/register/transfer 三接口）+ 编译 | 无 |
-| P2-21 | V1 功能验证（单块双向） | P2-20 |
-| P2-22 | V2 性能基线（各尺寸/队列深度）+ 与 AIO 对照 | P2-21 |
-| P2-23 | SPDK 集成评审（基于 V2 数据决定方案 B 是否启动） | P2-22 |
-
-## 6. 开放问题
-
-1. libnds 的打包/安装形态（CCDK build.sh 产出的 libnds.so 是否可独立
-   dlopen，还是需要完整 CANN env）
-2. nds_transfer 的并发模型（多队列/多线程是否安全）
-3. RA 注册段的生命周期管理（进程退出/异常时的清理路径）
+| 批次 | 内容 | 执行侧 |
+|------|------|--------|
+| P2-20 | 模块 A：NPU provider RA/HCCP 注册 + get_segment_info（外部开发，nds_v1 push） | 外部 |
+| P2-21 | 模块 B/C：段信息交换 + target 导入 + 数据面（外部开发） | 外部 |
+| P2-22 | 133 上构建 + V2 验证（urma_perf -M npu 双向数据判决） | 测试 Agent |
+| P2-23 | V3 全链路直连首测 + 性能对比（直连 vs 中转） | 测试 Agent |
