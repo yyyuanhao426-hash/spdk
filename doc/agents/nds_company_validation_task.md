@@ -468,6 +468,39 @@ vLLM 生产负载在跑 NPU0/2/3/4/5）。测试 agent 主动复验 Phase 2 全�
 ① 写方向（HBM→盘）验证；② 文件路径 FIEMAP 缺陷（同事C 代码，可绕过/
 反馈）；③ SPDK 集成形态设计。
 
+### 回执导入 2026-09-23 #P219（批次 P2-19 回执，用户带回）—— 🎯🎯 NDS-SSD 直连路线确认
+
+**判决实验通过：RA/HCCP 注册的 HBM 可被 URMA jetty（CTP）远端
+READ/WRITE，双向数据逐字节一致。P2-8 的 non_pin 段阻塞正式解除。**
+
+- 目标对齐 ✓：我们 = NDS = NPU 直连标准 NVMe SSD；RA/HCCP 只是 HBM
+  注册拼图；SSU 硬件不再深入
+- A ✅：P1 探针——aclrtMalloc HBM(HUGE_FIRST) + pattern 0xA5 →
+  nds_init（内部 RaInit / RaCtxInit / RaCtxQpCreate，libra.so）→
+  nds_buf_register(HBM)（= RaCtxLmemRegister nonPin）→
+  nds_get_segment_info → TCP 交换 {eid, uasid, jetty_id, token_id, va, len}
+- B ✅：P2——READ 走 CCDK 官方导出
+  nds_urma_transfer_read_imported_to_local（内部 urma_import_seg +
+  urma_import_jetty(CTP) + URMA READ）→ **verify(0xA5) mismatches=0
+  MATCH**；WRITE 用 CCDK 导出构造器自建 URMA WRITE → cr.status=0
+- P1 收尾 ✅：post-WRITE D2H rc=0，pattern(0x5A) mismatches=0 MATCH
+- **判定：双向闭环成立 → NDS-SSD 直连路线确认 🎯。HBM 注册问题解决，
+  剩余是 SPDK provider 集成（工程化）——可请外部出 provider 集成设计**
+
+**工程要点（务必带回）**：
+1. RA eid 与 URMA eid 是两套命名：RA eid（…df000100）无法被
+   urma_get_device_by_eid 命中；本地 ctx 须用
+   nds_query_device0_local_eid（sysfs 派生）自建；RA 段按
+   {eid,uasid,va,token} import
+2. CTP 必须；RTP 不通
+3. 驱动 rc2 后 URMA 设备名已变：udma3/udma7 → udmac{0,1}d1e{2..6}
+4. READ 用 CCDK 导出函数即可；WRITE 需自建；import_jetty 的 token=0
+   （NDS_URMA_TRANSFER_REMOTE_JETTY_TOKEN），本地 seg 用
+   NDS_URMA_TOKEN=0xACFE
+5. 编译必须与 CCDK 完全一致（-I/usr/include/ub/umdk/urma +
+   -l:liburma.so；不能用 umdk/src 的 urma_api.h，结构体布局不一致会
+   EPERM）
+
 ### 回执导入 2026-10-09 #P216（批次 P2-16 回执，用户带回）—— 🎯 直连路线复活：发现第三条官方 HBM 注册路径
 
 **一句话：同事C 的 CCDK（NPU Direct SSU）完全绕开了我们卡住的
