@@ -424,6 +424,40 @@ vLLM 生产负载在跑 NPU0/2/3/4/5）。测试 agent 主动复验 Phase 2 全�
 - 现场隔离：大页 1024（他人值未动）、系统零痕迹（ini md5 还原、
   vendors 空）、无残留进程；产物保留 p211_kernel/custom_opp/p214_log。
 
+### 回执导入 2026-10-09 #P216（批次 P2-16 回执，用户带回）—— 🎯 直连路线复活：发现第三条官方 HBM 注册路径
+
+**一句话：同事C 的 CCDK（NPU Direct SSU）完全绕开了我们卡住的
+CASM/libhcomm/AICPU 体系——HBM 注册走 RA/HCCP（libra.so）的
+RaCtxLmemRegister(nonPin)，数据面走内核 nvme_nds 驱动（NVMe-over-UB），
+且 133 的前置件几乎全部在位。**
+
+**机制链（同事C 的解法，逐环节实证出处）**：
+- ① HBM 注册 = **RA/HCCP UB API**（非 hcomm/CASM）：nds_buf_register()
+  先 aclrtPointerGetAttributes 判归属 → HBM 填
+  MrRegInfoT{addr,size, ub.flags{tokenPolicy=NONE, nonPin=ENABLE,
+  access=RW|ATOMIC}} → RaCtxLmemRegister(handle_ub,...) → 产出
+  MemKey/targetSegHandle。libra.so 由 plugin_loader dlopen 加载
+  （RaInit/RaCtxInit/RaCtxLmemRegister/RaCtxQpCreate/RaCtxCqCreate/
+  RaCtxTokenIdAlloc/RaCtxQpImport...）
+- ② 跨进程/跨节点 = 裸 URMA verbs：urma_import_seg(ubva{eid,uasid,va},
+  NON_CACHEABLE, RW|ATOMIC, SEG_NOMAP) + urma_import_jetty(CTP, TM_RM)
+  + urma_post_jetty_send_wr(URMA_OPC_READ) + urma_poll_jfc——段元数据
+  {eid, uasid, jetty_id, token_id} 经进程间交换
+- ③ 数据面 = **内核 nvme_nds 驱动**（/dev/nvme-nds，ioctl
+  NDS_IOCTL_FILE_TRANSFER）：NVMe-over-UB 内核搬运，无用户态拷贝、
+  无 AICPU、无 OPP 安装、无签名包
+- ④ FIEMAP 取文件物理块 → 支持普通文件/块设备/LVM/MD RAID（零拷贝关键）
+
+**三重阻塞对照（全数解除）**：
+| 我们的阻塞 | 同事C 解法 |
+| HBM 远程注册（CASM/libhcomm 被阻断） | RaCtxLmemRegister(nonPin)——同思路换官方 RA 通道 |
+| AICPU kernel 装载（系统级安装+签名） | 数据面=内核 nvme_nds 驱动 ioctl，彻底免 OPP/CMS |
+| 设备 CMS 签名校验 | 不向设备发包 → 不触发 |
+
+**133 前置件现状（几乎全在位）**：/dev/nvme-nds ✅、nvme_nds 模块已加载
+（refcount 2050！）✅、/sys/class/ubcore+udmac* ✅、libra.so/liburma.so
+✅。开放问题：SPDK/NVMe 栈与 nvme-nds 的关系（他们要求存储侧是 UB-SSD）。
+
 ### 回执导入 2026-10-08 #P215（批次 P2-15 回执，用户带回）—— 三路全堵，直连在 133 定局
 
 **三项只读侦察全部给出否定性结论（每项均有实证），"直连在 133"的所有
@@ -1010,6 +1044,64 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-23 #49：批次 P2-17（CCDK/nds-bench 构建与 HBM 直连实测）
+
+**背景**：P2-16 发现同事C 的 CCDK（NPU Direct SSU）有完整的 HBM 直连
+机制链（RA/HCCP 注册 + 内核 nvme_nds 数据面），133 前置件几乎全在位。
+本批 = 在 133 上构建 CCDK、跑 nds-bench，实测 RA/HCCP 路径的 HBM 注册
+与读写——**这是直连路线复活后的第一场实测**。
+
+**A. 获取与构建**：
+```bash
+# A1. 同事C 仓已在 P2-16 clone 到 /home/tools/app/colleague_c_repo（若无重新 clone，
+#     仓地址：ssh://git@codehub-dg-y.huawei.com:2222/LingquAIArchitecture/ConvergedComputing/CCDK.git master）
+cd /home/tools/app/colleague_c_repo && git log --oneline -1   # 应 fab20ee
+# A2. 构建（build.sh all 默认 NDS_HAVE_URMA=ON；CANN env 先 source）：
+source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null
+bash build.sh all 2>&1 | tail -20
+# 失败则逐项排查（cmake 版本/gcc/依赖）原样带回
+ls -la build/ 或产物目录（nds-bench 二进制在哪）
+```
+
+**B. mock 模式先行（无硬件验证代码通路）**：
+```bash
+# 按 nds-bench 的 README/用法（make 或 run_test.sh，mock 无硬件跑法）
+# 跑 nds-sync / nds-async 各一组，确认框架本身可运行
+```
+
+**C. 真机模式（核心判决）**：
+```bash
+# C1. 现状盘点（HBM 直连的前置件）：
+ls -la /dev/nvme-nds
+cat /proc/modules | grep nvme_nds          # refcount 2050 = 已被谁用着？
+ls /sys/class/ubcore /sys/class/uburma | head
+# C2. nds-bench 真机模式（NDSBENCH_HAVE_NDS=1）：
+#   HBM slab（aclrtMalloc HUGE_FIRST）+ --verify
+#   nds-sync / nds-async 各跑一组，记录 HBM 注册（RaCtxLmemRegister）
+#   是否成功、数据读写是否一致
+# C3. 若 bench 涉及 UB-SSU 目标：查 133 是否已有 UB 盘挂载
+#     （nvme_nds refcount 2050 暗示有活动连接——查明是谁/什么盘）：
+ls /sys/class/ubcore/*/ 2>/dev/null | head
+cat /proc/modules | grep -E "nvme|ub" | head -10
+```
+
+**D. 判定与回传**：
+```text
+D1. RA 注册 HBM 成功（无 4096/无 -ENOENT）→ 直连注册路径复活 ✅
+D2. URMA 读写（CTP）对 RA 注册的 HBM 段数据一致 → 直连数据面确认 🎯
+    （P2-8 的 non_pin 失败对照：RA 路径走 devmm/SVM 解析，理论上绕开
+     "SVM VA 不可远端 DMA"的限制——实测见分晓）
+D3. 任一环节失败 → 错误码/dmesg 原样带回，外部继续定位
+```
+
+**注意**：全程低可见度（自家目录、跑完恢复）；nvme_nds refcount 2050
+说明有别的进程在用 nvme-nds——**只观察不干扰**；若 bench 需要独占
+nvme-nds 或影响现有连接，记录后跳过该用例。
+
+**回传**：构建输出 + mock/真机各轮结果 + C1 现状盘点，注明
+「批次 P2-17 完毕」+ 判定链（D1/D2/D3）。
+
+### 指令 2026-09-23 #48：批次 P2-16（同事C NPU-direct-SSU 代码仓侦察，全只读）
 ### 指令 2026-09-23 #48：批次 P2-16（同事C NPU-direct-SSU 代码仓侦察，全只读）
 
 **背景（供理解侦察目的）**：我们正在做 NDS（NPU HBM 经 URMA 直连远端
