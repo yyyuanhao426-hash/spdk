@@ -1071,7 +1071,6 @@ grep -rn -iE "hardware|硬件|ssu|盘" README*.md docs/ 2>/dev/null | head -10
 外传、不评价代码质量——目的是找"HBM 直连的解法"。
 
 ### 指令 2026-09-23 #47：批次 P2-13（ASCEND_CUSTOM_OPP_PATH 用户目录加载实验——红线内完成最后一步）
-### 指令 2026-09-23 #47：批次 P2-13（ASCEND_CUSTOM_OPP_PATH 用户目录加载实验——红线内完成最后一步）
 
 **背景**：P2-12 发现 CANN 官方支持用户侧自定义算子安装路径
 ASCEND_CUSTOM_OPP_PATH（被 libge_runner/libregister/libmmpa 消费）。
