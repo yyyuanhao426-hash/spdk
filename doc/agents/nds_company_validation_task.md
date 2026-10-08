@@ -424,6 +424,29 @@ vLLM 生产负载在跑 NPU0/2/3/4/5）。测试 agent 主动复验 Phase 2 全�
 - 现场隔离：大页 1024（他人值未动）、系统零痕迹（ini md5 还原、
   vendors 空）、无残留进程；产物保留 p211_kernel/custom_opp/p214_log。
 
+### 回执导入 2026-10-09 #P217（批次 P2-17 回执，用户带回）—— 🎯 直连数据面实测打通（块设备方向）
+
+**判定链：**
+- D1 ✅ **RA 注册 HBM 复活**：nds_buf_register(HBM)=0（即
+  RaCtxLmemRegister(nonPin) 路径），无 4096/无 -ENOENT——**第三条官方
+  HBM 注册路径（RA/HCCP）实测可用**，绕开 CASM/libhcomm/AICPU 全部死结
+- D2 🎯 **块设备直连数据一致**：ndsbench + 自研只读程序对 /dev/nvme1n1
+  （**UB-SSU 裸盘，4G，挂载于 /home/ssu/ramdisk**——该硬件就挂在 133 上！）
+  做偏移读取（@4096 256K、@677380096 4K），**NDS-HBM 读 vs 宿主 pread
+  逐字节一致**（含 ext4 superblock 特征）——即 **UB-SSD 盘上数据经
+  nvme_nds 驱动直达 NPU HBM**，直连数据面确认
+- D3 ⚠️ 文件路径（nds_file_io_common）返回全 0（静默零数据，非错误码）：
+  排除时序/cache/媒质因素（dd 直读媒质=模式、文件内容=模式、NDS 读裸盘
+  同偏移一致），定位嫌疑 = 文件偏移→物理块（FIEMAP）翻译环节缺陷
+  （nds.c 的 nds_read 分派 / nds_io.c:95 resolve_char_dev_path）——
+  **同事C 代码缺陷，可用块设备路径绕过或反馈**
+- 环境注记：nvme1n1 = 4G UB-SSU 裸盘已挂载（ext4）；nvme_nds refcount
+  2050→1700→1 波动（他租户活动）；我们未 rmmod、未独占
+
+**外部判定：直连路线数据面复活并实测确认（块设备方向）。** 剩余：
+① 写方向（HBM→盘）验证；② 文件路径 FIEMAP 缺陷（同事C 代码，可绕过/
+反馈）；③ SPDK 集成形态设计。
+
 ### 回执导入 2026-10-09 #P216（批次 P2-16 回执，用户带回）—— 🎯 直连路线复活：发现第三条官方 HBM 注册路径
 
 **一句话：同事C 的 CCDK（NPU Direct SSU）完全绕开了我们卡住的
@@ -1044,6 +1067,52 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-23 #50：批次 P2-18（直连写方向验证——HBM→UB-SSU 落盘判决）
+
+**背景**：P2-17 确认读方向（UB-SSU 盘上数据 → nvme_nds → NPU HBM，逐字节
+一致）。本批验证**反方向**：HBM 中的 pattern 经 NDS 写入 UB-SSU 落盘，
+完成双向闭环。**安全红线：严禁触碰已挂载文件系统（/home/ssu/ramdisk）
+的元数据/超级块/他人文件——所有写入必须限于自建测试文件的已分配物理块内。**
+
+**A. 测试文件准备（安全写入的前提）**：
+```bash
+# 在挂载的 ext4 上新建专用测试文件（其物理块即安全写入范围）：
+dd if=/dev/urandom of=/home/ssu/ramdisk/p2w_test.bin bs=1M count=4
+sync
+filefrag -v /home/ssu/ramdisk/p2w_test.bin        # 记录 FIEMAP 物理块映射（原样带回）
+# 同时记录宿主基线：该文件内容的 md5 与前 256B hexdump
+```
+
+**B. NDS 写方向实测（HBM→盘）**：
+```c
+// 探针改造（基于 P2-17 自研程序）：
+// 1. aclrtMalloc HBM 64KB → 写入全新 pattern（如 0x5B 序列+偏移标记）
+// 2. nds_buf_register(HBM, nonPin) —— RA/HCCP 路径
+// 3. 按 A 项记录的 FIEMAP 物理块映射，对该文件的物理块执行
+//    NDS 块写（nds_block_io_common，写入前可先读出原内容备份到
+//    /home/tools/app/p218_log/origin_backup.bin 以便还原）
+// 4. 写后：host 侧 pread 该文件偏移 + md5 对比（应变为新 pattern）
+// 5. 还原：将 origin_backup 写回物理块，host 校验文件恢复原 md5
+```
+
+**C. 对照与附加**：
+```bash
+# C1. 对照：host 直接写（dd）该文件偏移 + NDS 读回——验证读方向仍一致
+# C2. 记录全程 dmesg（无内核报错 = 干净）
+```
+
+**D. 恢复现场**：
+```bash
+# 物理块写回原始内容（B4）后：
+rm /home/tools/app/p218_log/origin_backup.bin（或留档）
+md5 校验 p2w_test.bin 恢复原值 → rm 该文件 → sync
+```
+
+**回传**：FIEMAP 映射原文 + 写前/写后/还原三阶段 md5 与 hexdump + NDS
+写返回码 + dmesg，注明「批次 P2-18 完毕」+ 判定（**双向闭环是否成立**）。
+双向成立 = **直连路线端到端全部打通 🎯**（Phase 2 核心目标达成）。
+
+### 指令 2026-09-23 #49：批次 P2-17（CCDK/nds-bench 构建与 HBM 直连实测）
 ### 指令 2026-09-23 #49：批次 P2-17（CCDK/nds-bench 构建与 HBM 直连实测）
 
 **背景**：P2-16 发现同事C 的 CCDK（NPU Direct SSU）有完整的 HBM 直连
