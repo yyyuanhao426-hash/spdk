@@ -1088,6 +1088,41 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 目标重申（2026-09-23，外部 AI 致测试 Agent——先读这段再执行 #51）
+
+**我们的项目目标需要重新对齐**。此前 P2-14~P2-18 批次跟着证据走进了
+memfabric/UB-SSU 的领域，那些验证有价值，但容易让人忘记我们真正要做的
+东西。这里一次说清三个项目的谱系与边界：
+
+| 项目 | 计算侧 | 存储端点 | 作者 |
+|------|--------|----------|------|
+| **同事B：GDS** | GPU | NVMe SSD（PCIe） | 同事B |
+| **同事C：NPU Direct SSU** | NPU | **SSU（带 UB 插口的盘，原生 UB 端点）** | 同事C |
+| **我们：NDS** | NPU | **NVMe SSD（标准 NVMe 盘，经 URMA）** | 我们 |
+
+**我们的 NDS = NPU 直连标准 NVMe SSD**——与同事B 的 GDS 同构
+（GPU→NPU），与同事C 的 SSU 是**相邻但不同的项目**（他的存储端点是
+UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
+
+**为什么之前绕进了 SSU 领域**：直连路线的核心难题 = "HBM 如何被 URMA
+设备 DMA"。我们自己的方案（non_pin 直注、自研桥接）在 133 上失败后，
+侦察发现同事C 的仓里有"HBM 直接访问"的完整实现（RA/HCCP 注册路径），
+于是顺着它做了机制验证——**那些验证的真正目的，是找到了"HBM 注册的
+第三条官方路径"（RA/HCCP，libra.so 的 RaCtxLmemRegister nonPin），它与
+存储端点无关，正是我们 NDS-SSD 路线缺失的拼图**。
+
+**#51（批次 P2-19）就是把这个拼图装回我们的目标里**：
+- HBM 用 RA/HCCP 路径注册（新发现的官方路径）
+- 然后 URMA jetty（CTP）对它做远端读写——存储端是 NVMe SSD（经
+  nvmf_tgt），这才是 NDS 的直连
+- 判决：READ/WRITE 数据一致 = **NDS-SSD 直连路线确认**——HBM 注册
+  问题解决，剩余是 SPDK provider 集成（工程化）
+
+**边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
+除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
+的实验。
+
+### 指令 2026-09-23 #51：批次 P2-19（RA/HCCP 注册 HBM + URMA 读写判决——NDS-SSD 直连最终实验）
 ### 指令 2026-09-23 #51：批次 P2-19（RA/HCCP 注册 HBM + URMA 读写判决——NDS-SSD 直连最终实验）
 
 **背景**：P2-8 证明裸 `urma_register_seg(non_pin=1)` 注册的 HBM 段**不能被
