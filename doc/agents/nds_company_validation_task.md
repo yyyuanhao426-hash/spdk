@@ -1088,6 +1088,73 @@ a19f30031 (origin/nds_v1) docs(nds-task): 批次C-2回执导入...+ 指令#16 24
 
 ## 10. 外部 AI 指令区
 
+### 指令 2026-09-23 #51：批次 P2-19（RA/HCCP 注册 HBM + URMA 读写判决——NDS-SSD 直连最终实验）
+
+**背景**：P2-8 证明裸 `urma_register_seg(non_pin=1)` 注册的 HBM 段**不能被
+URMA jetty 远端 DMA**（HBM device VA 是进程内 SVM 语义）。P2-16 发现
+同事C 的 CCDK 有**第三条官方 HBM 注册路径：RA/HCCP（libra.so）的
+RaCtxLmemRegister(nonPin)**——且其 nds_urma.c 把「RA 注册 + URMA jetty
+远端读写」组合成了可用通路（跨节点 HBM 访问）。本批 = 用 RA 注册替换
+裸 non_pin 注册，重跑 P2-8 的双进程读写回环——**判决我们的
+NDS-SSD 直连（NPU HBM ↔ NVMe SSD over URMA）是否可行**。
+
+**参考代码（133 上已有）**：
+- RA 加载/注册：/home/tools/app/colleague_c_repo/src/hybm/csrc/under_api/
+  （dl_hal_api.cpp 的 libra dlopen + plugin_loader.c）与
+  rdma_agent_plugin.h（MrRegInfoT/RegSegFlag 定义）
+- 同事C 的组合用法：nds/src/nds.c（nds_buf_register：判归属→
+  RaCtxLmemRegister）与 nds/src/nds_urma.c（urma_import_seg/ jetty READ）
+- P2-8 探针：/home/tools/app/p28_log/（jetty/TP/TCP 交换流程可复用）
+
+**A. 探针改造（P2-8 探针 + RA 注册替换）**：
+```c
+// P1（initiator，udma3）改造点：
+// 1. dlopen libra.so → RaInit/RaCtxInit（照 colleague_c_repo 的
+//    plugin_loader.c 加载序列）
+// 2. HBM 注册改用：
+//    MrRegInfoT info = {0};
+//    info.in.mem.addr = hbm_va; info.in.mem.size = 65536;
+//    info.in.ub.flags.bs.tokenPolicy = TOKEN_POLICY_NONE;
+//    info.in.ub.flags.bs.tokenIdValid = FLAG_DISABLE;
+//    info.in.ub.flags.bs.access = MEM_SEG_ACCESS_READ|WRITE|ATOMIC;
+//    info.in.ub.flags.bs.cacheable = FLAG_DISABLE;
+//    info.in.ub.flags.bs.nonPin = FLAG_ENABLE;    // ← 关键
+//    RaCtxLmemRegister(handle_ub, &info_lm_reg, &lm_handle);
+//    （原 urma_register_seg(non_pin=1) 调用删除）
+// 3. 注册产出 MemKey/targetSegHandle → 连同 {eid, uasid, va, jetty_id,
+//    token_id} 经 TCP 交换给 P2（格式参照 nds_get_segment_info）
+// P2（target，udma7）改造点：
+//    收到对端 {eid, uasid, va, jetty_id, token_id} 后：
+//    urma_import_seg(ubva{eid,uasid,va}, NON_CACHEABLE, RW|ATOMIC, SEG_NOMAP)
+//    + urma_import_jetty(CTP) → URMA READ/WRITE（照 P2-8 流程）
+```
+
+**B. 双进程读写判决（同 P2-8 流程，注册换 RA）**：
+```text
+P1（udma3）：aclrtMalloc HBM 64KB → aclrtMemcpy H2D 写 pattern(0xA5+偏移)
+  → RA 注册 → URMA ctx/jetty(CTP) → TCP server
+P2（udma7）：host 缓冲 64KB → import_seg + import_jetty →
+  URMA READ（拉 P1 HBM → P2 host 缓冲）→ 逐字节比对 pattern
+  → URMA WRITE（写新 pattern 进 HBM 段）
+P1 收尾：aclrtMemcpy D2H 读回 HBM 段 → 验证 P2 写入的数据
+```
+
+**C. 判定与回传**：
+```text
+READ pattern 一致 + WRITE 后 P1 D2H 读回一致
+  → **NDS-SSD 直连路线确认 🎯**（RA/HCCP 注册解决了 HBM 的 URMA DMA）
+  → 外部立即出 SPDK provider 集成设计（NPU provider 挂 RA 注册）
+READ 失败（LOC_ACCESS_ERR 等）→ 错误码/dmesg 原样带回
+  → 外部评估 RA 语义与 UB 通路差异
+```
+
+**注意**：CTP 必须（RTP 在 get_tp_list 失败）；libra dlopen 序列照
+colleague_c_repo 的 plugin_loader.c；全程低可见度、跑完恢复。
+
+**回传**：探针改造 diff 说明 + 双进程全输出 + 判定，注明
+「批次 P2-19 完毕」。
+
+### 指令 2026-09-23 #50：批次 P2-18（直连写方向验证——HBM→UB-SSU 落盘判决）
 ### 指令 2026-09-23 #50：批次 P2-18（直连写方向验证——HBM→UB-SSU 落盘判决）
 
 **背景**：P2-17 确认读方向（UB-SSU 盘上数据 → nvme_nds → NPU HBM，逐字节
