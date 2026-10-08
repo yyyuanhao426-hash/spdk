@@ -1175,7 +1175,47 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
 
-### 指令 2026-09-23 #51：批次 P2-19（RA/HCCP 注册 HBM + URMA 读写判决——NDS-SSD 直连最终实验）
+### 指令 2026-09-23 #53：批次 P2-21（Module A 修正——照 nds_init_ra 补全 RA 序列 + 双进程复验）
+
+**背景**：P2-20 定位 Module A 三缺陷：RA 序列缺 rtOpenNetService/
+GetPhyDevId/EidInfoList 三个前置调用，且 RaInit/RaCtxInit 参数全错
+（0/0/0/false → 应为实测值）。权威参照 = colleague_c_repo/nds/src/nds.c
+的 nds_init_ra（约 L347）。**本批授权：按该参照修正 Module A 并复验。**
+
+**A. 参照提取（先原样贴回）**：
+```bash
+sed -n '320,420p' /home/tools/app/colleague_c_repo/nds/src/nds.c
+# 原样带回 nds_init_ra 的完整 RA 序列（各调用与参数）
+```
+
+**B. 修正 urma_perf_npu.c（按 A 项参照）**：
+```c
+// npu_driver_init 的 RA 段补全（顺序照 nds_init_ra）：
+// 1. rtOpenNetService：dlopen libruntime.so → 调用（参数 --hdcType=18,
+//    len=12，照 colleague_c_repo 的用法）
+// 2. aclrtGetPhyDevIdByLogicDevId(device_id, &phy_id)（libacl_rt.so）
+// 3. RaGetDevEidInfoNum / RaGetDevEidInfoList → 取 eid/eidIndex
+// 4. RaInit{phy_id=实查值, nic_position=NETWORK_OFFLINE(1),
+//    hdc_type=18, enable_hdc_async=true}
+// 5. RaCtxInit{mode=NETWORK_OFFLINE(1), phy_id, ub.eid_index/ub.eid=查询值}
+// 符号名修正：RaCtxDeinit（小写 i）；补绑 RaDeinit
+```
+
+**C. 运行陷阱修正**：
+```bash
+# urma_perf 运行时 LD_LIBRARY_PATH 去掉 $UMDK/lib（liburma 与系统冲突
+# 致 aclrtSetDevice=507033）；只用 CANN/aarch64-linux/lib64:/usr/lib64
+```
+
+**D. 双进程复验（P2-19 流程）**：
+```text
+P1（udma3）：aclrtMalloc HBM + pattern → RA 注册（修正后）→ jetty → TCP
+P2（udma7）：import_seg + import_jetty(CTP) → URMA READ/WRITE
+判定：READ pattern 一致 + WRITE 回写一致 → Module A 修复确认 🎯
+```
+
+**回传**：A 项 nds_init_ra 原文 + B 项修正 diff + D 项判定链，注明
+「批次 P2-21 完毕」。
 ### 指令 2026-09-23 #51：批次 P2-19（RA/HCCP 注册 HBM + URMA 读写判决——NDS-SSD 直连最终实验）
 
 **背景**：P2-8 证明裸 `urma_register_seg(non_pin=1)` 注册的 HBM 段**不能被
@@ -1243,7 +1283,6 @@ colleague_c_repo 的 plugin_loader.c；全程低可见度、跑完恢复。
 「批次 P2-19 完毕」。
 
 ### 指令 2026-09-23 #50：批次 P2-18（直连写方向验证——HBM→UB-SSU 落盘判决）
-### 指令 2026-09-23 #50：批次 P2-18（直连写方向验证——HBM→UB-SSU 落盘判决）
 
 **背景**：P2-17 确认读方向（UB-SSU 盘上数据 → nvme_nds → NPU HBM，逐字节
 一致）。本批验证**反方向**：HBM 中的 pattern 经 NDS 写入 UB-SSU 落盘，
@@ -1288,7 +1327,6 @@ md5 校验 p2w_test.bin 恢复原值 → rm 该文件 → sync
 写返回码 + dmesg，注明「批次 P2-18 完毕」+ 判定（**双向闭环是否成立**）。
 双向成立 = **直连路线端到端全部打通 🎯**（Phase 2 核心目标达成）。
 
-### 指令 2026-09-23 #49：批次 P2-17（CCDK/nds-bench 构建与 HBM 直连实测）
 ### 指令 2026-09-23 #49：批次 P2-17（CCDK/nds-bench 构建与 HBM 直连实测）
 
 **背景**：P2-16 发现同事C 的 CCDK（NPU Direct SSU）有完整的 HBM 直连
@@ -1346,7 +1384,6 @@ nvme-nds 或影响现有连接，记录后跳过该用例。
 **回传**：构建输出 + mock/真机各轮结果 + C1 现状盘点，注明
 「批次 P2-17 完毕」+ 判定链（D1/D2/D3）。
 
-### 指令 2026-09-23 #48：批次 P2-16（同事C NPU-direct-SSU 代码仓侦察，全只读）
 ### 指令 2026-09-23 #48：批次 P2-16（同事C NPU-direct-SSU 代码仓侦察，全只读）
 
 **背景（供理解侦察目的）**：我们正在做 NDS（NPU HBM 经 URMA 直连远端
@@ -1454,7 +1491,6 @@ P2 侧 AICPU kernel 读 P1 导入的 HBM → 数据到 P2 host 缓冲 → 比对
 「批次 P2-13 完毕」。若仍失败，AICPU 侧日志原样带回（外部分析 weak
 符号解析机制）。
 
-### 指令 2026-09-23 #46：批次 P2-12（AICPU 免安装加载方式侦察，全只读）
 ### 指令 2026-09-23 #46：批次 P2-12（AICPU 免安装加载方式侦察，全只读）
 
 **背景**：P2-11 机制链全通，最后一步（HYBM AICPU kernel 包装入 CANN OPP
