@@ -401,6 +401,29 @@ kernel 未编译安装（源码/ini/CMake 目标齐全，缺 libcann_hybm_kernel
 设备 kernel 承载（AscendC），SPDK 集成需引入设备 kernel 编译链——这是
 Phase 2 的方向决策点（三种数据面方案已呈用户）。
 
+### 回执导入 2026-10-08 #P214（批次 P2-14 回执：环境升级后主动复验）
+
+**背景**：用户度假归来发现 133 环境已升级（driver 25.6.rc1.b136→rc2、
+kernel 6.6.0-155.0.0.143→159.4.14.168.oe2403sp4、大页被他人设 1024、
+vLLM 生产负载在跑 NPU0/2/3/4/5）。测试 agent 主动复验 Phase 2 全部结论
+在新环境是否成立，并处理一起 memfabric 自动写入系统树事件。
+
+- **复验结论：Phase 2 全部结论在 rc2 上成立，无需修订**——P2-13 启动探针
+  完全重现（507018/open so failed/11002）；MEM_PAGE_HUGE 仍恒 65534
+  （即使大页已有 1024）；memfabric 两示例逃生门通过。代码行为与升级前
+  完全一致。
+- **意外事件（已回滚）**：memfabric 示例运行时其内部 _provision.py **自动
+  写入系统 OPP 树**（/usr/local/Ascend/cann-9.1.0/opp/vendors/cust/... +
+  conf/ascend_package_load.ini 追加 5 行）——已精确恢复（ini md5 逐字节
+  一致、vendors 树清空，对在跑 vLLM 零影响）。
+- **重要副产品**：memfabric 的自动 provision 实测**真能写入系统 OPP 树
+  并追加 ini**——"系统级安装"这条路在 rc2 上机制可行（设备 CMS 签名
+  校验是否放行自建包仍待验）。
+- **SOP 建议（采纳）**：今后每次运行 memfabric，跑前/跑后必须检查系统
+  conf/ascend_package_load.ini 与 opp/vendors/ 并回滚（自愈式自动安装）。
+- 现场隔离：大页 1024（他人值未动）、系统零痕迹（ini md5 还原、
+  vendors 空）、无残留进程；产物保留 p211_kernel/custom_opp/p214_log。
+
 ### 回执导入 2026-09-23 #P213（批次 P2-13 回执，用户带回）—— 用户目录路径全部无效，直连在 133 定局
 
 - A ✅：customize 官方布局 + cust 镜像 + 包形态 + custom_latest 四种配置
