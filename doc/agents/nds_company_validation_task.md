@@ -244,6 +244,92 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P222（批次 P2-22 回执，用户带回）—— Module A 修正固化 + npu 快验通过；npu-staged 回归被环境阻塞
+
+**判定：A/B/C ✅（修正固化进 git + 重编通过 + RA/HCCP context ready）；
+D ⚠️ npu-staged 回归未能判定——URMA 回环握手在 133 当前不可用
+（-M cpu 对照同失败，排除本次改动嫌疑）；E ✅ 现场还原。**
+
+- **A ✅ 拉取固化**：133 任务仓经华为代理 proxycn2.huawei.com:8080 拉取
+  （直连 GitHub 被阻断）；pull 2b0277a→b4d1a158，d530e0090 经
+  merge-base 确认在 HEAD 内；marker 全命中（ra_hccp_eid_u=3 等）。
+  133 工作区 urma_perf_npu.c = git 版（md5 c0daaa…），P2-21 手改版
+  备份至 p222_log/ 后作废。
+- **B ✅ 重编**：只编 example 目录（P2-20 绕行方式），CC+LINK rc=0，
+  urma_perf 5813232B。
+- **C ✅ npu 快验**：`-M npu -g 0` →
+  `RA/HCCP context ready (phy_id=0 eid_index=0)` 命中。
+- **D ⚠️ 环境阻塞**：nvmf_tgt URMA 回环（hugepages 2048/loop.img 2G/
+  bdev_aio/nvmf_create_transport -t URMA/listener 4420）握手失败：
+  target `nvmf_urma_accept: accept: handshake failed rc=-5`，initiator
+  connection reset。**对照组 -M cpu（不含 NPU/Module A 路径）同报
+  rc=-5 → URMA 回环传输本身在 133 不可用，非我方回归**。另：系统版
+  liburma 能建 transport 但握手失败；UMDK 版 device open failed；
+  UMDK/lib 进 initiator 即 aclrtSetDevice=507033（复证实）。
+  → 待环境恢复（URMA 设备空闲/版本一致）后补跑。
+- **E ✅ 还原**：target 进程已 kill、loop.img 删除、大页 2048 保持
+  基线、无残留进程。
+
+### 回执导入 2026-10-09 #P223（批次 P2-23 回执，用户带回）—— 🎯 数据链路判定补证（CCDK 权威结论）
+
+**五项全达成（纯只读）。三大结论：HBM↔SSU 不经 host RAM；四元组
+权威来源 = RA jetty/QP key（非 sysfs eid）；950DT 自带 UB 端口不经
+PCIe。另有一项环境认知修正：133 上无真 UB-SSU，nvme1n1 是 TCP 回环
+逻辑盘。**
+
+- **A ✅ nvme_nds 数据面：HBM↔SSU 直达，不经 host RAM**：
+  nds_read/write（nds.c L763/L814）对 RA 注册的 HBM 缓冲走
+  nds_resolve_local_target → nds_block_io_common → build_io_order
+  （nds_io.c:188：va=HBM device VA，offset=SSD 物理块）→
+  ioctl(/dev/nvme-nds, NDS_CMD_TRANSFER) 内核 DMA；仅 host 缓冲
+  （device_id==NDS_HOST_ID）才走 host segment 中转。CCDK README
+  明确"绕过 CPU 和用户态内存拷贝"。
+- **B ✅ 四元组权威来源（模块 B 合成 urma_seg_t 的依据）**：
+  nds_get_segment_info（nds.c:581）——{eid, uasid, jetty_id} 全部取自
+  **RA jetty（RaCtxQpCreate 输出 key，经 nds_parse_jetty_info 解析）**；
+  token_id 取自 **RA lmem 注册（RaCtxLmemRegister 输出 key）**。
+  **不是** sysfs 派生 eid——nds_query_device0_local_eid（读
+  /proc/asdrv_ub/pair_info）仅用于 transfer 侧本地 jetty，不参与段信息。
+  NDS 未调用 urma_get_uasid()；P2-19 实测 uasid=0x0 与 RA jetty 一致。
+  token：NDS_URMA_TOKEN=0xACFE（nds_urma.h:25），段导入用；
+  jetty 导入 token=0。
+- **C ✅ CCDK urma_import_seg 调用细节（nds_urma.c:457）**：
+  remote_seg={ubva{eid,uasid,va}, len, attr{NON_CACHEABLE,
+  R|W|ATOMIC}, token_id=RA lmem token_id}；urma_import_seg(ctx,
+  &remote_seg, token=0xACFE, 0, flag{NON_CACHEABLE, R|W|A,
+  **SEG_NOMAP**})。jetty 导入（:442）：rjetty{eid,uasid,id=RA jetty_id,
+  trans_mode=URMA_TM_RM, tp_type=**CTP**, flag.order_type=DEF_ORDER}，
+  token=0。数据面 nds_urma_post_read：URMA_OPC_READ，local/remote
+  sge 各带 tseg，poll JFC。与 P2-19 探针一致。注：CCDK 只封装了
+  READ，WRITE 需自建（P2-19 已验证可行）。
+- **D ✅ 950DT 自带 UB 端口（NPU 不经 PCIe）**：lspci 无任何
+  ascend/davinci PCIe 设备（仅 HiSilicon SoC 部件 + PCIe Root Port +
+  iBMC）；NPU 在 /sys/devices/virtual/devdrv-class/davinci0..7（SoC
+  集成，非 PCIe 卡）；UB 独立总线 /sys/bus/ub/devices/
+  （ub_bus_controller0/1）；npu-smi info -t topo：NPU0..7 两两互联
+  全部 UB（无 PCIe/HCCS）。**判定：HBM 数据走 UB 总线，不经 PCIe
+  到 CPU——"完全绕开 CPU"在物理层成立。**
+- **E ⚠️ 环境认知修正：133 上不存在 UB-SSU 硬件**：urma_admin show
+  26 条 UB 端点全为 NPU 侧（df08/df0a 前缀）；NVMe 控制器仅
+  nvme0（PCIe 系统盘 7.68T）+ nvme1（**transport=tcp，
+  traddr=127.0.0.1:4421，model=Linux，subnqn=tcp_loopx3**）。即
+  nvme1n1（/home/ssu/ramdisk 那块 4G 盘）实为 **TCP 回环 nvmf 逻辑盘
+  （软件 target）**，不是 UB 硬件；本机无任何以 UB 端点注册的存储
+  设备。CCDK 的 SSU 经 NVMe-oF（TCP 或 URMA）访问——"UB-SSU"指
+  远端经 URMA/UB 到达的 SSU server。**修正 P2-17/P2-18 的表述：
+  当时验证的"直连"是 nvme_nds 驱动把 HBM 与该软件 NVMe 盘打通，
+  机制链（RA 注册+UB 传输）成立不变，但存储端点是软件回环盘。**
+
+**对模块 B/C 的直接输入（权威参数）**：
+1. initiator 侧（Module A 扩展）：RA 上下文建好后需 **RaCtxCqCreate +
+   RaCtxQpCreate** 产出 RA jetty（{eid,uasid,jetty_id} 来源），每段
+   RaCtxLmemRegister 产出 token_id → 合成 urma_seg_t 填入 capsule
+2. target 侧（Module C）：urma_import_seg 按上文 C 项参数
+   （SEG_NOMAP + R|W|A + seg token=0xACFE）+ urma_import_jetty
+   （CTP + token=0）
+3. 数据面直达性成立（A+D）：HBM 经 UB 直达，不落 host RAM、不经
+   PCIe——NPU 侧"零 CPU"完整确认
+
 ### 回执导入 2026-10-09 #P221（批次 P2-21 回执，用户带回）—— 🎯 Module A 修正通过 + 双进程复验无回归
 
 **判定：Module A 四缺陷全修（含真根因 = CtxInitAttr 结构对齐缺陷），
