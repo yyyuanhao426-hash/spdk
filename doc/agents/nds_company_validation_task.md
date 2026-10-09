@@ -1239,6 +1239,50 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
 
+### 指令 2026-10-09 #54：批次 P2-22（Module A 修正固化——git 版本替换本地 patch + 双模式回归）
+
+**背景**：P2-21 修正已由外部合入 nds_v1 并 push（commit d530e00，
+内容与 p221_moduleA_fix.patch 等价：CtxInitAttr 8 对齐 union + 五步
+RA 序列 + 符号名修正 + RTLD_GLOBAL）。本批把修正固化进 git 工作区，
+并验证无回归。**授权：git pull + 重编 urma_perf + 两种模式快验。**
+
+**A. 拉取并确认**：
+```bash
+cd /home/tools/app/spdk && git pull --ff-only
+git log --oneline -1          # 期望 d530e00
+grep -c "ra_hccp_eid_u\|npu_ra_init" examples/nvme/urma_perf/urma_perf_npu.c
+# 期望非零（=修正已在 git 版本内）
+```
+（确认后 133 上 p221_moduleA_fix.patch 即可作废，以 git 为准。）
+
+**B. 重编 urma_perf**（照 P2-20 的绕行方式，只编 example 目录）：
+```bash
+# 根 make 若因 dpdkbuild Meson 版本不匹配中断，仍只编 urma_perf 目录
+# 期望：CC urma_perf_npu.o + LINK urma_perf
+```
+
+**C. npu 模式快验（Module A git 版）**：
+```bash
+LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64:/usr/lib64 \
+  ./urma_perf -M npu -g 0
+```
+期望日志：`RA/HCCP context ready (phy_id=0 eid_index=0)`。
+（注：若 RaInit 返回 328002 属"重复初始化"，代码已按成功处理，不算失败。）
+（注：-M npu 的注册/数据面在 Module B/C 合入前仍会走旧路径失败，
+本项只判 RA 上下文就绪，不用等全链路通过。）
+
+**D. npu-staged 回归**：
+```bash
+# 与 Phase 1 相同命令，短跑（如 30s 或 1 万 IO）
+```
+判定：零错误（RTLD_GLOBAL 与 RA 前置调用理论上不影响中转路线，
+需实测排除）。
+
+**E. 现场还原**（进程/大页/系统 ini 与 vendors 树巡检，照 SOP）。
+
+**回传**：git log -1 + A 项 grep 结果 + B 项编译尾行 + C/D 项输出
+原文，注明「批次 P2-22 完毕」。
+
 ### 指令 2026-09-23 #53：批次 P2-21（Module A 修正——照 nds_init_ra 补全 RA 序列 + 双进程复验）
 
 **背景**：P2-20 定位 Module A 三缺陷：RA 序列缺 rtOpenNetService/
