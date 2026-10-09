@@ -1239,6 +1239,59 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
 
+### 指令 2026-10-09 #55：批次 P2-23（CCDK 只读侦察 + UB 拓扑确认——直连数据链路判定补证）
+
+**背景**：外部正在做 SPDK 集成（模块 B/C：段信息交换 + target 导入数据面）。
+同事B 的代码里 capsule 已携带 urma_seg_t{eid,uasid,va,len,attr,token_id}、
+target 侧已有 urma_import_seg 数据面（lib/nvmf/urma.c W5）——模块 B 的
+核心问题收敛为：**initiator 侧如何为 RA/HCCP 注册的 HBM 段合成这个
+urma_seg_t**。本批全部只读，为以下判定补证。
+
+**A. nvme_nds 数据面（判定 HBM↔SSU 是否经过 host RAM）**：
+```bash
+# colleague_c_repo/nds/src/ 下重点看 nds.c / nds_io.c /
+# nds_block_io_common.c 的 read/write 路径
+# 带回：读写入口函数原文（关键 50~100 行）+ 你的判断：
+# 数据是 HBM↔SSU 直达，还是中途落到 host 内存？
+```
+
+**B. nds_get_segment_info 的四元组来源（模块 B 合成段信息的依据）**：
+```bash
+# 带回：
+# 1. eid 字段由哪个函数填充？是 RA eid（RaGetDevEidInfoList）还是
+#    sysfs 派生的 URMA local eid（nds_query_device0_local_eid）？
+# 2. uasid 从哪来？（ds 的哪个字段/哪个调用？与 liburma 的
+#    urma_get_uasid() 是否等价？P2-19 实测 uasid=0x0）
+# 3. token 的含义与取值（NDS_URMA_TOKEN=0xACFE? 何时用 0?）
+# 4. 相关函数原文（nds_get_segment_info / nds_query_device0_local_eid）
+```
+
+**C. urma_import_seg 调用细节（target 侧对接）**：
+```bash
+# CCDK 里 urma_import_seg 的调用点：import_flag 各位取值、token 传法、
+# SEG_NOMAP 用没用。与 P2-19 探针写法对照，带回原文。
+```
+
+**D. 950DT UB 拓扑（判定 HBM 数据是否物理上经过 CPU/PCIe）**：
+```bash
+lspci | grep -i -E "ub|davinci|ascend"
+# /sys 下找 NPU 与 UB 网卡的拓扑关系（同一 root complex？）
+# colleague_c_repo 的 README/docs 里若有架构说明一并带回
+# 判定：950DT 是否自带 UB 端口（HBM 直挂 UB 网络），还是 HBM 数据
+# 需经 PCIe 到 CPU 侧再到 UB 网卡
+```
+
+**E. SSU 的 UB 端点性（判定 SSD 与 SSU 访问路径差异）**：
+```bash
+ls /sys/bus/ub/devices/ 2>/dev/null 或等价 ub 设备枚举
+# uburma/ubctl 列设备；判断 UB-SSU（nvme1n1 那块盘）是否以 UB 设备
+# 身份注册（有自己的 eid），还是仅作为普通 NVMe 控制器挂在 PCIe
+```
+
+**约束**：全部只读；不改任何文件；不跑 memfabric；现场零痕迹。
+
+**回传**：A~E 各项原文+判断，注明「批次 P2-23 完毕」。
+
 ### 指令 2026-10-09 #54：批次 P2-22（Module A 修正固化——git 版本替换本地 patch + 双模式回归）
 
 **背景**：P2-21 修正已由外部合入 nds_v1 并 push（commit d530e00，
