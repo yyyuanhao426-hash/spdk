@@ -10,11 +10,10 @@
  * documentation (aclrt* family); they are redeclared locally so no CANN
  * headers are needed at compile time, exactly like the CUDA path does.
  *
- * Known Phase 1 limitation: AscendCL exposes no public dmabuf export API
- * (no equivalent of cuMemGetHandleForAddressRange), so the NPU provider
- * leaves export_dmabuf NULL and the only direct-registration route is the
- * URMA peer-memory path (is_gpu_seg=1), which requires the Phase 2 kernel
- * NPU bridge module. */
+ * AscendCL exposes no public dmabuf export API, so direct registration goes
+ * through the RA/HCCP path (libra.so RaCtxLmemRegister with nonPin=ENABLE):
+ * the pinned HBM segment is remotely DMA-able via URMA jetty READ/WRITE with
+ * no kernel gpu_p2p framework (P2-19 verdict, P2-21 init sequence). */
 
 #include "spdk/stdinc.h"
 
@@ -76,13 +75,68 @@ struct ra_ctx_init_cfg {
 	int32_t mode;
 };
 
+union ra_hccp_eid_u {
+	uint8_t raw[16];
+	struct {
+		uint64_t reserved;
+		uint32_t prefix;
+		uint32_t addr;
+	} in4;
+	struct {
+		uint64_t subnet_prefix;
+		uint64_t interface_id;
+	} in6;
+};
+
+/* Mirrors CtxInitAttr from rdma_agent_plugin.h: union HccpEid contains a
+ * uint64_t so the struct is 8-byte aligned (eidIndex@8, eid@16, resv@32,
+ * sizeof 96). A plain uint8_t eid[16] layout is 4-byte aligned (sizeof 88)
+ * and RaCtxInit fails with 128003 "ra_get_init_ctx_handle failed" — the
+ * P2-21 root cause. */
 struct ra_ctx_init_attr {
 	uint32_t phy_id;
-	struct {
-		uint32_t eid_index;
-		uint8_t eid[16];
-	} ub;
+	union {
+		struct {
+			uint32_t notify_type;
+			int32_t family;
+		} rdma;
+		struct {
+			uint32_t eid_index;
+			union ra_hccp_eid_u eid;
+		} ub;
+	};
 	uint32_t resv[16];
+};
+
+/* nds.c constants (P2-21 verified on 133). */
+#define RA_HDC_TYPE 18
+#define RA_NETWORK_OFFLINE 1
+#define RA_INIT_REPEAT_RET_CODE 328002
+
+struct ra_info {
+	int32_t mode;
+	uint32_t phy_id;
+};
+
+struct ra_dev_eid_info {
+	char name[64];
+	uint32_t type;
+	uint32_t eid_index;
+	union ra_hccp_eid_u eid;
+	uint32_t die_id;
+	uint32_t chip_id;
+	uint32_t func_id;
+	uint32_t resv;
+};
+
+struct rt_proc_ext_param {
+	const char *param_info;
+	uint64_t param_len;
+};
+
+struct rt_net_service_open_args {
+	struct rt_proc_ext_param *ext_param_list;
+	uint64_t ext_param_cnt;
 };
 
 struct ra_hccp_mem_info {
@@ -136,12 +190,19 @@ struct ra_lmem_reg_info {
 };
 
 typedef int (*ra_init_fn)(struct ra_init_config *config);
+typedef int (*ra_deinit_fn)(struct ra_init_config *config);
 typedef int (*ra_ctx_init_fn)(struct ra_ctx_init_cfg *cfg,
 			      struct ra_ctx_init_attr *attr, void **ctx_handle);
 typedef int (*ra_ctx_lmem_register_fn)(void *ctx_handle,
 		struct ra_lmem_reg_info *lmem_info, void **lmem_handle);
 typedef int (*ra_ctx_lmem_unregister_fn)(void *ctx_handle, void *lmem_handle);
 typedef int (*ra_ctx_deinit_fn)(void *ctx_handle);
+typedef int (*ra_get_eid_num_fn)(struct ra_info info, unsigned int *num);
+typedef int (*ra_get_eid_list_fn)(struct ra_info info,
+				  struct ra_dev_eid_info *info_list,
+				  unsigned int *num);
+typedef int (*rt_open_net_service_fn)(struct rt_net_service_open_args *args);
+typedef int (*aclrt_get_phy_dev_id_fn)(int32_t device_id, uint32_t *phy_id);
 
 /* Segment descriptor exposed to the remote endpoint: the remote does
  * urma_import_seg(ubva{eid, uasid, va}) + urma_import_jetty(CTP) and its
@@ -157,12 +218,21 @@ struct npu_segment_info {
 struct npu_driver {
 	void *library;
 	void *ra_library;
+	void *rt_library;
+	void *rt_acl_library;
 	void *ra_ctx_handle;
+	struct ra_init_config ra_cfg;
+	uint32_t ra_phy_id;
 	ra_init_fn ra_init;
+	ra_deinit_fn ra_deinit;
 	ra_ctx_init_fn ra_ctx_init;
 	ra_ctx_lmem_register_fn ra_lmem_register;
 	ra_ctx_lmem_unregister_fn ra_lmem_unregister;
 	ra_ctx_deinit_fn ra_ctx_deinit;
+	ra_get_eid_num_fn ra_get_eid_num;
+	ra_get_eid_list_fn ra_get_eid_list;
+	rt_open_net_service_fn rt_open_net_service;
+	aclrt_get_phy_dev_id_fn get_phy_dev_id;
 	bool ra_ready;
 	uint8_t ra_eid[16];
 	aclrt_context_t context;
@@ -227,6 +297,138 @@ npu_load_symbol(const char *name)
 		} \
 	} while (0)
 
+/* RA/HCCP init sequence, mirrors colleague_c nds/src/nds.c nds_init
+ * (P2-21 verified on 133): rtOpenNetService("--hdcType=18") →
+ * aclrtGetPhyDevIdByLogicDevId → RaInit → RaGetDevEidInfoNum/List →
+ * RaCtxInit. Returns 0 on success; on any failure the RA path is disabled
+ * with a message and the provider keeps working for non-direct routes. */
+static int
+npu_ra_init(int32_t device_id)
+{
+	struct ra_ctx_init_cfg ra_ctx_cfg = {};
+	struct ra_ctx_init_attr ra_attr = {};
+	struct ra_info ra_info = {};
+	struct ra_dev_eid_info *eid_list = NULL;
+	unsigned int eid_num = 0;
+	struct rt_net_service_open_args rt_args = {};
+	struct rt_proc_ext_param rt_ext = {};
+	int ret;
+
+	ra_info.mode = RA_NETWORK_OFFLINE;
+
+	g_npu.ra_library = dlopen("libra.so", RTLD_NOW | RTLD_GLOBAL);
+	if (g_npu.ra_library == NULL) {
+		fprintf(stderr, "RA libra.so unavailable (%s)\n", dlerror());
+		return -1;
+	}
+	g_npu.ra_init = (ra_init_fn)dlsym(g_npu.ra_library, "RaInit");
+	g_npu.ra_ctx_init = (ra_ctx_init_fn)dlsym(g_npu.ra_library, "RaCtxInit");
+	g_npu.ra_lmem_register = (ra_ctx_lmem_register_fn)
+				 dlsym(g_npu.ra_library, "RaCtxLmemRegister");
+	g_npu.ra_lmem_unregister = (ra_ctx_lmem_unregister_fn)
+				   dlsym(g_npu.ra_library, "RaCtxLmemUnregister");
+	/* libra.so exports RaCtxDeinit (lowercase i, nm -D) — "RaCtxDeInit"
+	 * never resolves. */
+	g_npu.ra_ctx_deinit = (ra_ctx_deinit_fn)dlsym(g_npu.ra_library, "RaCtxDeinit");
+	g_npu.ra_deinit = (ra_deinit_fn)dlsym(g_npu.ra_library, "RaDeinit");
+	g_npu.ra_get_eid_num = (ra_get_eid_num_fn)
+			       dlsym(g_npu.ra_library, "RaGetDevEidInfoNum");
+	g_npu.ra_get_eid_list = (ra_get_eid_list_fn)
+				dlsym(g_npu.ra_library, "RaGetDevEidInfoList");
+	if (g_npu.ra_init == NULL || g_npu.ra_ctx_init == NULL ||
+	    g_npu.ra_lmem_register == NULL || g_npu.ra_lmem_unregister == NULL ||
+	    g_npu.ra_get_eid_num == NULL || g_npu.ra_get_eid_list == NULL) {
+		fprintf(stderr, "RA libra symbols missing\n");
+		return -1;
+	}
+
+	/* Step 1: rtOpenNetService (nds.c tsd_process_open, libruntime.so). */
+	g_npu.rt_library = dlopen("libruntime.so", RTLD_NOW | RTLD_GLOBAL);
+	if (g_npu.rt_library == NULL) {
+		fprintf(stderr, "RA libruntime.so unavailable (%s)\n", dlerror());
+		return -1;
+	}
+	g_npu.rt_open_net_service = (rt_open_net_service_fn)
+				    dlsym(g_npu.rt_library, "rtOpenNetService");
+	if (g_npu.rt_open_net_service == NULL) {
+		fprintf(stderr, "RA rtOpenNetService missing\n");
+		return -1;
+	}
+	rt_ext.param_info = "--hdcType=18";
+	rt_ext.param_len = 12;
+	rt_args.ext_param_list = &rt_ext;
+	rt_args.ext_param_cnt = 1;
+	if (g_npu.rt_open_net_service(&rt_args) != 0) {
+		fprintf(stderr, "rtOpenNetService failed\n");
+		return -1;
+	}
+
+	/* Step 2: physical device id (libacl_rt.so). */
+	g_npu.rt_acl_library = dlopen("libacl_rt.so", RTLD_NOW | RTLD_GLOBAL);
+	if (g_npu.rt_acl_library != NULL) {
+		g_npu.get_phy_dev_id = (aclrt_get_phy_dev_id_fn)
+				       dlsym(g_npu.rt_acl_library,
+					     "aclrtGetPhyDevIdByLogicDevId");
+	}
+	if (g_npu.get_phy_dev_id == NULL) {
+		fprintf(stderr, "RA aclrtGetPhyDevIdByLogicDevId missing\n");
+		return -1;
+	}
+	if (g_npu.get_phy_dev_id(device_id, &g_npu.ra_phy_id) != 0) {
+		fprintf(stderr, "aclrtGetPhyDevIdByLogicDevId(%d) failed\n", device_id);
+		return -1;
+	}
+
+	/* Step 3: RaInit; 328002 = repeat init, treated as success. */
+	memset(&g_npu.ra_cfg, 0, sizeof(g_npu.ra_cfg));
+	g_npu.ra_cfg.phy_id = g_npu.ra_phy_id;
+	g_npu.ra_cfg.nic_position = RA_NETWORK_OFFLINE;
+	g_npu.ra_cfg.hdc_type = RA_HDC_TYPE;
+	g_npu.ra_cfg.enable_hdc_async = true;
+	ret = g_npu.ra_init(&g_npu.ra_cfg);
+	if (ret != 0 && ret != RA_INIT_REPEAT_RET_CODE) {
+		fprintf(stderr, "RaInit failed: ret %d\n", ret);
+		return -1;
+	}
+
+	/* Step 4: query real eid/eidIndex (nds.c nds_init_get_eid_info). */
+	ra_info.phy_id = g_npu.ra_phy_id;
+	ret = g_npu.ra_get_eid_num(ra_info, &eid_num);
+	if (ret != 0 || eid_num == 0) {
+		fprintf(stderr, "RaGetDevEidInfoNum failed: ret %d num %u\n",
+			ret, eid_num);
+		return -1;
+	}
+	eid_list = calloc(eid_num, sizeof(*eid_list));
+	if (eid_list == NULL) {
+		return -1;
+	}
+	ret = g_npu.ra_get_eid_list(ra_info, eid_list, &eid_num);
+	if (ret != 0) {
+		fprintf(stderr, "RaGetDevEidInfoList failed: ret %d\n", ret);
+		free(eid_list);
+		return -1;
+	}
+
+	/* Step 5: RaCtxInit with the queried eid (nds.c nds_init_ub_resources). */
+	ra_ctx_cfg.mode = RA_NETWORK_OFFLINE;
+	ra_attr.phy_id = g_npu.ra_phy_id;
+	ra_attr.ub.eid_index = eid_list[0].eid_index;
+	memcpy(ra_attr.ub.eid.raw, eid_list[0].eid.raw, sizeof(ra_attr.ub.eid.raw));
+	ret = g_npu.ra_ctx_init(&ra_ctx_cfg, &ra_attr, &g_npu.ra_ctx_handle);
+	if (ret != 0) {
+		fprintf(stderr, "RaCtxInit failed: ret %d\n", ret);
+		free(eid_list);
+		return -1;
+	}
+	memcpy(g_npu.ra_eid, eid_list[0].eid.raw, sizeof(g_npu.ra_eid));
+	free(eid_list);
+	g_npu.ra_ready = true;
+	printf("RA/HCCP context ready (phy_id=%u eid_index=%u)\n",
+	       g_npu.ra_phy_id, ra_attr.ub.eid_index);
+	return 0;
+}
+
 /* NDS-fix: 非 static——urma_perf.c 经 urma_perf_npu.h 外部调用 */
 int
 npu_driver_init(int32_t device_id)
@@ -242,7 +444,9 @@ npu_driver_init(int32_t device_id)
 	if (lib_name == NULL || lib_name[0] == '\0') {
 		lib_name = "libascendcl.so";
 	}
-	g_npu.library = dlopen(lib_name, RTLD_NOW | RTLD_LOCAL);
+	/* RTLD_GLOBAL per P2-20/P2-21: RA and CANN symbols must stay mutually
+	 * visible (CCDK nds.c uses RTLD_GLOBAL for libascendcl too). */
+	g_npu.library = dlopen(lib_name, RTLD_NOW | RTLD_GLOBAL);
 	if (g_npu.library == NULL) {
 		fprintf(stderr, "Unable to load %s: %s\n", lib_name, dlerror());
 		return -ENODEV;
@@ -292,67 +496,9 @@ npu_driver_init(int32_t device_id)
 	/* RA/HCCP init (optional): libra.so enables the third official HBM
 	 * registration path (RaCtxLmemRegister nonPin). Absent libra -> RA
 	 * path disabled with a warning; the provider keeps working for the
-	 * non-direct routes. Init parameters follow colleague_c's
-	 * nds/src/nds.c nds_init_ra (see colleague_c_repo on the target). */
-	{
-		const char *ra_lib_name;
-		struct ra_init_config ra_cfg = {};
-		struct ra_ctx_init_cfg ra_ctx_cfg = {};
-		struct ra_ctx_init_attr ra_attr = {};
-
-		ra_lib_name = getenv("URMA_PERF_RA_LIB");
-		if (ra_lib_name == NULL || ra_lib_name[0] == '\0') {
-			ra_lib_name = "libra.so";
-		}
-		g_npu.ra_library = dlopen(ra_lib_name, RTLD_NOW | RTLD_GLOBAL);
-		if (g_npu.ra_library == NULL) {
-			fprintf(stderr, "RA libra.so unavailable (%s) — "
-				"RA/HCCP HBM registration disabled\n", dlerror());
-		} else {
-			g_npu.ra_init = (ra_init_fn)dlsym(g_npu.ra_library, "RaInit");
-			g_npu.ra_ctx_init = (ra_ctx_init_fn)dlsym(g_npu.ra_library, "RaCtxInit");
-			g_npu.ra_lmem_register = (ra_ctx_lmem_register_fn)
-						 dlsym(g_npu.ra_library, "RaCtxLmemRegister");
-			g_npu.ra_lmem_unregister = (ra_ctx_lmem_unregister_fn)
-						   dlsym(g_npu.ra_library, "RaCtxLmemUnregister");
-			g_npu.ra_ctx_deinit = (ra_ctx_deinit_fn)
-					      dlsym(g_npu.ra_library, "RaCtxDeInit");
-			if (g_npu.ra_init == NULL || g_npu.ra_ctx_init == NULL ||
-			    g_npu.ra_lmem_register == NULL ||
-			    g_npu.ra_lmem_unregister == NULL) {
-				fprintf(stderr, "RA libra symbols missing — "
-					"RA/HCCP HBM registration disabled\n");
-				g_npu.ra_ready = false;
-			} else {
-				/* Parameter values per colleague_c nds/src/nds.c
-				 * nds_init_ra — adapt on-machine if needed. */
-				memset(&ra_cfg, 0, sizeof(ra_cfg));
-				ra_cfg.phy_id = 0;
-				ra_cfg.nic_position = 0;
-				ra_cfg.hdc_type = 0;
-				ra_cfg.enable_hdc_async = false;
-				err = g_npu.ra_init(&ra_cfg);
-				if (err != NPU_ACL_SUCCESS && err != 1) {
-					fprintf(stderr, "RaInit failed: ret %d\n", err);
-				} else {
-					memset(&ra_ctx_cfg, 0, sizeof(ra_ctx_cfg));
-					memset(&ra_attr, 0, sizeof(ra_attr));
-					ra_attr.phy_id = 0;
-					/* eid_index/eid: first RA device; the
-					 * nds_get_segment_info flow selects the
-					 * same eid family (…df000100). */
-					ra_attr.ub.eid_index = 0;
-					err = g_npu.ra_ctx_init(&ra_ctx_cfg, &ra_attr,
-							&g_npu.ra_ctx_handle);
-					if (err != NPU_ACL_SUCCESS) {
-						fprintf(stderr, "RaCtxInit failed: ret %d\n", err);
-					} else {
-						g_npu.ra_ready = true;
-						printf("RA/HCCP context ready\n");
-					}
-				}
-			}
-		}
+	 * non-direct routes. */
+	if (npu_ra_init(device_id) != 0) {
+		fprintf(stderr, "RA/HCCP HBM registration disabled\n");
 	}
 	return 0;
 
@@ -377,10 +523,21 @@ npu_driver_fini(void)
 		g_npu.ra_ctx_deinit(g_npu.ra_ctx_handle);
 		g_npu.ra_ctx_handle = NULL;
 	}
+	if (g_npu.ra_ready && g_npu.ra_deinit != NULL) {
+		g_npu.ra_deinit(&g_npu.ra_cfg);
+	}
 	g_npu.ra_ready = false;
 	if (g_npu.ra_library != NULL) {
 		dlclose(g_npu.ra_library);
 		g_npu.ra_library = NULL;
+	}
+	if (g_npu.rt_library != NULL) {
+		dlclose(g_npu.rt_library);
+		g_npu.rt_library = NULL;
+	}
+	if (g_npu.rt_acl_library != NULL) {
+		dlclose(g_npu.rt_acl_library);
+		g_npu.rt_acl_library = NULL;
 	}
 	if (g_npu.library == NULL) {
 		return;

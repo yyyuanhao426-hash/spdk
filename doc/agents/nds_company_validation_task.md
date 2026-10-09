@@ -242,8 +242,72 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 4. npu-staged 全链路结果 + npu 路线报错原文
 
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
-
 ## 9. 内部 AI 回执区
+
+### 回执导入 2026-10-09 #P221（批次 P2-21 回执，用户带回）—— 🎯 Module A 修正通过 + 双进程复验无回归
+
+**判定：Module A 四缺陷全修（含真根因 = CtxInitAttr 结构对齐缺陷），
+RA/HCCP context ready ✅；双进程复验（P2-19 流程）READ/WRITE 双向一致
+→ Module A 修正通过，NDS-SSD 直连路线无回归 🎯**
+
+**A 项 · nds_init_ra 权威 RA 序列原文（colleague_c_repo/nds/src/nds.c，
+= 用户 D:\ndssu\CCDK）**：宏 HDC_TYPE=18(L38)、EID_INDEX=0(L39)、
+RAINIT_REPEAT_RET_CODE=328002(L58)；NETWORK_OFFLINE=1。
+- tsd_process_open() L124：rtExt.paramInfo="--hdcType=18"，paramLen=12
+  → g_rtOpenNetService(&rtArgs)
+- nds_init_ra() L140：cfg={phy_id, nicPosition=OFFLINE, hdcType=18,
+  enableHdcAsync=true} → g_RaInit；ret==328002 视作成功（重复初始化）
+- nds_init() L347 主链：aclrtGetDevice → tsd_process_open →
+  aclrtGetPhyDevIdByLogicDevId(device_id,&phy_id) → nds_init_ra →
+  nds_init_get_eid_info（g_RaGetDevEidInfoNum 按值传 RaInfo → List）→
+  nds_update_route_info（/proc/asdrv_ub 匹配设备换 info_list[0]，
+  本例 EID 全 0 不影响）→ nds_init_ub_resources（g_RaCtxInit：
+  init_cfg.mode=OFFLINE，ctx_info.phyId + ub.eidIndex=info_list[0]
+  + memcpy ub.eid.raw）→ nds_alloc_device_token
+
+**B 项 · urma_perf_npu.c RA 段修正**：
+- 补 3 个前置调用（rtOpenNetService / aclrtGetPhyDevIdByLogicDevId /
+  RaGetDevEidInfoNum+List）；RaInit/RaCtxInit 参数改实测值；
+  符号 RaCtxDeInit→RaCtxDeinit；补绑 RaDeinit + teardown；
+  dlopen(libascendcl) 改 RTLD_GLOBAL
+- **第 4 缺陷（真根因）= CtxInitAttr 结构对齐缺陷**：真头文件
+  union HccpEid 含 uint64_t（对齐 8）→ CtxInitAttr 内 union 对齐 8，
+  phyId 后需 4B 填充；旧代码用 uint8_t eid[16]（对齐 4）：
+  旧(错) sizeof=88 / phyId@0 / eidIndex@4 / eid@8 / resv@24
+  真(对) sizeof=96 / phyId@0 / eidIndex@8 / eid@16 / resv@32
+  修正：改用 union ra_hccp_eid_u（raw[16] + in4/in6 视图，对齐 8），
+  memcpy 目标改 ra_attr.ub.eid.raw。完整 372 行 diff 已存
+  p221_moduleA_fix.patch（未 commit，需外部合入本地仓）
+
+**C 项 · 运行时库路径**：LD_LIBRARY_PATH=
+/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64:/usr/lib64
+（去掉 $UMDK/lib，规避 liburma 冲突致 507033）。已落实生效。
+
+**D 项 · 双进程复验（P2-19 流程，无回归）**：
+```
+P1: aclrtMalloc(64KB,HUGE)=0 hbm_va=0x120000017000
+    nds_init=0 ; nds_buf_register(HBM)=0  <== RaCtxLmemRegister(nonPin=ENABLE)
+    segment: uasid=0x0 jetty_id=10611 token_id=1128704
+    [P1-RA] eid=000000000000020000100000df000100
+P2: urma_import_seg + urma_import_jetty(CTP)
+    nds_urma_transfer_read_imported_to_local rc=0 -> READ verify mismatches=0
+    -> MATCH (seed 0xA5)
+    post WRITE status=0 / cr.status=0 -> urma_write_remote rc=0
+P1: post-WRITE D2H rc=0 pattern(0x5A) mismatches=0 -> MATCH
+```
+- 判定链：B 全修后仍 RaCtxInit=128003（8/8 设备确定性复现）→ 对照
+  独立探针（真头文件）=0 OK，urma_perf_npu.c（自定义结构）=128003 →
+  锁定结构体定义差异 → redef 探针复现 128003，sizeof=88/eidIndex@4
+  （真值 96/@8）→ 根因坐实 → 8 对齐 union 后探针=0 → 重编 urma_perf：
+  aclInit/setDevice/createContext/rtOpenNetService/phy_id=0/RaInit=0/
+  EID num=16 → **RA/HCCP context ready ✅**
+- 128003 语义（strings libra.so）= "ra_get_init_ctx_handle failed"
+  ——结构体布局错位致 ctx 句柄获取失败
+
+**工程要点**：Module A 修正以测试 agent 本地 patch 形式存在（133 未
+commit），需外部把等价修复合入 nds_v1 并 push，133 才能 pull 固化——
+否则下次 git 操作会丢修正。
+
 
 ### 回执导入 2026-09-22 #P22（批次 P2-2 回执，用户带回）
 
