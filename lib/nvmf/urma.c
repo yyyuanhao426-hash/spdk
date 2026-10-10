@@ -895,7 +895,7 @@ nvmf_urma_register_iobuf_chunk(void *cb_arg, void *addr, size_t length, int32_t 
 		free(entry);
 		return rc;
 	}
-	rc = nvme_urma_region_registry_add(transport->device->context, addr, length, entry->region);
+	rc = spdk_nvme_urma_region_registry_add(transport->device->context, addr, length, entry->region);
 	if (rc != 0) {
 		spdk_nvme_urma_unregister_memory(entry->region);
 		free(entry);
@@ -1469,7 +1469,7 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	/* The iobuf backing allocations are registered once at transport creation. */
 	ureq->cache_entry = NULL;
 	ureq->local_region_external = false;
-	ureq->local_region = nvme_urma_region_registry_find(device->context,
+	ureq->local_region = spdk_nvme_urma_region_registry_find(device->context,
 							    (uint64_t)ureq->req.iov[0].iov_base,
 							    ureq->req.length);
 	if (ureq->local_region != NULL) {

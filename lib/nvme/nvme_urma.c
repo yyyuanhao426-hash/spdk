@@ -282,7 +282,7 @@ nvme_urma_cid_free(struct nvme_urma_qpair *uqpair, uint16_t cid)
 
 /* Modified By Yida(v7): 应用侧整池注册入口。urma_perf 等应用在 qpair 建立后把
  * 一整块连续缓冲（如每 worker 的 allocation）注册一次；提交 I/O 时
- * nvme_urma_region_registry_find() 采纳覆盖缓冲的 region，跳过 per-I/O
+ * spdk_nvme_urma_region_registry_find() 采纳覆盖缓冲的 region，跳过 per-I/O
  * register，capsule.data.seg 携带全区描述，target 可整池 import 一次。
  * region 生命周期由应用管理：spdk_nvme_urma_unregister_memory() 注销时
  * 同步移出注册表。 */
@@ -299,7 +299,7 @@ spdk_nvme_urma_register_memory_for_qpair(struct spdk_nvme_qpair *qpair, void *ad
 	}
 	rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr, length, type, region);
 	if (rc == 0) {
-		rc = nvme_urma_region_registry_add(uqpair->device->context, addr, length, *region);
+		rc = spdk_nvme_urma_region_registry_add(uqpair->device->context, addr, length, *region);
 		if (rc != 0) {
 			spdk_nvme_urma_unregister_memory(*region);
 			*region = NULL;
@@ -771,7 +771,7 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		 * 采纳语义与 per-I/O 注册一致；region 生命周期由应用管理。 */
 		ureq->region_external = false;
 		ureq->cache_entry = NULL;
-		ureq->region = nvme_urma_region_registry_find(uqpair->device->context,
+		ureq->region = spdk_nvme_urma_region_registry_find(uqpair->device->context,
 				(uint64_t)addr, req->payload.size);
 		if (ureq->region != NULL) {
 			ureq->region_external = true;

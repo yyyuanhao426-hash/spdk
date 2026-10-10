@@ -166,10 +166,10 @@ urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 /* Modified By Yida(v7): 整池注册表（实现见 nvme_urma_common.c）。由 initiator
  * 预注册缓冲或 target iobuf 整池注册填充；I/O 提交路径用 find() 采纳覆盖本
  * I/O 缓冲的 region，跳过 per-I/O register。按共享 urma_context 键控。 */
-int nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
+int spdk_nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
 				  struct spdk_nvme_urma_memory_region *region);
-void nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region);
+void spdk_nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region);
 struct spdk_nvme_urma_memory_region *
-nvme_urma_region_registry_find(void *urma_context, uint64_t addr, size_t length);
+spdk_nvme_urma_region_registry_find(void *urma_context, uint64_t addr, size_t length);
 
 #endif /* SPDK_NVME_URMA_INTERNAL_H */

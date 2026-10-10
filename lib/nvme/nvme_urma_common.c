@@ -276,7 +276,7 @@ static TAILQ_HEAD(, nvme_urma_region_entry) g_region_registry =
 static pthread_mutex_t g_region_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int
-nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
+spdk_nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
 			      struct spdk_nvme_urma_memory_region *region)
 {
 	struct nvme_urma_region_entry *e;
@@ -303,7 +303,7 @@ nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
 }
 
 void
-nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region)
+spdk_nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region)
 {
 	struct nvme_urma_region_entry *e, *tmp;
 
@@ -321,7 +321,7 @@ nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region)
 }
 
 struct spdk_nvme_urma_memory_region *
-nvme_urma_region_registry_find(void *urma_context, uint64_t addr, size_t length)
+spdk_nvme_urma_region_registry_find(void *urma_context, uint64_t addr, size_t length)
 {
 	struct spdk_nvme_urma_memory_region *found = NULL;
 	struct nvme_urma_region_entry *e;
@@ -468,7 +468,7 @@ spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 		return;
 	}
 	/* Modified By Yida(v7): 整池 region 注销时同步移出注册表，防悬垂采纳 */
-	nvme_urma_region_registry_remove(region);
+	spdk_nvme_urma_region_registry_remove(region);
 	if (region->target_seg != NULL) {
 		urma_unregister_seg(region->target_seg);
 	}
