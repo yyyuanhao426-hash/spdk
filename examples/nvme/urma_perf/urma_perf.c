@@ -803,16 +803,21 @@ work_fn(void *arg)
 		fprintf(stderr, "Worker %u could not allocate an I/O qpair\n", worker->id);
 		atomic_store_explicit(&g_failed, true, memory_order_release);
 	}
-	/* Modified By Yida(v7): URMA_PERF_REGION_REG=1 且 cpu/posix 路线时，把每
-	 * worker 的整块连续 allocation 一次性注册进本 qpair 的 URMA context；
-	 * 提交路径按覆盖关系自动采纳 → 跳过 per-I/O register，capsule 携带全区
-	 * seg，target 每连接只 import 一次。注册失败降级为 per-I/O 路线并告警。 */
+	/* Modified By Yida(v7) + StepB(peermem): URMA_PERF_REGION_REG=1 且
+	 * cpu/posix/peermem 路线时，把每 worker 的整块连续 allocation 一次性注册
+	 * 进本 qpair 的 URMA context；提交路径按覆盖关系自动采纳 → 跳过 per-I/O
+	 * register，capsule 携带全区 seg，target 每连接只 import 一次。注册失败
+	 * 降级为 per-I/O 路线并告警。 */
 	if (worker->qpair != NULL &&
-	    (g_mem_type == URMA_PERF_MEM_CPU || g_mem_type == URMA_PERF_MEM_POSIX) &&
+	    (g_mem_type == URMA_PERF_MEM_CPU || g_mem_type == URMA_PERF_MEM_POSIX ||
+	     g_mem_type == URMA_PERF_MEM_PEERMEM) &&
 	    getenv("URMA_PERF_REGION_REG") != NULL) {
+		enum spdk_nvme_urma_memory_type region_type =
+			(g_mem_type == URMA_PERF_MEM_PEERMEM) ?
+			SPDK_NVME_URMA_MEM_CUDA : SPDK_NVME_URMA_MEM_HOST;
 		int rrc = spdk_nvme_urma_register_memory_for_qpair(worker->qpair,
 				worker->allocation.addr, worker->allocation.alloc_size,
-				SPDK_NVME_URMA_MEM_HOST, &worker->region);
+				region_type, &worker->region);
 
 		if (rrc == 0) {
 			printf("Worker %u: whole-pool region registered (%zu bytes)\n",
