@@ -1382,6 +1382,14 @@ nvme_urma_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qp
 		rc = uqpair->fd;
 		goto fail;
 	}
+	{
+		/* SE_Review #3（对偶）: hello 交换是阻塞收发，target 异常时由
+		 * 超时兜底，最坏阻塞 5s 而不是无限期卡住 initiator 线程。 */
+		struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+
+		setsockopt(uqpair->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		setsockopt(uqpair->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	}
 	rc = nvme_urma_exchange_hello(uqpair);
 	if (rc != 0) {
 		goto fail;
