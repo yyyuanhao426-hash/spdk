@@ -204,6 +204,11 @@ struct nvme_urma_qpair {
 	struct nvme_urma_rsp_rx_slot *capsule_rx_slots;
 	struct spdk_nvme_urma_memory_region *capsule_rx_region;
 	uint32_t capsule_rx_count;
+	/* SE_Review #4: RX slot 数组只在首次连接分配一次（地址作为 CR user_ctx
+	 * 必须存活到旧连接的遗留 CR 排干为止），cap 记录容量；断连只 unregister
+	 * region，不释放数组。 */
+	uint32_t capsule_rx_slots_cap;
+	uint32_t epoch;
 	struct spdk_urma_capsule_rsp *pending_rsps;
 	uint32_t pending_rsp_head;
 	uint32_t pending_rsp_tail;
@@ -956,51 +961,102 @@ nvme_urma_drain_queued_responses(struct nvme_urma_qpair *uqpair,
 	return completed;
 }
 
+static struct nvme_urma_qpair *
+nvme_urma_cr_owner_qpair(const struct nvme_urma_cqe_ctx *ctx)
+{
+	if (ctx->type == NVME_URMA_CQE_CAPSULE_TX) {
+		return ctx->owner;
+	}
+	if (ctx->type == NVME_URMA_CQE_CAPSULE_RX) {
+		return ((struct nvme_urma_rsp_rx_slot *)ctx->owner)->qpair;
+	}
+	return NULL;
+}
+
+static void
+nvme_urma_qpair_defer_error(struct nvme_urma_qpair *uqpair, int err)
+{
+	if (err == 0) {
+		return;
+	}
+	SPDK_ERRLOG("capsule completion error routed to qpair qid=%u: err=%d\n",
+		    uqpair->qpair.id, err);
+	__atomic_store_n(&uqpair->deferred_error, err, __ATOMIC_RELEASE);
+}
+
 static int32_t
 nvme_urma_process_capsule_cr(struct nvme_urma_qpair *poller, const urma_cr_t *cr,
 			     uint32_t *completed)
 {
 	struct nvme_urma_cqe_ctx *ctx;
+	struct nvme_urma_qpair *owner;
 	uint64_t t_compl0 = spdk_get_ticks();
 
 	if (spdk_urma_cr_is_fake(cr)) {
 		return 0;
 	}
 	ctx = (void *)cr->user_ctx;
-	if (ctx == NULL || cr->status != URMA_CR_SUCCESS) {
-		SPDK_ERRLOG("capsule completion failed: status=%d user_ctx=%p\n",
-			    cr->status, (void *)cr->user_ctx);
+	if (ctx == NULL) {
+		/* SE_Review #5: 无法归属的 CR 只能放弃整个 poller。 */
+		SPDK_ERRLOG("capsule completion failed: status=%d user_ctx=NULL\n", cr->status);
 		return -EIO;
 	}
+	owner = nvme_urma_cr_owner_qpair(ctx);
+	if (owner == NULL) {
+		SPDK_ERRLOG("capsule completion with unknown ctx type=%d\n", ctx->type);
+		return -EPROTO;
+	}
+	if (owner->epoch != ctx->epoch) {
+		/* SE_Review #4: 上一轮连接的遗留 CR——旧 jetty/RX slot 已随断连
+		 * 销毁，其响应与新连接无关，直接丢弃。 */
+		return 0;
+	}
+	if (cr->status != URMA_CR_SUCCESS) {
+		/* SE_Review #5: 错误 CR 归属 owner，而不是恰好轮到它的 poller。 */
+		nvme_urma_qpair_defer_error(owner, -EIO);
+		return 0;
+	}
 	if (ctx->type == NVME_URMA_CQE_CAPSULE_TX) {
-		return cr->flag.bs.s_r == 0 ? 0 : -EPROTO;
+		if (cr->flag.bs.s_r != 0) {
+			/* s_r 表示对端已关连接：故障属于 owner 这条连接。 */
+			nvme_urma_qpair_defer_error(owner, -ECONNRESET);
+		}
+		return 0;
 	}
 	if (ctx->type == NVME_URMA_CQE_CAPSULE_RX) {
 		struct nvme_urma_rsp_rx_slot *slot = ctx->owner;
-		struct nvme_urma_qpair *owner = slot->qpair;
 		struct spdk_urma_capsule_rsp_frame frame = slot->frame;
 		int rc;
 
 		if (cr->flag.bs.s_r == 0 || cr->opcode != URMA_CR_OPC_SEND ||
 		    cr->completion_len != (uint32_t)sizeof(frame)) {
-			return -EPROTO;
+			nvme_urma_qpair_defer_error(owner, -EPROTO);
+			return 0;
 		}
 		rc = nvme_urma_post_rsp_receive(slot);
 		if (rc != 0) {
-			return rc;
+			nvme_urma_qpair_defer_error(owner, rc);
+			return 0;
 		}
 		if (frame.hdr.magic != SPDK_URMA_WIRE_MAGIC ||
 		    frame.hdr.version != SPDK_URMA_WIRE_VERSION ||
 		    frame.hdr.type != SPDK_URMA_MSG_CAPSULE_RSP ||
 		    frame.hdr.length != sizeof(frame.capsule) ||
 		    frame.hdr.qid != owner->qpair.id) {
-			return -EPROTO;
+			nvme_urma_qpair_defer_error(owner, -EPROTO);
+			return 0;
 		}
 		__atomic_add_fetch(&g_timing.compl_ticks, spdk_get_ticks() - t_compl0,
 				   __ATOMIC_RELAXED);
 		__atomic_add_fetch(&g_timing.compl_count, 1, __ATOMIC_RELAXED);
 		if (owner != poller) {
-			return nvme_urma_queue_response(owner, &frame.capsule);
+			rc = nvme_urma_queue_response(owner, &frame.capsule);
+			if (rc < 0) {
+				/* owner 的 pending 队列满是 owner 的故障，不是 poller 的。 */
+				nvme_urma_qpair_defer_error(owner, rc);
+				return 0;
+			}
+			return rc;
 		}
 		rc = nvme_urma_complete_response(owner, &frame.capsule);
 		if (rc < 0) {
@@ -1021,6 +1077,7 @@ nvme_urma_process_capsule_completions(struct nvme_urma_qpair *uqpair,
 	uint64_t requested_budget = (uint64_t)max_completions * 2 + 8;
 	uint32_t budget = requested_budget > SPDK_COUNTOF(cr) ? SPDK_COUNTOF(cr) :
 			  (uint32_t)requested_budget;
+	int hard_err = 0;
 
 	int pending = nvme_urma_drain_queued_responses(uqpair, max_completions);
 
@@ -1028,33 +1085,72 @@ nvme_urma_process_capsule_completions(struct nvme_urma_qpair *uqpair,
 		return pending;
 	}
 	completed = pending;
-	for (uint32_t j = 0; j < uqpair->device->send_jfc_count && completed < max_completions; j++) {
+	for (uint32_t j = 0; j < uqpair->device->send_jfc_count && completed < max_completions &&
+	     hard_err == 0; j++) {
 		int count = spdk_urma_device_poll_send_jfc(uqpair->device, j, budget, cr);
 		if (count < 0) {
-			return -EIO;
+			hard_err = -EIO;
+			break;
 		}
 		for (int i = 0; i < count; i++) {
 			int rc = nvme_urma_process_capsule_cr(uqpair, &cr[i], &completed);
-			if (rc != 0) {
-				return rc;
+			if (rc != 0 && hard_err == 0) {
+				/* SE_Review #5: 记下错误但继续处理本批剩余 CR，
+				 * 避免连带丢弃其他 qpair 的成功完成。 */
+				hard_err = rc;
 			}
 		}
 	}
-	for (uint32_t j = 0; j < uqpair->device->recv_jfc_count && completed < max_completions; j++) {
+	for (uint32_t j = 0; j < uqpair->device->recv_jfc_count && completed < max_completions &&
+	     hard_err == 0; j++) {
 		uint32_t remaining = max_completions - completed;
 		uint32_t recv_budget = spdk_min(budget, remaining);
 		int count = spdk_urma_device_poll_recv_jfc(uqpair->device, j, recv_budget, cr);
 		if (count < 0) {
-			return -EIO;
+			hard_err = -EIO;
+			break;
 		}
 		for (int i = 0; i < count; i++) {
 			int rc = nvme_urma_process_capsule_cr(uqpair, &cr[i], &completed);
-			if (rc != 0) {
-				return rc;
+			if (rc != 0 && hard_err == 0) {
+				hard_err = rc;
 			}
 		}
 	}
-	return completed;
+	if (hard_err == 0) {
+		int deferred = 0;
+
+		/* 本轮路由给自己的错误在同一笔 poll 里就上报。 */
+		deferred = __atomic_exchange_n(&uqpair->deferred_error, 0, __ATOMIC_ACQ_REL);
+		if (deferred != 0) {
+			hard_err = deferred;
+		}
+	}
+	return hard_err != 0 ? hard_err : (int32_t)completed;
+}
+
+/* SE_Review #6: 与 target 的 nvmf_urma_check_lifetime_socket() 对称。URMA
+ * capsule 模式下 SEND 成功后不保证再有 JFC 通知退出，target 若在发响应前
+ * 消失，只能靠 bootstrap socket 的 EOF 发现。仅在零完成的空闲 poll 上调用，
+ * 热路径不加 syscall。 */
+static int
+nvme_urma_check_lifetime_socket(struct nvme_urma_qpair *uqpair)
+{
+	uint8_t byte;
+	ssize_t rc;
+
+	rc = recv(uqpair->fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+	if (rc > 0) {
+		/* SEND/RECV 模式下 bootstrap socket 不应携带任何数据。 */
+		return -EPROTO;
+	}
+	if (rc == 0) {
+		return -ECONNRESET;
+	}
+	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+		return 0;
+	}
+	return -errno;
 }
 
 static int32_t
@@ -1067,12 +1163,27 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	if (max_completions == 0) {
 		max_completions = UINT32_MAX;
 	}
+	{
+		/* SE_Review #5: 消费别的 poller 线程路由过来的连接故障。 */
+		int deferred = __atomic_exchange_n(&uqpair->deferred_error, 0, __ATOMIC_ACQ_REL);
+
+		if (deferred != 0) {
+			return deferred;
+		}
+	}
 	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		rc = nvme_urma_process_capsule_completions(uqpair, max_completions);
 		if (rc < 0) {
 			return rc;
 		}
 		completed = rc;
+		if (completed == 0) {
+			/* SE_Review #6: 无完成可取时检查 bootstrap socket 的 EOF/错误。 */
+			rc = nvme_urma_check_lifetime_socket(uqpair);
+			if (rc < 0) {
+				return rc;
+			}
+		}
 	} else {
 		while (completed < max_completions) {
 			struct spdk_urma_msg_hdr hdr;

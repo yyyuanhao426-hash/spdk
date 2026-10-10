@@ -1879,31 +1879,38 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 	urma_cr_t completions[64];
 	uint32_t stride = spdk_max(transport->worker_count, 1u);
 	int total = 0;
+	int hard_err = 0;
 
-	for (uint32_t j = group->worker_index; j < transport->device->send_jfc_count; j += stride) {
+	/* SE_Review #1/#5: 批内出错不再立即 return——剩余已取出的 CR 照常处理，
+	 * 错误记到最后返回，避免连带丢弃其他 qpair 的成功完成。 */
+	for (uint32_t j = group->worker_index; j < transport->device->send_jfc_count && hard_err == 0; j += stride) {
 		int count = spdk_urma_device_poll_send_jfc(transport->device, j,
 				SPDK_COUNTOF(completions), completions);
 		if (count < 0) {
-			return -EIO;
+			hard_err = hard_err != 0 ? hard_err : -EIO;
+			break;
 		}
 		for (int i = 0; i < count; i++) {
 			int rc = nvmf_urma_process_completion(&completions[i]);
 			if (rc < 0) {
-				return rc;
+				hard_err = hard_err != 0 ? hard_err : rc;
+				continue;
 			}
 			total += rc;
 		}
 	}
-	for (uint32_t j = group->worker_index; j < transport->device->recv_jfc_count; j += stride) {
+	for (uint32_t j = group->worker_index; j < transport->device->recv_jfc_count && hard_err == 0; j += stride) {
 		int count = spdk_urma_device_poll_recv_jfc(transport->device, j,
 				SPDK_COUNTOF(completions), completions);
 		if (count < 0) {
-			return -EIO;
+			hard_err = hard_err != 0 ? hard_err : -EIO;
+			break;
 		}
 		for (int i = 0; i < count; i++) {
 			int rc = nvmf_urma_process_completion(&completions[i]);
 			if (rc < 0) {
-				return rc;
+				hard_err = hard_err != 0 ? hard_err : rc;
+				continue;
 			}
 			total += rc;
 		}
@@ -1943,7 +1950,7 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 			total += rc;
 		}
 	}
-	return total;
+	return hard_err != 0 ? hard_err : total;
 }
 
 static void
