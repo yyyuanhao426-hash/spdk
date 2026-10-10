@@ -1304,6 +1304,19 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 	int rc;
 	uint64_t t_rsp0 = spdk_get_ticks(); /* Modified By Yida(v3): W10 start */
 
+	/* SE_Review #2: 错误路径（数据搬运 post 失败、CR 错误）可能在
+	 * nvmf_urma_req_complete() 之前直接走响应，而 rsp 在收命令时被清零。
+	 * 在所有响应的唯一必经点兜底填身份字段，req_complete 里的赋值是幂等的。 */
+	if (ureq->rsp.nvme_cpl.cid != ureq->cmd.nvme_cmd.cid) {
+		if (ureq->rsp.nvme_cpl.cid == 0 && ureq->cmd.nvme_cmd.cid != 0) {
+			SPDK_WARNLOG("response reached with CID=0 (cmd cid=%u), identity filled late\n",
+				     ureq->cmd.nvme_cmd.cid);
+		}
+		ureq->rsp.nvme_cpl.cid = ureq->cmd.nvme_cmd.cid;
+	}
+	ureq->rsp.nvme_cpl.sqid = uqpair->qpair.qid;
+	rsp.cpl = ureq->rsp.nvme_cpl;
+
 	hdr.magic = SPDK_URMA_WIRE_MAGIC;
 	hdr.version = SPDK_URMA_WIRE_VERSION;
 	hdr.type = SPDK_URMA_MSG_CAPSULE_RSP;
