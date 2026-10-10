@@ -159,6 +159,8 @@ enum nvme_urma_cqe_type {
 struct nvme_urma_cqe_ctx {
 	enum nvme_urma_cqe_type type;
 	void *owner;
+	/* SE_Review #4: 每轮连接一个代数，旧连接的遗留 CR 靠它识别并丢弃。 */
+	uint32_t epoch;
 };
 
 struct nvme_urma_qpair;
@@ -218,6 +220,10 @@ struct nvme_urma_qpair {
 	/* Modified By Yida: memory registration cache */
 	struct nvme_urma_reg_entry reg_cache[NVME_URMA_REG_CACHE_SIZE];
 	TAILQ_HEAD(, nvme_urma_req) outstanding;
+	/* SE_Review #5: 共享 JFC 轮询可能取出别的 qpair 的错误 CR，不能把 -EIO
+	 * 归给当前 poller。错误按 user_ctx 归属，原子标志由 owner 自己的下一次
+	 * process_completions 消费。 */
+	int deferred_error;
 };
 
 struct nvme_urma_ctrlr {
@@ -613,14 +619,23 @@ nvme_urma_capsule_resources_init(struct nvme_urma_qpair *uqpair)
 	if (uqpair->capsule_transport != SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		return 0;
 	}
+	/* SE_Review #4: 新一轮连接，旧连接的遗留 CR 由代数差识别丢弃。 */
+	uqpair->epoch++;
+	uqpair->capsule_tx_cqe.epoch = uqpair->epoch;
 	uqpair->capsule_rx_count = uqpair->num_entries;
 	if (uqpair->capsule_rx_count == 0 ||
 	    (uint64_t)uqpair->capsule_rx_count >
 	    (uint64_t)uqpair->jfrs[0]->jfr_cfg.depth * uqpair->jetty_count) {
 		return -EINVAL;
 	}
-	uqpair->capsule_rx_slots = calloc(uqpair->capsule_rx_count,
-					  sizeof(*uqpair->capsule_rx_slots));
+	if (uqpair->capsule_rx_slots == NULL) {
+		/* 首次连接分配，容量按本 qpair 的 num_entries 上限；此后各轮连接
+		 * 只会用它的前 capsule_rx_count 项。地址进 CR user_ctx，必须
+		 * 活到 qpair 销毁，中途断连/重连不释放。 */
+		uqpair->capsule_rx_slots_cap = uqpair->capsule_rx_count;
+		uqpair->capsule_rx_slots = calloc(uqpair->capsule_rx_slots_cap,
+						  sizeof(*uqpair->capsule_rx_slots));
+	}
 	uqpair->pending_rsps = calloc(uqpair->capsule_rx_count, sizeof(*uqpair->pending_rsps));
 	if (uqpair->capsule_rx_slots == NULL || uqpair->pending_rsps == NULL) {
 		return -ENOMEM;
@@ -631,7 +646,7 @@ nvme_urma_capsule_resources_init(struct nvme_urma_qpair *uqpair)
 	uqpair->pending_rsp_lock_initialized = true;
 	rc = spdk_nvme_urma_register_memory(uqpair->device->context,
 			uqpair->capsule_rx_slots,
-			uqpair->capsule_rx_count * sizeof(*uqpair->capsule_rx_slots),
+			uqpair->capsule_rx_slots_cap * sizeof(*uqpair->capsule_rx_slots),
 			SPDK_NVME_URMA_MEM_HOST, &uqpair->capsule_rx_region);
 	if (rc != 0) {
 		return rc;
@@ -642,6 +657,7 @@ nvme_urma_capsule_resources_init(struct nvme_urma_qpair *uqpair)
 
 		slot->cqe.type = NVME_URMA_CQE_CAPSULE_RX;
 		slot->cqe.owner = slot;
+		slot->cqe.epoch = uqpair->epoch;
 		slot->qpair = uqpair;
 		slot->sge.addr = (uint64_t)&slot->frame;
 		slot->sge.len = sizeof(slot->frame);
@@ -670,9 +686,10 @@ nvme_urma_capsule_resources_fini(struct nvme_urma_qpair *uqpair)
 	uqpair->pending_rsp_head = 0;
 	uqpair->pending_rsp_tail = 0;
 	uqpair->pending_rsp_count = 0;
-	free(uqpair->capsule_rx_slots);
-	uqpair->capsule_rx_slots = NULL;
 	uqpair->capsule_rx_count = 0;
+	/* SE_Review #4: capsule_rx_slots 不在这里释放——slot 地址是已取出未处理
+	 * 的 CR 的 user_ctx，旧连接的遗留 CR 排干前必须保持可解引用；
+	 * 交给 delete_io_qpair 在 qpair 销毁时释放。 */
 }
 
 static int
@@ -1346,6 +1363,7 @@ nvme_urma_qpair_release_transport(struct nvme_urma_qpair *uqpair)
 	/* Modified By Yida: unregister all cached memory regions before closing the device */
 	for (int i = 0; i < NVME_URMA_REG_CACHE_SIZE; i++) {
 		struct nvme_urma_reg_entry *e = &uqpair->reg_cache[i];
+
 		if (e->used) {
 			spdk_nvme_urma_unregister_memory(e->region);
 			e->used = false;
@@ -1353,11 +1371,13 @@ nvme_urma_qpair_release_transport(struct nvme_urma_qpair *uqpair)
 			e->region = NULL;
 		}
 	}
-	/* Modified By Yida (v3): 释放 CID 位图 */
-	free(uqpair->cid_bitmap);
-	uqpair->cid_bitmap = NULL;
-	spdk_urma_device_close(uqpair->device);
-	uqpair->device = NULL;
+	/* SE_Review #4: cid_bitmap 是 qpair 级资源（create_qpair 分配一次），
+	 * 不能在断连时释放，否则下一轮 connect 的 CID 分配拿到 NULL；
+	 * 交给 delete_io_qpair 释放。 */
+	if (uqpair->device != NULL) {
+		spdk_urma_device_close(uqpair->device);
+		uqpair->device = NULL;
+	}
 }
 
 static int
@@ -1367,6 +1387,8 @@ nvme_urma_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qp
 	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
 	int rc;
 
+	/* SE_Review #4: 新一轮连接从干净的错误状态开始。 */
+	__atomic_store_n(&uqpair->deferred_error, 0, __ATOMIC_RELAXED);
 	uqpair->max_io_size = uctrlr->opts.max_io_size;
 	rc = spdk_urma_device_open(&uctrlr->opts, &uqpair->device);
 	if (rc != 0) {
@@ -1416,10 +1438,16 @@ nvme_urma_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
 
 	nvme_urma_qpair_abort_reqs(qpair, qpair->abort_dnr);
-	if (uqpair->fd >= 0) {
-		close(uqpair->fd);
-		uqpair->fd = -1;
-	}
+	/* SE_Review #4: 先换代再拆资源——其他 poller 线程共享 JFC 可能正取到
+	 * 本 qpair 的 CR，代数失配让它们直接丢弃，不再触碰即将释放的资源。
+	 * （已进入 queue_response 等持锁路径的极小 TOCTOU 窗口保留，
+	 * 多线程 initiator 才可能出现，量级远小于修复前的泄漏。） */
+	uqpair->epoch++;
+	/* SE_Review #4: 断连必须回收连接级 transport 资源（device 引用、jetty、
+	 * JFR、capsule RX、region 缓存），否则下一轮 connect 会直接覆盖旧指针，
+	 * 反复断连/重连会泄漏 context 引用并重复 init mutex。cid 位图与 RX
+	 * slot 数组是 qpair 级资源，保留给重连复用。 */
+	nvme_urma_qpair_release_transport(uqpair);
 	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
 	nvme_transport_ctrlr_disconnect_qpair_done(qpair);
 }
@@ -1431,6 +1459,10 @@ nvme_urma_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 
 	nvme_urma_qpair_abort_reqs(qpair, qpair->abort_dnr);
 	nvme_urma_qpair_release_transport(uqpair);
+	free(uqpair->cid_bitmap);
+	uqpair->cid_bitmap = NULL;
+	free(uqpair->capsule_rx_slots);
+	uqpair->capsule_rx_slots = NULL;
 	nvme_qpair_deinit(qpair);
 	free(uqpair);
 	return 0;
