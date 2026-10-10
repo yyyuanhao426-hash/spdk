@@ -757,6 +757,35 @@ iobuf_priority(void)
 	free_cores();
 }
 
+/* SE_Review #7: 字节上限把初始 chunk_bufs 压到 MIN_CHUNK_SIZE(4) 之下时，
+ * chunk 表容量必须按真实下界取。256MiB / (64MiB+4KiB) = 3 < 4，
+ * large_pool_count=4 需要 ceil(4/3)=2 项，按 4 算只给 1 项即越界写堆。 */
+static void
+iobuf_large_chunk_table_boundary(void)
+{
+	struct spdk_iobuf_opts opts = {
+		.small_pool_count = 2,
+		.large_pool_count = 4,
+		.small_bufsize = SMALL_BUFSIZE,
+		.large_bufsize = 64 * 1024 * 1024 + 4096,
+	};
+	int rc, finish = 0;
+
+	allocate_cores(1);
+	allocate_threads(1);
+	set_thread(0);
+
+	g_iobuf.opts = opts;
+	rc = spdk_iobuf_initialize();
+	CU_ASSERT_EQUAL(rc, 0);
+
+	spdk_iobuf_finish(ut_iobuf_finish_cb, &finish);
+	poll_threads();
+	CU_ASSERT_EQUAL(finish, 1);
+	free_threads();
+	free_cores();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -770,6 +799,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, iobuf);
 	CU_ADD_TEST(suite, iobuf_cache);
 	CU_ADD_TEST(suite, iobuf_priority);
+	CU_ADD_TEST(suite, iobuf_large_chunk_table_boundary);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

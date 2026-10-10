@@ -154,12 +154,19 @@ iobuf_large_chunks_alloc(struct iobuf_node *node, uint32_t numa_id)
 	uint64_t remaining = opts->large_pool_count;
 	uint64_t j;
 
-	/* Cap the chunk in bytes too, so an oversized bufsize can't defeat the chunking. */
+	/* Cap the chunk in bytes too, so an oversized bufsize can't defeat the chunking.
+	 * SE_Review #7: 这个下限是真实下界——字节上限可以把初始 chunk_bufs 压到
+	 * 1..MIN_CHUNK_SIZE-1（如 128MiB bufsize 时为 2），shrink 循环的下限
+	 * MIN_CHUNK_SIZE 并不约束初始值。 */
 	chunk_bufs = spdk_min(IOBUF_LARGE_POOL_CHUNK_SIZE,
 			      spdk_max(1U, (uint32_t)(IOBUF_LARGE_POOL_CHUNK_MAX_BYTES / opts->large_bufsize)));
 
-	/* Size the chunk table for the worst case: every chunk shrunk to the minimum. */
-	num_chunks = SPDK_CEIL_DIV(opts->large_pool_count, IOBUF_LARGE_POOL_MIN_CHUNK_SIZE);
+	/* Size the chunk table for the worst case: every chunk shrunk to the minimum.
+	 * SE_Review #7: 按 chunk_bufs 的真实下界取表容量，否则
+	 * large_pool_count=8 / large_bufsize=128MiB 之类配置会在第 3 次写入
+	 * large_pool_chunks[allocated++] 时越过表尾。 */
+	num_chunks = SPDK_CEIL_DIV(opts->large_pool_count,
+				   spdk_min(IOBUF_LARGE_POOL_MIN_CHUNK_SIZE, chunk_bufs));
 	node->large_pool_chunks = spdk_malloc(num_chunks * sizeof(void *), IOBUF_ALIGNMENT,
 					      NULL, numa_id, SPDK_MALLOC_DMA);
 	node->large_pool_chunk_buf_counts = spdk_zmalloc(num_chunks * sizeof(uint32_t),
