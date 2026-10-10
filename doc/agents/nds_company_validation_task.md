@@ -1325,6 +1325,59 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
 
+### 指令 2026-10-09 #56：批次 P2-24（CCDK key 解析格式提取 + URMA 回环 rc=-5 诊断）
+
+**背景**：模块 B/C 管线已由外部完成（capsule 段信息合成 + NPU 注册分
+流，target 侧零改动确认）。initiator 合成 urma_seg_t 还差 **uasid 的
+来源**——P2-23 确认它取自 RA jetty（RaCtxQpCreate 输出 key，经
+nds_parse_jetty_info 解析），该解析函数源码不在外部。本批提取格式。
+另：P2-22 发现 URMA 回环握手 rc=-5，本批顺带诊断。
+
+**A. nds_parse_jetty_info 源码（QpKey.value 64B 格式）**：
+```bash
+grep -rn "nds_parse_jetty_info" colleague_c_repo/nds/src/
+# 带回该函数完整原文——外部要在 urma_perf_npu.c 里复刻解析，
+# 从 RaCtxQpCreate 输出的 QpKey.value 提取 {eid, uasid, jetty_id}
+```
+
+**B. nds_parse_segment_info 源码（MemKey.value 128B 格式，备用）**：
+```bash
+grep -rn "nds_parse_segment_info" colleague_c_repo/nds/src/
+# 带回原文（对照我们直接用 out.ub.token_id 是否足够）
+```
+
+**C. nds_init_ub_resources 全文（CqCreate/QpCreate 属性值，备用）**：
+```bash
+sed -n '160,230p' colleague_c_repo/nds/src/nds.c
+# 带回原文：CqCreateAttr/QpCreateAttr 的具体取值（depth/mode/ceqn/
+# transportMode/jettyId 等）——若外部需要自建 RA jetty 时照抄
+```
+
+**D. libnds 可用性（备选方案评估）**：
+```bash
+find / -name "libnds.so*" 2>/dev/null; ls colleague_c_repo/nds/ 构建产物
+# 带回：133 上 libnds.so 路径（若有）。备选方案 = urma_perf 直接
+# dlopen libnds 调 nds_get_segment_info，省去自行解析
+```
+
+**E. URMA 回环 rc=-5 诊断（P2-22 D 项遗留）**：
+```bash
+# 复现：nvmf_tgt（URMA transport, listener 4420）+ urma_perf -M cpu
+# 带回：
+# 1. target 侧完整日志（accept 前后）
+# 2. dmesg | grep -iE "ub|urma" 窗口
+# 3. urma_admin show 原文
+# 4. 系统版 liburma 与 UMDK liburma 的版本/路径对照
+#   （ldd target 与 initiator 各自加载的 liburma.so）
+# 若独立 NPU 节点已可用，优先在该节点复测回环是否正常（对照定位
+# 是 133 环境问题还是通用问题）
+```
+
+**约束**：A~D 只读；E 允许起停自建 target 进程与自建回环盘，不碰
+系统服务与在跑业务。
+
+**回传**：A~E 各项原文/输出，注明「批次 P2-24 完毕」。
+
 ### 指令 2026-10-09 #55：批次 P2-23（CCDK 只读侦察 + UB 拓扑确认——直连数据链路判定补证）
 
 **背景**：外部正在做 SPDK 集成（模块 B/C：段信息交换 + target 导入数据面）。

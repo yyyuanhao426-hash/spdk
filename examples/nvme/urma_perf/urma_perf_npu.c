@@ -233,6 +233,8 @@ struct npu_driver {
 	ra_get_eid_list_fn ra_get_eid_list;
 	rt_open_net_service_fn rt_open_net_service;
 	aclrt_get_phy_dev_id_fn get_phy_dev_id;
+	uint32_t ra_uasid;
+	bool ra_uasid_valid;
 	bool ra_ready;
 	uint8_t ra_eid[16];
 	aclrt_context_t context;
@@ -270,6 +272,10 @@ struct npu_pin_handle {
 	/* RA/HCCP registration output (libra path); non-NULL when the RA
 	 * context was ready at pin time. */
 	void *lmem_handle;
+	/* RaCtxLmemRegister output: token_id from lmem.out.ub — the peer
+	 * needs it in the imported urma_seg_t (P2-23 B). */
+	uint32_t token_id;
+	bool token_id_valid;
 };
 
 static size_t
@@ -738,8 +744,38 @@ npu_provider_pin(void *provider_ctx, void *addr, size_t length, void **pin_handl
 			free(handle);
 			return -EIO;
 		}
+		handle->token_id = lmem.out.ub.token_id;
+		handle->token_id_valid = true;
 	}
 	*pin_handle = handle;
+	return 0;
+}
+
+/* NDS direct route: synthesize the peer-importable segment descriptor.
+ * eid/va/len/token_id are all available from the RA path (P2-23 B); uasid
+ * comes from the RA jetty key (RaCtxQpCreate output, nds_parse_jetty_info)
+ * which is not sourced yet — gated until that format is extracted from the
+ * CCDK. Returning nonzero here makes registration fall back to the legacy
+ * urma_register_seg path (harmless: it fails visibly on 133). */
+static int
+npu_provider_get_segment_info(void *provider_ctx, void *pin_handle,
+			      struct spdk_nvme_urma_seg_info *info)
+{
+	struct npu_pin_handle *handle = pin_handle;
+
+	(void)provider_ctx;
+	if (g_npu.library == NULL || !g_npu.ra_ready || handle == NULL) {
+		return -ENODEV;
+	}
+	if (!handle->token_id_valid || !g_npu.ra_uasid_valid) {
+		return -ENOTSUP;
+	}
+	memset(info, 0, sizeof(*info));
+	memcpy(info->eid, g_npu.ra_eid, sizeof(info->eid));
+	info->uasid = g_npu.ra_uasid;
+	info->va = (uint64_t)(uintptr_t)handle->entry->addr;
+	info->token_id = handle->token_id;
+	info->len = handle->entry->size;
 	return 0;
 }
 
@@ -767,6 +803,7 @@ static const struct spdk_nvme_urma_memory_provider g_npu_provider = {
 	.type = SPDK_NVME_URMA_MEM_NPU,
 	.pin = npu_provider_pin,
 	.unpin = npu_provider_unpin,
+	.get_segment_info = npu_provider_get_segment_info,
 };
 
 int

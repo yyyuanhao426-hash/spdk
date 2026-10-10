@@ -13,6 +13,11 @@ struct spdk_nvme_urma_memory_region {
 	size_t length;
 	enum spdk_nvme_urma_memory_type type;
 	urma_target_seg_t *target_seg;
+	/* NDS direct route: segment synthesized from accelerator-native
+	 * registration (RA/HCCP), carried in the capsule for peer import;
+	 * npu_direct regions have target_seg == NULL. */
+	urma_seg_t direct_seg;
+	bool npu_direct;
 	const struct spdk_nvme_urma_memory_provider *provider;
 	void *pin_handle;
 	int dmabuf_fd;
@@ -348,6 +353,40 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 			SPDK_URMA_STAT_INC(registration_failures);
 			goto fail_provider;
 		}
+		/* NDS direct route: the provider synthesizes the peer-importable
+		 * segment from accelerator-native registration (P2-23: eid/uasid
+		 * from the RA domain, token_id from the lmem key). The capsule
+		 * carries it and the target imports it — no local
+		 * urma_register_seg()/is_gpu_seg roundtrip, which cannot work
+		 * for NPU HBM (P2-8 verdict). Attribute values follow
+		 * colleague_c nds_urma_import_remote_seg (nds_urma.c:457). */
+		if (region->provider->get_segment_info != NULL) {
+			struct spdk_nvme_urma_seg_info si;
+
+			rc = region->provider->get_segment_info(
+				     region->provider->provider_ctx,
+				     region->pin_handle, &si);
+			if (rc == 0) {
+				memset(&region->direct_seg, 0, sizeof(region->direct_seg));
+				memcpy(region->direct_seg.ubva.eid.raw, si.eid,
+				       sizeof(region->direct_seg.ubva.eid.raw));
+				region->direct_seg.ubva.uasid = si.uasid;
+				region->direct_seg.ubva.va = si.va;
+				region->direct_seg.len = si.len;
+				region->direct_seg.attr.bs.cacheable = URMA_NON_CACHEABLE;
+				region->direct_seg.attr.bs.access = URMA_ACCESS_READ |
+								    URMA_ACCESS_WRITE |
+								    URMA_ACCESS_ATOMIC;
+				region->direct_seg.token_id = si.token_id;
+				region->npu_direct = true;
+				SPDK_URMA_STAT_INC(direct_registrations);
+				*region_out = region;
+				return 0;
+			}
+			fprintf(stderr, "provider %s get_segment_info rc=%d — "
+				"falling back to urma_register_seg\n",
+				region->provider->name, rc);
+		}
 	}
 
 	cfg.va = (uint64_t)addr;
@@ -466,12 +505,36 @@ spdk_urma_memory_region_get_tseg(struct spdk_nvme_urma_memory_region *region)
 	return region == NULL ? NULL : region->target_seg;
 }
 
+bool
+spdk_urma_memory_region_is_direct(const struct spdk_nvme_urma_memory_region *region)
+{
+	return region != NULL && region->npu_direct;
+}
+
+urma_seg_t
+spdk_urma_memory_region_get_direct_seg(const struct spdk_nvme_urma_memory_region *region)
+{
+	if (region == NULL) {
+		return (urma_seg_t){};
+	}
+	return region->direct_seg;
+}
+
 int
 spdk_nvme_urma_memory_region_export(const struct spdk_nvme_urma_memory_region *region,
 				    void *buf, size_t *length)
 {
 	if (region == NULL || length == NULL) {
 		return -EINVAL;
+	}
+	if (region->npu_direct) {
+		if (buf == NULL || *length < sizeof(region->direct_seg)) {
+			*length = sizeof(region->direct_seg);
+			return buf == NULL ? 0 : -ENOSPC;
+		}
+		memcpy(buf, &region->direct_seg, sizeof(region->direct_seg));
+		*length = sizeof(region->direct_seg);
+		return 0;
 	}
 	if (buf == NULL || *length < sizeof(region->target_seg->seg)) {
 		*length = sizeof(region->target_seg->seg);

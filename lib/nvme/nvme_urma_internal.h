@@ -103,6 +103,13 @@ uint32_t spdk_urma_env_u32(const char *name, uint32_t default_value);
 urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 	struct spdk_nvme_urma_memory_region *region);
 
+/* NDS direct route: the provider synthesized the peer-importable segment
+ * from accelerator-native registration (RA/HCCP), no local tseg exists. */
+bool spdk_urma_memory_region_is_direct(
+	const struct spdk_nvme_urma_memory_region *region);
+urma_seg_t spdk_urma_memory_region_get_direct_seg(
+	const struct spdk_nvme_urma_memory_region *region);
+
 /* Modified By Yida(v7): 整池注册表（实现见 nvme_urma_common.c）。仅由应用侧
  * spdk_nvme_urma_register_memory_for_qpair 填充；I/O 提交路径用 find() 采纳
  * 覆盖本 I/O 缓冲的 region，跳过 per-I/O register，capsule 携带全区 seg，

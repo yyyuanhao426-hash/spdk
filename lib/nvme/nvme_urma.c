@@ -559,7 +559,14 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 				__atomic_add_fetch(&g_timing.reg_count, 1, __ATOMIC_RELAXED);
 			}
 		}
-		capsule.data.seg = spdk_urma_memory_region_get_tseg(ureq->region)->seg;
+		if (spdk_urma_memory_region_is_direct(ureq->region)) {
+			/* NDS direct route: capsule carries the synthesized
+			 * urma_seg_t (RA/HCCP domain); the target imports it
+			 * through its existing W5 path unchanged. */
+			capsule.data.seg = spdk_urma_memory_region_get_direct_seg(ureq->region);
+		} else {
+			capsule.data.seg = spdk_urma_memory_region_get_tseg(ureq->region)->seg;
+		}
 		capsule.data.address = (uint64_t)addr;
 		capsule.data.length = req->payload.size;
 	}
