@@ -332,6 +332,23 @@ struct nvmf_urma_req {
 	TAILQ_ENTRY(nvmf_urma_req) link;
 };
 
+/* SE_Review #3: 非阻塞握手状态机。accept 出来的 socket 是非阻塞的，HELLO
+ * 收发分两段增量推进（hdr 一段、endpoint desc 一段），避免组合结构体内部
+ * padding 与对端字节流错位。 */
+enum nvmf_urma_hs_state {
+	NVMF_URMA_HS_RECV_HELLO,
+	NVMF_URMA_HS_SEND_RSP,
+	NVMF_URMA_HS_DONE,
+};
+
+#define NVMF_URMA_HANDSHAKE_TIMEOUT_S	5
+#define NVMF_URMA_HANDSHAKE_POLL_US	1000
+
+/* SE_Review #1: 断连排空期限。正常情况下 URMA WR 的 CR 由网卡 err_timeout
+ * 兜底必然到达，10s 只是防挂死。 */
+#define NVMF_URMA_DRAIN_TIMEOUT_S	10
+#define NVMF_URMA_DRAIN_POLL_US		1000
+
 struct nvmf_urma_qpair {
 	struct spdk_nvmf_qpair qpair;
 	struct nvmf_urma_poll_group *group;
@@ -355,11 +372,32 @@ struct nvmf_urma_qpair {
 	struct nvmf_urma_cmd_rx_slot *capsule_rx_slots;
 	struct spdk_nvme_urma_memory_region *capsule_rx_region;
 	uint32_t capsule_rx_count;
+	enum nvmf_urma_hs_state hs_state;
+	size_t hs_off0;
+	size_t hs_off1;
+	uint64_t hs_deadline_tsc;
+	struct spdk_poller *hs_poller;
+	struct spdk_urma_msg_hdr hs_hdr;
+	struct spdk_urma_endpoint_desc hs_remote;
+	struct {
+		struct spdk_urma_msg_hdr hdr;
+		struct spdk_urma_endpoint_desc local;
+	} hs_rsp;
 	struct nvmf_urma_req *reqs;
 	/* Modified By Yida(v4): tick of the poll round that first MSG_PEEK'd the
 	 * hdr currently at the head of rcvbuf; 0 = none. Kept across rounds while
 	 * the capsule body is still in flight so peek->parse covers real queueing. */
 	uint64_t pending_peek_tick;
+	/* SE_Review #1: 断连排空状态机。qpair_fini 不再同步释放——等在途 WR 的
+	 * CR、已转发的完成消息、缓冲等待全部落地后再真正 teardown。 */
+	bool draining;
+	uint32_t pending_wr;	/* 已 post 未收到 CR 的数据 WR（pull/push） */
+	pthread_mutex_t drain_lock;
+	uint32_t pending_msgs;	/* 已转发到 owner thread 未执行的完成消息，drain_lock 保护 */
+	uint64_t drain_deadline_tsc;
+	struct spdk_poller *drain_poller;
+	spdk_nvmf_transport_qpair_fini_cb fini_cb;	/* fini 回调在 free(uqpair) 之后触发，先存到这里 */
+	void *fini_arg;
 	/* Modified By Yida: target-side registration cache */
 	struct nvmf_urma_reg_entry reg_cache[NVMF_URMA_REG_CACHE_SIZE];
 	/* Remote segment imports are shared in the transport-level hash table. */
@@ -671,37 +709,86 @@ nvmf_urma_capsule_resources_fini(struct nvmf_urma_qpair *uqpair)
 	uqpair->capsule_rx_count = 0;
 }
 
+/* SE_Review #3: 非阻塞增量收/发。短读、短写、EAGAIN 都留给调用方按状态机推进。 */
 static int
-nvmf_urma_handshake(struct nvmf_urma_qpair *uqpair)
+nvmf_urma_hs_fill(int fd, void *buf, size_t length, size_t *off)
+{
+	uint8_t *pos = buf;
+
+	while (*off < length) {
+		ssize_t rc = recv(fd, pos + *off, length - *off, 0);
+
+		if (rc == 0) {
+			return -ECONNRESET;
+		}
+		if (rc < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				return -EAGAIN;
+			}
+			return -errno;
+		}
+		*off += rc;
+	}
+	return 0;
+}
+
+static int
+nvmf_urma_hs_flush(int fd, const void *buf, size_t length, size_t *off)
+{
+	const uint8_t *pos = buf;
+
+	while (*off < length) {
+		ssize_t rc = send(fd, pos + *off, length - *off, MSG_NOSIGNAL);
+
+		if (rc < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				return -EAGAIN;
+			}
+			return -errno;
+		}
+		*off += rc;
+	}
+	return 0;
+}
+
+/* 收满 HELLO 帧（hdr + endpoint desc）后的校验与 jetty import/bind，
+ * 纯设备操作，无 socket I/O。 */
+static int
+nvmf_urma_handshake_apply(struct nvmf_urma_qpair *uqpair)
 {
 	struct spdk_urma_device *device = uqpair->device;
-	struct spdk_urma_msg_hdr hdr = {};
-	struct spdk_urma_endpoint_desc local = {}, remote = {};
-	urma_rjetty_t rjetty = {};
+	struct spdk_urma_msg_hdr *hdr = &uqpair->hs_hdr;
+	struct spdk_urma_endpoint_desc *remote = &uqpair->hs_remote;
+	struct spdk_urma_msg_hdr *rsp_hdr = &uqpair->hs_rsp.hdr;
+	struct spdk_urma_endpoint_desc *local = &uqpair->hs_rsp.local;
 	uint32_t max_queue_depth;
 	int rc;
 
-	rc = nvmf_urma_read_full(uqpair->fd, &hdr, sizeof(hdr));
-	if (rc != 0 || hdr.magic != SPDK_URMA_WIRE_MAGIC ||
-	    hdr.version != SPDK_URMA_WIRE_VERSION || hdr.type != SPDK_URMA_MSG_HELLO ||
-	    hdr.length != sizeof(remote)) {
-		return rc != 0 ? rc : -EPROTO;
+	if (hdr->magic != SPDK_URMA_WIRE_MAGIC ||
+	    hdr->version != SPDK_URMA_WIRE_VERSION || hdr->type != SPDK_URMA_MSG_HELLO ||
+	    hdr->length != sizeof(*remote)) {
+		return -EPROTO;
 	}
-	if (nvmf_urma_read_full(uqpair->fd, &remote, sizeof(remote)) != 0 ||
-	    remote.transport_mode != device->opts.transport_mode ||
-	    remote.tp_type != device->opts.tp_type) {
+	if (remote->transport_mode != device->opts.transport_mode ||
+	    remote->tp_type != device->opts.tp_type) {
 		SPDK_ERRLOG("URMA handshake transport mismatch: local mode=%u tp=%u, "
 			    "remote mode=%u tp=%u\n",
 			    (unsigned)device->opts.transport_mode, (unsigned)device->opts.tp_type,
-			    remote.transport_mode, remote.tp_type);
+			    remote->transport_mode, remote->tp_type);
 		return -EPROTONOSUPPORT;
 	}
-	if (remote.max_queue_depth < 2 || remote.max_io_size == 0 ||
-	    remote.jetty_count == 0 || remote.jetty_count != uqpair->jetty_count ||
-	    remote.jetty_count > SPDK_URMA_MAX_JETTY_PER_EP) {
+	if (remote->max_queue_depth < 2 || remote->max_io_size == 0 ||
+	    remote->jetty_count == 0 || remote->jetty_count != uqpair->jetty_count ||
+	    remote->jetty_count > SPDK_URMA_MAX_JETTY_PER_EP) {
 		return -EPROTO;
 	}
-	max_queue_depth = spdk_min(remote.max_queue_depth,
+	max_queue_depth = spdk_min(remote->max_queue_depth,
 				   spdk_min(uqpair->transport->transport.opts.max_queue_depth,
 					    (uint32_t)spdk_min(
 						    (uint64_t)uqpair->jfrs[0]->jfr_cfg.depth *
@@ -710,27 +797,27 @@ nvmf_urma_handshake(struct nvmf_urma_qpair *uqpair)
 	if (max_queue_depth < 2) {
 		return -EINVAL;
 	}
-	uqpair->qpair.qid = hdr.qid;
+	uqpair->qpair.qid = hdr->qid;
 	uqpair->qpair.sq_head_max = max_queue_depth - 1;
 	uqpair->max_io_size = spdk_min(uqpair->transport->urma_opts.max_io_size,
-				      remote.max_io_size);
-	if (remote.capsule_transport != device->opts.capsule_transport) {
+				       remote->max_io_size);
+	if (remote->capsule_transport != device->opts.capsule_transport) {
 		SPDK_ERRLOG("URMA handshake capsule mode mismatch: local=%s remote=%s\n",
 			    spdk_urma_capsule_transport_name(device->opts.capsule_transport),
-			    spdk_urma_capsule_transport_name(remote.capsule_transport));
+			    spdk_urma_capsule_transport_name(remote->capsule_transport));
 		return -EPROTONOSUPPORT;
 	}
 	uqpair->capsule_transport = device->opts.capsule_transport;
 	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
 		urma_token_t token = {.token = SPDK_URMA_DEFAULT_TOKEN};
 		urma_status_t status;
+		urma_rjetty_t rjetty = {};
 
-		memset(&rjetty, 0, sizeof(rjetty));
-		rjetty.jetty_id.eid = remote.eid;
-		rjetty.jetty_id.id = remote.jetty_ids[i];
-		rjetty.trans_mode = remote.transport_mode;
+		rjetty.jetty_id.eid = remote->eid;
+		rjetty.jetty_id.id = remote->jetty_ids[i];
+		rjetty.trans_mode = remote->transport_mode;
 		rjetty.type = URMA_JETTY;
-		rjetty.tp_type = remote.tp_type;
+		rjetty.tp_type = remote->tp_type;
 		uqpair->target_jettys[i] = urma_import_jetty(device->context, &rjetty, &token);
 		if (uqpair->target_jettys[i] == NULL) {
 			return -EIO;
@@ -743,20 +830,149 @@ nvmf_urma_handshake(struct nvmf_urma_qpair *uqpair)
 			return -EIO;
 		}
 	}
-	hdr.type = SPDK_URMA_MSG_HELLO_RSP;
-	hdr.length = sizeof(local);
-	local.eid = device->eid;
-	local.jetty_count = uqpair->jetty_count;
+	memset(rsp_hdr, 0, sizeof(*rsp_hdr));
+	rsp_hdr->magic = SPDK_URMA_WIRE_MAGIC;
+	rsp_hdr->version = SPDK_URMA_WIRE_VERSION;
+	rsp_hdr->type = SPDK_URMA_MSG_HELLO_RSP;
+	rsp_hdr->length = sizeof(*local);
+	rsp_hdr->qid = hdr->qid;
+	memset(local, 0, sizeof(*local));
+	local->eid = device->eid;
+	local->jetty_count = uqpair->jetty_count;
 	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
-		local.jetty_ids[i] = uqpair->jettys[i]->jetty_id.id;
+		local->jetty_ids[i] = uqpair->jettys[i]->jetty_id.id;
 	}
-	local.transport_mode = device->opts.transport_mode;
-	local.tp_type = device->opts.tp_type;
-	local.max_queue_depth = max_queue_depth;
-	local.max_io_size = uqpair->transport->transport.opts.max_io_size;
-	local.capsule_transport = uqpair->capsule_transport;
-	rc = nvmf_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
-	return rc == 0 ? nvmf_urma_write_full(uqpair->fd, &local, sizeof(local)) : rc;
+	local->transport_mode = device->opts.transport_mode;
+	local->tp_type = device->opts.tp_type;
+	local->max_queue_depth = max_queue_depth;
+	local->max_io_size = uqpair->transport->transport.opts.max_io_size;
+	local->capsule_transport = uqpair->capsule_transport;
+	return 0;
+}
+
+/* 返回 0 = 握手完成，-EAGAIN = 未完成等下轮推进，其余 = 连接作废。 */
+static int
+nvmf_urma_handshake_progress(struct nvmf_urma_qpair *uqpair)
+{
+	int rc;
+
+	switch (uqpair->hs_state) {
+	case NVMF_URMA_HS_RECV_HELLO:
+		if (uqpair->hs_off0 < sizeof(uqpair->hs_hdr)) {
+			rc = nvmf_urma_hs_fill(uqpair->fd, &uqpair->hs_hdr,
+					       sizeof(uqpair->hs_hdr), &uqpair->hs_off0);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+		rc = nvmf_urma_hs_fill(uqpair->fd, &uqpair->hs_remote,
+				       sizeof(uqpair->hs_remote), &uqpair->hs_off1);
+		if (rc != 0) {
+			return rc;
+		}
+		rc = nvmf_urma_handshake_apply(uqpair);
+		if (rc != 0) {
+			return rc;
+		}
+		uqpair->hs_off0 = 0;
+		uqpair->hs_off1 = 0;
+		uqpair->hs_state = NVMF_URMA_HS_SEND_RSP;
+		/* fallthrough */
+	case NVMF_URMA_HS_SEND_RSP:
+		if (uqpair->hs_off0 < sizeof(uqpair->hs_rsp.hdr)) {
+			rc = nvmf_urma_hs_flush(uqpair->fd, &uqpair->hs_rsp.hdr,
+						sizeof(uqpair->hs_rsp.hdr), &uqpair->hs_off0);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+		rc = nvmf_urma_hs_flush(uqpair->fd, &uqpair->hs_rsp.local,
+					sizeof(uqpair->hs_rsp.local), &uqpair->hs_off1);
+		if (rc != 0) {
+			return rc;
+		}
+		uqpair->hs_state = NVMF_URMA_HS_DONE;
+		return 0;
+	default:
+		return 0;
+	}
+}
+
+static void
+nvmf_urma_accept_reject(struct nvmf_urma_qpair *uqpair)
+{
+	uint32_t i;
+
+	for (i = 0; i < uqpair->jetty_count; i++) {
+		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
+			if (uqpair->device->opts.transport_mode == URMA_TM_RC &&
+			    uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
+				urma_unbind_jetty(uqpair->jettys[i]);
+			}
+			urma_unimport_jetty(uqpair->target_jettys[i]);
+		}
+		if (uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
+			urma_delete_jetty(uqpair->jettys[i]);
+		}
+	}
+	free(uqpair->target_jettys);
+	free(uqpair->jettys);
+	for (i = 0; i < uqpair->jetty_count; i++) {
+		if (uqpair->jfrs != NULL && uqpair->jfrs[i] != NULL) {
+			urma_delete_jfr(uqpair->jfrs[i]);
+		}
+	}
+	free(uqpair->jfrs);
+	nvmf_urma_capsule_resources_fini(uqpair);
+	if (uqpair->hs_poller != NULL) {
+		spdk_poller_unregister(&uqpair->hs_poller);
+	}
+	pthread_mutex_destroy(&uqpair->drain_lock);
+	spdk_urma_device_close(uqpair->device);
+	close(uqpair->fd);
+	free(uqpair);
+}
+
+static void
+nvmf_urma_handshake_complete(struct nvmf_urma_qpair *uqpair)
+{
+	int flags = fcntl(uqpair->fd, F_GETFL);
+
+	/* SE_Review #3: 握手完成即恢复阻塞语义——TCP capsule 路径的
+	 * read_full/write_full 依赖阻塞 socket，残余阻塞由 accept 时设置的
+	 * SO_RCVTIMEO/SO_SNDTIMEO 兜底。URMA 模式下握手后 fd 只承载 lifetime
+	 * EOF 检查（MSG_DONTWAIT），阻塞与否无影响。 */
+	if (flags >= 0) {
+		fcntl(uqpair->fd, F_SETFL, flags & ~O_NONBLOCK);
+	}
+	uqpair->hs_state = NVMF_URMA_HS_DONE;
+	/* Modified By Yida(v3): 每条新连接视作新一轮测量的开始 */
+	nvmf_urma_timing_reset();
+	spdk_nvmf_tgt_new_qpair(uqpair->transport->transport.tgt, &uqpair->qpair);
+}
+
+static int
+nvmf_urma_handshake_poll(void *arg)
+{
+	struct nvmf_urma_qpair *uqpair = arg;
+	int rc = nvmf_urma_handshake_progress(uqpair);
+
+	if (rc == -EAGAIN) {
+		if (spdk_get_ticks() < uqpair->hs_deadline_tsc) {
+			return SPDK_POLLER_BUSY;
+		}
+		SPDK_ERRLOG("accept: handshake timeout peer=%s service=%s\n",
+			    uqpair->peer_addr, uqpair->service);
+		rc = -ETIMEDOUT;
+	}
+	spdk_poller_unregister(&uqpair->hs_poller);
+	if (rc != 0) {
+		SPDK_ERRLOG("accept: handshake failed rc=%d peer=%s\n", rc, uqpair->peer_addr);
+		nvmf_urma_accept_reject(uqpair);
+		return SPDK_POLLER_BUSY;
+	}
+	nvmf_urma_handshake_complete(uqpair);
+	return SPDK_POLLER_BUSY;
 }
 
 static int
@@ -789,7 +1005,9 @@ nvmf_urma_accept(void *arg)
 	TAILQ_FOREACH(port, &transport->ports, link) {
 		while (accepted < 16) {
 			struct nvmf_urma_qpair *uqpair;
-			int fd = accept4(port->fd, NULL, NULL, SOCK_CLOEXEC);
+			/* SE_Review #3: 监听 socket 的 nonblocking 不被 Linux 继承，
+			 * 必须显式带上 SOCK_NONBLOCK，否则握手 recv 会卡死本线程。 */
+			int fd = accept4(port->fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
 			if (fd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 				break;
 			}
@@ -799,7 +1017,14 @@ nvmf_urma_accept(void *arg)
 			/* Keep the bootstrap and optional TCP capsule path low latency. */
 			{
 				int flag = 1;
+				struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+
 				setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+				/* SE_Review #3: 握手完成恢复阻塞后，TCP capsule 路径的
+				 * read_full/write_full 由这两个超时兜底——对端停止
+				 * 读取/发送时最坏阻塞 2s，而不是无限期卡住 poll group。 */
+				setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+				setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 			}
 			uqpair = calloc(1, sizeof(*uqpair));
 			if (uqpair == NULL) {
@@ -812,6 +1037,7 @@ nvmf_urma_accept(void *arg)
 			uqpair->qpair.state = SPDK_NVMF_QPAIR_UNINITIALIZED;
 			uqpair->capsule_tx_cqe.type = NVMF_URMA_CQE_CAPSULE_TX;
 			uqpair->capsule_tx_cqe.owner = uqpair;
+			pthread_mutex_init(&uqpair->drain_lock, NULL);
 			TAILQ_INIT(&uqpair->free_reqs);
 			TAILQ_INIT(&uqpair->working_reqs);
 			/* Modified by Yin: 拆分 accept 复合条件为独立 rc，逐阶段打错误日志便于定位 */
@@ -819,44 +1045,35 @@ nvmf_urma_accept(void *arg)
 			spdk_urma_device_get(uqpair->device);
 			int rc_addr = nvmf_urma_get_socket_addresses(fd, uqpair);
 			int rc_jetty = rc_addr ? -1 : nvmf_urma_create_jetty(uqpair);
-			int rc_hs = rc_jetty ? -1 : nvmf_urma_handshake(uqpair);
+			int rc_hs = 0;
+
 			if (rc_addr != 0) {
 				SPDK_ERRLOG("accept: get_socket_addresses failed rc=%d\n", rc_addr);
 			} else if (rc_jetty != 0) {
 				SPDK_ERRLOG("accept: create_jetty failed rc=%d\n", rc_jetty);
-			} else if (rc_hs != 0) {
-				SPDK_ERRLOG("accept: handshake failed rc=%d\n", rc_hs);
 			}
-			if (rc_addr != 0 || rc_jetty != 0 || rc_hs != 0) {
-				for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
-					if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
-						if (uqpair->device->opts.transport_mode == URMA_TM_RC &&
-						    uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
-							urma_unbind_jetty(uqpair->jettys[i]);
-						}
-						urma_unimport_jetty(uqpair->target_jettys[i]);
-					}
-					if (uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
-						urma_delete_jetty(uqpair->jettys[i]);
-					}
-				}
-				free(uqpair->target_jettys);
-				free(uqpair->jettys);
-				for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
-					if (uqpair->jfrs != NULL && uqpair->jfrs[i] != NULL) {
-						urma_delete_jfr(uqpair->jfrs[i]);
-					}
-				}
-				free(uqpair->jfrs);
-				nvmf_urma_capsule_resources_fini(uqpair);
-				spdk_urma_device_close(uqpair->device);
-				close(fd);
-				free(uqpair);
+			if (rc_addr != 0 || rc_jetty != 0) {
+				nvmf_urma_accept_reject(uqpair);
 				continue;
 			}
-			/* Modified By Yida(v3): 每条新连接视作新一轮测量的开始 */
-			nvmf_urma_timing_reset();
-			spdk_nvmf_tgt_new_qpair(transport->transport.tgt, &uqpair->qpair);
+			/* SE_Review #3: 非阻塞增量握手 + 期限。先原地推进一次，没推完
+			 * 就交给周期 poller；只连接不发 HELLO 的对端再也卡不住本线程。 */
+			uqpair->hs_deadline_tsc = spdk_get_ticks() +
+						  (uint64_t)NVMF_URMA_HANDSHAKE_TIMEOUT_S * spdk_get_ticks_hz();
+			uqpair->hs_state = NVMF_URMA_HS_RECV_HELLO;
+			rc_hs = nvmf_urma_handshake_progress(uqpair);
+			if (rc_hs == -EAGAIN) {
+				uqpair->hs_poller = SPDK_POLLER_REGISTER(nvmf_urma_handshake_poll, uqpair,
+									 NVMF_URMA_HANDSHAKE_POLL_US);
+				continue;
+			}
+			if (rc_hs != 0) {
+				SPDK_ERRLOG("accept: handshake failed rc=%d peer=%s\n",
+					    rc_hs, uqpair->peer_addr);
+				nvmf_urma_accept_reject(uqpair);
+				continue;
+			}
+			nvmf_urma_handshake_complete(uqpair);
 			accepted++;
 		}
 	}
@@ -1295,6 +1512,22 @@ nvmf_urma_disconnect_qpair(struct nvmf_urma_qpair *uqpair)
 	}
 }
 
+/* SE_Review #1: 排空判定。pending_msgs 的增减与判定统一持 drain_lock，
+ * 保证"消息已入 owner thread 队列但计数未落地"的窗口不会导致提前收口；
+ * 其余计数只在 owner thread 修改，判定点也在 owner thread。 */
+static bool
+nvmf_urma_qpair_drained(struct nvmf_urma_qpair *uqpair)
+{
+	bool drained;
+
+	pthread_mutex_lock(&uqpair->drain_lock);
+	drained = TAILQ_EMPTY(&uqpair->working_reqs) &&
+		  __atomic_load_n(&uqpair->pending_wr, __ATOMIC_ACQUIRE) == 0 &&
+		  uqpair->pending_msgs == 0;
+	pthread_mutex_unlock(&uqpair->drain_lock);
+	return drained;
+}
+
 static int
 nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 {
@@ -1546,6 +1779,8 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 
 		NVMF_URMA_TGT_STAGE(post, t_post1 - ureq->post_tick);
 		ureq->post_tick = t_post1;
+		/* SE_Review #1: 在途 WR 计数，qpair_fini 的排空等它归零。 */
+		__atomic_add_fetch(&uqpair->pending_wr, 1, __ATOMIC_RELAXED);
 		return 0;
 	}
 }
@@ -1556,6 +1791,11 @@ nvmf_urma_buffers_ready(struct nvmf_urma_req *ureq)
 	/* Modified By Yida(v3): W4b — capsule parsed -> buffers ready */
 	if (ureq->start_tick != 0) {
 		NVMF_URMA_TGT_STAGE(buffer, spdk_get_ticks() - ureq->start_tick);
+	}
+	if (spdk_unlikely(nvmf_urma_qpair(ureq->req.qpair)->draining)) {
+		/* SE_Review #1: 排空期不再发起数据搬运或 exec，直接释放。 */
+		nvmf_urma_release_req(ureq);
+		return;
 	}
 	if (ureq->req.xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
 		if (nvmf_urma_post_data(ureq, false) != 0) {
@@ -1724,6 +1964,11 @@ nvmf_urma_process_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot,
 	uint64_t t_parse0 = spdk_get_ticks();
 	int rc;
 
+	if (spdk_unlikely(uqpair->draining)) {
+		/* SE_Review #1: 排空期不再接收新命令，也不重发 RX slot——
+		 * 断连后连接作废，slot 随 qpair 一起销毁。 */
+		return 0;
+	}
 	if (cr->flag.bs.s_r == 0 || cr->opcode != URMA_CR_OPC_SEND ||
 	    cr->completion_len != (uint32_t)sizeof(frame)) {
 		return -EPROTO;
@@ -1776,6 +2021,12 @@ nvmf_urma_handle_completion(const urma_cr_t *completion)
 			return 0;
 		}
 		ureq = ctx->owner;
+		__atomic_sub_fetch(&uqpair->pending_wr, 1, __ATOMIC_RELAXED);
+		if (spdk_unlikely(uqpair->draining)) {
+			/* SE_Review #1: 排空期只释放，不再回错误响应。 */
+			nvmf_urma_release_req(ureq);
+			return 0;
+		}
 		ureq->rsp.nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 		ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		if (nvmf_urma_send_response(ureq) != 0) {
@@ -1799,6 +2050,14 @@ nvmf_urma_handle_completion(const urma_cr_t *completion)
 		return rc;
 	}
 	ureq = ctx->owner;
+	__atomic_sub_fetch(&uqpair->pending_wr, 1, __ATOMIC_RELAXED);
+	if (spdk_unlikely(uqpair->draining)) {
+		/* SE_Review #1: 排空期收到数据 CR 只释放，不 exec、不回包。 */
+		if (ureq->state == NVMF_URMA_REQ_PULLING || ureq->state == NVMF_URMA_REQ_PUSHING) {
+			nvmf_urma_release_req(ureq);
+		}
+		return 1;
+	}
 	if (ureq->state == NVMF_URMA_REQ_PULLING) {
 		/* Modified By Yida(v3): W8 — WR posted -> JFC completion
 		 * (includes poller scheduling latency) */
@@ -1824,8 +2083,26 @@ static void
 nvmf_urma_completion_msg_fn(void *ctx)
 {
 	struct nvmf_urma_completion_msg *msg = ctx;
+	const urma_cr_t *completion = &msg->completion;
+	struct nvmf_urma_cqe_ctx *cctx = (void *)completion->user_ctx;
+	struct nvmf_urma_qpair *uqpair = NULL;
 
-	(void)nvmf_urma_handle_completion(&msg->completion);
+	if (cctx != NULL) {
+		if (cctx->type == NVMF_URMA_CQE_CAPSULE_TX) {
+			uqpair = cctx->owner;
+		} else if (cctx->type == NVMF_URMA_CQE_CAPSULE_RX) {
+			uqpair = ((struct nvmf_urma_cmd_rx_slot *)cctx->owner)->qpair;
+		} else if (cctx->type == NVMF_URMA_CQE_DATA) {
+			uqpair = nvmf_urma_qpair(((struct nvmf_urma_req *)cctx->owner)->req.qpair);
+		}
+	}
+	if (uqpair != NULL) {
+		/* SE_Review #1: 排空判定依赖这个计数在消息执行前落地。 */
+		pthread_mutex_lock(&uqpair->drain_lock);
+		uqpair->pending_msgs--;
+		pthread_mutex_unlock(&uqpair->drain_lock);
+	}
+	(void)nvmf_urma_handle_completion(completion);
 	free(msg);
 }
 
@@ -1861,11 +2138,18 @@ nvmf_urma_process_completion(const urma_cr_t *completion)
 		return -ENOMEM;
 	}
 	msg->completion = *completion;
+	/* SE_Review #1: 计数在入队前落地（与 msg_fn 的递减、drain 判定同锁），
+	 * 保证排空判定不会漏掉在途消息。 */
+	pthread_mutex_lock(&uqpair->drain_lock);
+	uqpair->pending_msgs++;
 	if (spdk_thread_send_msg(uqpair->thread, nvmf_urma_completion_msg_fn, msg) != 0) {
+		uqpair->pending_msgs--;
+		pthread_mutex_unlock(&uqpair->drain_lock);
 		free(msg);
 		nvmf_urma_disconnect_qpair(uqpair);
 		return -EIO;
 	}
+	pthread_mutex_unlock(&uqpair->drain_lock);
 	return 0;
 }
 
@@ -2022,18 +2306,34 @@ nvmf_urma_req_complete(struct spdk_nvmf_request *req)
 	}
 }
 
+/* Modified By Yida(v8): 真正的 teardown 收尾。只有 drained() 为真（或排水超时强制
+ * 收尾）才会走到这里：此时在途 WR 的 CR 已被消费、已转发的完成消息已执行，
+ * working_reqs 不再会被任何回调触碰，归还 buffer / 销毁队列 / 释放 qpair 才安全。 */
 static void
-nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
-		      spdk_nvmf_transport_qpair_fini_cb cb_fn, void *cb_arg)
+nvmf_urma_qpair_drain_finish(struct nvmf_urma_qpair *uqpair)
 {
-	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(qpair);
-	struct nvmf_urma_req *ureq, *tmp;
-	TAILQ_FOREACH_SAFE(ureq, &uqpair->working_reqs, link, tmp) {
-		nvmf_urma_release_req(ureq);
+	spdk_nvmf_transport_qpair_fini_cb cb_fn = uqpair->fini_cb;
+	void *cb_arg = uqpair->fini_arg;
+
+	if (uqpair->drain_poller != NULL) {
+		spdk_poller_unregister(&uqpair->drain_poller);
 	}
+
+	/* 正常路径 working_reqs 已空；只有排水超时的强制收尾才会剩下请求。
+	 * 强制归还可能命中仍在途 WR 将要写入的 buffer，仅作为不挂死的兜底。 */
+	if (!TAILQ_EMPTY(&uqpair->working_reqs)) {
+		struct nvmf_urma_req *ureq, *tmp;
+		SPDK_ERRLOG("qpair qid=%u drain timeout, force-releasing %u remaining reqs\n",
+			    uqpair->qpair.qid, uqpair->qpair.queue_depth);
+		TAILQ_FOREACH_SAFE(ureq, &uqpair->working_reqs, link, tmp) {
+			nvmf_urma_release_req(ureq);
+		}
+	}
+
 	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
 		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
-			if (uqpair->device->opts.transport_mode == URMA_TM_RC) {
+			if (uqpair->device != NULL &&
+			    uqpair->device->opts.transport_mode == URMA_TM_RC) {
 				urma_unbind_jetty(uqpair->jettys[i]);
 			}
 			urma_unimport_jetty(uqpair->target_jettys[i]);
@@ -2063,10 +2363,61 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 		close(uqpair->fd);
 	}
 	free(uqpair->reqs);
+	pthread_mutex_destroy(&uqpair->drain_lock);
 	free(uqpair);
 	if (cb_fn != NULL) {
 		cb_fn(cb_arg);
 	}
+}
+
+static int
+nvmf_urma_drain_poll(void *arg)
+{
+	struct nvmf_urma_qpair *uqpair = arg;
+
+	if (nvmf_urma_qpair_drained(uqpair)) {
+		nvmf_urma_qpair_drain_finish(uqpair);
+		return SPDK_POLLER_BUSY;
+	}
+	if (spdk_get_ticks() >= uqpair->drain_deadline_tsc) {
+		/* 在途计数没有归零（JFC 不再上报 CR、消息被 owner thread 丢失等）。
+		 * 与其让 qpair 和 iobuf 永远挂着，不如强制收尾并明确报错。 */
+		SPDK_ERRLOG("qpair qid=%u drain deadline exceeded: pending_wr=%u pending_msgs=%u\n",
+			    uqpair->qpair.qid, __atomic_load_n(&uqpair->pending_wr, __ATOMIC_ACQUIRE),
+			    uqpair->pending_msgs);
+		nvmf_urma_qpair_drain_finish(uqpair);
+		return SPDK_POLLER_BUSY;
+	}
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
+		     spdk_nvmf_transport_qpair_fini_cb cb_fn, void *cb_arg)
+{
+	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(qpair);
+
+	if (uqpair->draining) {
+		/* 通用层不应重复 fini；防御性兜底，避免双注册 poller / 双回调。 */
+		SPDK_ERRLOG("qpair qid=%u fini called while already draining\n", qpair->qid);
+		return;
+	}
+
+	/* Modified By Yida(v8): 断连时在途资源可能还没落完 —— PULLING/PUSHING 的
+	 * 数据 WR 需要等 JFC CR，转发到 owner thread 的完成消息需要等它被执行。
+	 * 先把这些引用排干，再走 drain_finish 的 teardown。 */
+	uqpair->fini_cb = cb_fn;
+	uqpair->fini_arg = cb_arg;
+	uqpair->draining = true;
+	uqpair->drain_deadline_tsc = spdk_get_ticks() +
+				     NVMF_URMA_DRAIN_TIMEOUT_S * spdk_get_ticks_hz();
+
+	if (nvmf_urma_qpair_drained(uqpair)) {
+		nvmf_urma_qpair_drain_finish(uqpair);
+		return;
+	}
+	uqpair->drain_poller = SPDK_POLLER_REGISTER(nvmf_urma_drain_poll, uqpair,
+			       NVMF_URMA_DRAIN_POLL_US);
 }
 
 static int
