@@ -404,8 +404,6 @@ struct nvmf_urma_qpair {
 	TAILQ_HEAD(, nvmf_urma_req) free_reqs;
 	TAILQ_HEAD(, nvmf_urma_req) working_reqs;
 	TAILQ_ENTRY(nvmf_urma_qpair) link;
-	spdk_nvmf_transport_qpair_fini_cb fini_cb;
-	void *fini_arg;
 };
 
 struct nvmf_urma_port {
