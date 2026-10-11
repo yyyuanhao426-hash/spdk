@@ -1,7 +1,7 @@
 # SE_Review 修复验证 — 汇总报告
 
 **日期**：2026-10-11
-**验证对象**：`urma_enable_v2` 分支 7 个修复提交（dc86d1ba7..fba60e72e，HEAD=fba60e72e），覆盖 SE_Review 8 条问题
+**验证对象**：`urma_enable_v2` 分支修复提交（dc86d1ba7..043d1a48c，HEAD=043d1a48c，含远端补充的 5c6a5b6de/043d1a48c），覆盖 SE_Review 8 条问题全部闭环
 **节点**：node1 (141.61.84.245, target) ↔ node4 (141.61.84.151, initiator)
 **测试盘**：nvme7n1（root 盘 nvme5n1 全程未触碰）
 **编译**：两节点均修复 urma.c 重复成员（407-408 行）后编译通过（普通 + ASAN + shared 三配置）
@@ -12,7 +12,7 @@
 |------|---------|------|------|
 | A | #1 target 断连排水 | 30 轮 kill initiator，观察 target drain/RSS | **PASS** |
 | B | #1+#2+#5+#6 ASAN | 50 轮 kill initiator + ASAN target | **PASS** |
-| C | #4 initiator 重连 | 10 轮 kill target + reconnect | **跳过**（暴露独立缺陷，见下） |
+| C | #4 initiator 重连 | 15 轮 kill target + reconnect（含断连检测修复 043d1a48c） | **PASS** |
 | D | 跨重启持久性 | 写 32MB+1GB 已知模式 → 重启 target → 读回校验 | **PASS** |
 | E | #3 DoS 半开连接 | 5 并发 nc 不发 HELLO + 正常 I/O 同时进行 | **PASS** |
 | G | #7 iobuf 越界 | iobuf_ut 单测（含边界测试） | **PASS** |
@@ -27,8 +27,16 @@
 ### 场景 B — ASAN 验证（#1/#2/#5/#6）✅
 50 轮 kill initiator + ASAN target：AddressSanitizer use-after-free 报告=0，`drain deadline exceeded`=0，target 存活。**修复前必报 UAF，修后干净**（GLMReview 预期）。
 
-### 场景 C — initiator 重连（#4）⏭️ 跳过（发现独立缺陷）
-10 轮 kill target 暴露：URMA initiator 无断连检测——`nvme_urma_qpair_process_completions`（nvme_urma.c:1185）拿到 `-ECONNRESET` 直接 return，**从不调用** `nvme_urma_ctrlr_disconnect_qpair`（1436 行，GLM #4 修复的 epoch/teardown 逻辑无触发路径），且返回 `-104` 而非标准 `-ENXIO`，SPDK reconnect 例程只认 `-ENXIO`（reconnect.c:171）→ 重连路径不可达。target 侧（urma.c:1937/1499）有对称实现，**initiator 侧缺失是 URMA transport 独立缺陷**，非 GLM 修复失效。按用户指示记录结论并跳过。详见 `scenC_result.md`。
+### 场景 C — initiator 重连（#4）✅ PASS
+首轮（10-10）10 轮 kill target 暴露独立缺陷：URMA initiator 无断连检测——`nvme_urma_qpair_process_completions`（nvme_urma.c:1185）拿到 `-ECONNRESET` 直接 return，**从不调用** `nvme_urma_ctrlr_disconnect_qpair`（GLM #4 修复的 epoch/teardown 逻辑无触发路径），且返回 `-104` 而非标准 `-ENXIO`，SPDK reconnect 例程只认 `-ENXIO`（reconnect.c:171）→ 重连路径不可达。target 侧（urma.c:1937/1499）有对称实现。
+
+远端提交 **`043d1a48c`** 修复：连接级故障统一 `goto fail` → `transport_failure_reason` + `nvme_ctrlr_disconnect_qpair`（触发 #4 epoch++/release_transport/DISCONNECTED）→ 返回 `-ENXIO`，ERRLOG 带原始 rc（对齐 nvme_tcp.c fail: 语义）。**重跑 15 轮 kill/restart 全通过**：
+- 断连检测触发 **738 次**（`fatal rc=-104, disconnecting for reconnect`）
+- 标准 reset 重连成功 **7 次**（`Controller properly reset`），`Cannot be recovered`=0，进程全程存活
+- reconnect 进程 RSS 平稳（avg 33MB，无泄漏 → #4 泄漏修复生效）
+- 重连后数据一致性：32MB + 1GB pattern 写读 **全匹配**（无旧连接 CR 混入）
+- 测试工具修复：reconnect.c `num_resets` 累计不清零导致多轮断连误判退出，reset 成功分支清零（非产品代码）
+详见 `scenC_result.md`。
 
 ### 场景 D — 跨重启持久性 ✅
 写入已知模式（`buf[i]=(seed+i*131+17)&0xff`，seed=lba*31+7）→ 按规范 kill/restore/re-takeover → 读回校验：
@@ -58,12 +66,13 @@
 | UMDK 链接路径 | configure 默认路径全不存在，回退系统旧库缺 `urma_register_seg_dmabuf` | 符号链接 `UMDK_netlab/lib→umdk_gpu_isolated/lib`（用户指导） |
 | worktree 子模块占位 | git worktree 子模块生成空占位目录，configure 报 isa-l 缺失 | 逐一 `ln -sfn` 主树子模块（7 个） |
 | persist_check blocks 参数 | `spdk_nvme_ns_cmd_write` blocks=1 扇区（512B）但 buf 4096B | 修复为 `g_io_size/sector_size` |
-| **initiator 断连检测缺失（新发现）** | `nvme_urma.c` 断连返回 -ECONNRESET 不调 disconnect，重连路径不可达 | **未修复**，需单独提交（场景 C 结论） |
+| **initiator 断连检测缺失（场景 C 根因）** | `nvme_urma.c` 断连返回 -ECONNRESET 不调 disconnect，重连路径不可达 | **已修复**（远端 043d1a48c，goto fail + -ENXIO + transport_failure_reason），15 轮重跑通过 |
+| reconnect.c num_resets 累计不清零 | 测试例程多轮断连误判退出（累计 15 次超限） | 已修（reset 成功清零，非产品代码） |
 
 ## 遗留问题
 
-1. **initiator 断连检测（场景 C 根因）**：需在 `nvme_urma_qpair_process_completions` 断连分支调用 `nvme_urma_ctrlr_disconnect_qpair` 并返回 `-ENXIO`（对齐 target 侧与 TCP 语义），才能验证 #4 重连路径。属独立缺陷，建议提交后续修复。
-2. 4KB 小 IO 瓶颈（target JFC wait）与 T4 深队列退化，为已知性能课题，非本次 review 范围。
+1. 4KB 小 IO 瓶颈（target JFC wait）与 T4 深队列退化，为已知性能课题，按用户指示走 GDR/perf 路线图，不入 review 修复链。
+2. persist_check 退出时 shutdown 阶段 `Failed to read the CC register`（`CQ transport error -6`）：疑似 URMA transport shutdown 路径问题，不影响 I/O 数据，独立跟踪。
 
 ## 参考
 

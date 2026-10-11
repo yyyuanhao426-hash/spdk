@@ -1,55 +1,70 @@
 # SE_Review 修复验证 — 场景 C（#4 重连）结论
 
-日期：2026-10-10
-节点：node1（141.61.84.245, target, ASAN 构建 fba60e72e）/ node4（141.61.84.151, initiator）
+日期：2026-10-11（重跑）
+节点：node1（141.61.84.245, target, ASAN 构建 043d1a48c）/ node4（141.61.84.151, initiator）
 测试盘：nvme7n1（BDF 0000:91:00.0）
+代码：`043d1a48c`（initiator 断连检测修复）+ 测试工具修复（reconnect.c num_resets 清零）
 
 ## 结论
 
-**场景 C 未通过（阻塞），原因是 URMA initiator transport 断连检测缺失，GLM #4 修复（epoch/teardown）无触发路径。** 按用户指示记录结论并跳过场景 C。
+**场景 C 重跑通过（#4 最后闭环）。** 首轮执行（10-10）发现的「initiator 断连检测缺失」已由远端提交 `043d1a48c` 修复，重跑 15 轮 kill/restart 全部恢复，无泄漏、无数据混入。
 
-## 执行记录
+## 修复内容（远端 5c6a5b6de + 043d1a48c）
 
-- 目标：node4 跑 SPDK `examples/nvme/reconnect` 例程，node1 循环 kill/restart target（计划 10 轮），验证 initiator 重连成功、epoch 丢弃、无泄漏。
-- 实际执行：10 轮 kill/restart 循环全部完成（`/tmp/se_c/rounds.log`），但：
-  1. 第一轮验证脚本未包含 `-i 141.61.84.245`（自动探测 listener 选错网卡：veth 10.12.1.178 而非 enp165s0 141.61.84.245），reconnect 连不上。
-  2. 手动修复 listener 后复测，reconnect 例程在 target 断连时报错退出：
-     ```
-     nvme_qpair.c:914: ... CQ transport error -104 (Connection reset by peer)
-     Received an unknown error processing completions.   <- reconnect.c:177, exit(1)
-     ```
-- 下载数据：`data/scenC_reconnect.log`（node4 reconnect 日志，含上述 -104 退出）、`data/scenC_rounds.log`（node1 重启循环记录）。
+| 提交 | 内容 | 状态 |
+|------|------|------|
+| `5c6a5b6de` | urma.c struct 重复成员 fini_cb/fini_arg（fba60e72e 回归，删除 407-408） | 与机器侧修复一致 |
+| `043d1a48c` | initiator 连接级故障统一 `goto fail`：设置 `transport_failure_reason` → `nvme_ctrlr_disconnect_qpair`（触发 #4 的 epoch++/release_transport/DISCONNECTED）→ 返回 `-ENXIO`；ERRLOG 带原始 rc | 对齐 nvme_tcp.c fail: 语义 |
 
-## 根因分析（代码证据）
+触发路径（nvme_urma_qpair_process_completions，1272-1280 行）：
+```
+SPDK_ERRLOG("URMA qpair %u: fatal rc=%d, disconnecting for reconnect\n", ...);
+qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_UNKNOWN;
+nvme_ctrlr_disconnect_qpair(qpair->ctrlr, qpair);
+return -ENXIO;
+```
 
-对比 target 侧与 initiator 侧对 TCP 控制面断连（recv==0）的处理：
+## 执行记录（重跑）
 
-| 环节 | target 侧 `lib/nvmf/urma.c` | initiator 侧 `lib/nvme/nvme_urma.c` |
-|------|------------------------------|--------------------------------------|
-| lifetime socket 检查 | `nvmf_urma_check_lifetime_socket`（1937） | `nvme_urma_check_lifetime_socket`（1147） |
-| EOF 返回值 | `-ECONNRESET`（1948） | `-ECONNRESET`（1167） |
-| 断连后的动作 | **调用** `nvmf_urma_disconnect_qpair`（2210，排水状态机 + 资源回收） | **不调用**，`nvme_urma_qpair_process_completions` 拿到 rc<0 直接 return（1185） |
-| 返回错误码 | 触发 qpair 断开流程 | `-104`，非标准 `-ENXIO` |
+- initiator：`examples/nvme/reconnect -q 32 -o 4096 -w write -t 1500`，trid 显式 `traddr:141.61.84.245`
+- target：ASAN 构建 nvmf_tgt，`target_nvme_takeover.sh -d nvme7n1 -y -i 141.61.84.245 -L /home/tong/umdk_gpu_isolated/lib`
+- 循环：15 轮 `kill -9` → `-r -y` 还原 vfio 盘 → 检查 root（/dev/mapper/openeuler-root，非 nvme7）→ 重新接管
 
-标准语义对照（SPDK TCP transport，`lib/nvme/nvme_tcp.c`）：
-- `nvme_tcp_qpair_process_completions` 失败路径（`fail:` 标签）设置 `transport_failure_reason` → `nvme_ctrlr_disconnect_qpair()` → `return -ENXIO`（nvme_tcp.c:2438-2441）。
-- 上层 `spdk_nvme_qpair_process_completions`（nvme_qpair.c:869）据此返回 `-ENXIO`，驱动 reconnect 例程 `nvme_check_io`（reconnect.c:171）走 `spdk_nvme_ctrlr_reconnect_io_qpair` 重连。
+### 关键计数（data/scenC_reconnect_r2.log）
 
-URMA initiator 侧问题：
-1. `nvme_urma_qpair_process_completions` 在 TCP 断连（recv==0）分支返回 `-ECONNRESET`（nvme_urma.c:1215），lifetime socket 检查也返回 `-ECONNRESET`（1167）。
-2. **从不调用** `nvme_urma_ctrlr_disconnect_qpair`（nvme_urma.c:1436，即 GLM #4 修复实现的 epoch++ / release_transport / DISCONNECTED 状态机）。该函数仅有定义和 ops 表注册，无断连路径调用点（grep 确认：1436 定义、1615 ops 注册，无其他调用）。
-3. 结果：qpair 永远停在 ENABLED，epoch 不变，标准重连（reconnect 例程、`spdk_nvme_ctrlr_reconnect_io_qpair`）不可达。
+| 指标 | 数值 | 判定 |
+|------|------|------|
+| `fatal rc=-104, disconnecting for reconnect` | **738** | 新断连路径持续触发 ✓ |
+| `Controller properly reset` | **7** | 标准 reset 重连成功恢复 ✓ |
+| `Controller cannot be recovered. Exiting.` | **0** | 无退出 ✓ |
+| `failed with error: -111`（reset 期间 target down 窗口） | 36 | 正常，恢复前重试 |
+| reconnect 进程存活 | 全程 8+ 分钟 | ✓ |
 
-## 影响
+### RSS（data/scenC_rss_r2.csv）
 
-- **GLM #4 修复无法被验证**：epoch 丢弃旧 CR、连接级 teardown 逻辑在 TCP 断连路径上永远不执行。该修复只在「上层框架主动调用 disconnect_qpair」（如 ctrlr_reset / delete qpair）时才会生效，而 URMA transport 自身的断连检测从未触发它。
-- **URMA transport 独立缺陷**：initiator 侧断连检测不完整，对称实现存在于 target 侧（lib/nvmf/urma.c:2203-2210），initiator 侧缺失。
+- 样本 589，avg 33,016 KB，max 34,812 KB，无持续增长 → **#4 泄漏修复生效** ✓
 
-## 修复建议（未执行）
+### 数据一致性（persist_check fill→verify）
 
-在 `nvme_urma_qpair_process_completions` 的断连分支（recv==0 / lifetime socket EOF / recv 错误）调用 `nvme_urma_ctrlr_disconnect_qpair(qpair->ctrlr, qpair)` 并返回 `-ENXIO`（对齐 nvme_tcp.c 的 fail: 路径与 target 侧语义），使 GLM #4 的 epoch/teardown 状态机可被标准重连路径触发。
+| 范围 | 结果 |
+|------|------|
+| 32MB（8192×4KB, LBA 0）write→verify | **matched OK (8192 I/Os)** ✓ |
+| 1GB（8192×128KB, LBA 1M）write→verify | **matched OK (8192 I/Os)** ✓ |
 
-## 遗留
+无旧连接 CR 混入。注：1GB verify 程序退出时出现 `Failed to read the CC register` / `CQ transport error -6` 的 shutdown 阶段日志，与数据校验无关（verify 结果 matched OK）。
 
-- 场景 C 数据：10 轮循环日志（listener 选错网卡，无效）、单轮手动复现日志（-104 退出，有效证据）。
-- 后续若需验证 #4，先实施上述修复并重新编译 initiator（及 ASAN worktree）后再跑。
+## 测试工具修复（非产品代码）
+
+reconnect.c `g_max_ctrlr_resets=15` 为**累计计数且 reset 成功后不清零**：多次断连场景下失败次数跨轮累计，超限触发 `exit(1)`。修复：reset 成功分支加 `entry->num_resets = 0;`（reconnect.c:957）。这是例程逻辑缺陷，不影响产品代码验证结论。
+
+## 遗留观察（记录在案，不阻塞闭环）
+
+1. **reset 期间断连检测高频触发**（738 次）：target down 窗口内 I/O 持续失败，每轮 qpair 0/1 反复检测 EOF。行为正确但日志量大，若需收敛可考虑断连后暂停 I/O 提交直到 reset 完成。
+2. **shutdown 阶段 `Failed to read the CC register`**：persist_check 退出时 URMA target 的 CC 寄存器读取失败（`CQ transport error -6`），疑似 URMA transport shutdown 路径问题，不影响 I/O 数据。独立跟踪。
+3. **性能课题不入本链**：4KB 小 IO 的 JFC wait 瓶颈与 T4 深队列退化按用户指示走 GDR/perf 路线图。
+
+## 数据文件
+
+- `data/scenC_reconnect_r2.log` — reconnect 例程完整日志（738 次断连 + 7 次恢复）
+- `data/scenC_rss_r2.csv` — reconnect 进程 VmRSS 全程采样
+- `data/scenC_rounds_r2.log` — node1 15 轮 restart 循环记录
