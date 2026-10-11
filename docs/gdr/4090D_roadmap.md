@@ -46,7 +46,7 @@
 **整池注册 P1**（`urma_perf.c:810-824`，15 行）：`URMA_PERF_REGION_REG=1` 时 gate 放行 peermem，type 按 mem_type 传 `SPDK_NVME_URMA_MEM_CUDA`。
 
 - 效果：首圈注册税移出计时窗（T4b8 setup 仅 ~0.2s）+ 稳态 8.5 → **16.6 GB/s**（顺带绕过 per-IO seg 开销墙）。
-- ⚠️ **该改动目前只存在于 node1 工作区，未进任何 git——下一次 `reset --hard` 对齐就会把它抹掉。抢救进 git 是全部行动计划里最优先的一项（§5 行动 1）。**
+- ✅ 已抢救进 git（`8e852647c` 已提交并推送，见 source_audit §1）；剩余后半段：node1 `reset --hard` 对齐重建 + 复跑 T4b8 确认 16.6 从库里复现（§5 行动 1）。
 
 ### 3.2 部署达标配置（今天就能交付的答案）
 
@@ -61,13 +61,13 @@ GPU peermem：URMA_PERF_REGION_REG=1  -o 4M -T 4 -b 8   → 16.6 GB/s（inflight
 
 **1. bridge 层大页合并 —— 本方案的核心赌注**
 
-原理：`nvidia.ko` 没有"给大页"的开关（页粒度由 RM 决定，恒吐 64KB 条目），但页表在返回 UMMU 之前**过我们自己的 `udma_nv_p2p_bridge.ko`**（源码在 node1 `/home/tong/urma_driver/`）。在 bridge 里把**物理连续**的 32 条 64KB 合并成 1 条 2MB 再交 UMMU——UMDU 自己声明 `supported_alignments: 4K/64K/2M/1G`。
+原理：`nvidia.ko` 没有"给大页"的开关（页粒度由 RM 决定，恒吐 64KB 条目），但页表在返回 UMMU 之前**过我们自己的 `udma_nv_p2p_bridge.ko`**（源码已入库 cf9835d：`urma_driver/urma/hw/udma/udma_nv_p2p_bridge.c`）。在 bridge 里把**物理连续**的 32 条 64KB 合并成 1 条 2MB 再交 UMMU——可行依据（第三轮定案，audit §7.1/7.2）：`supported_alignments: 4K/64K/2M/1G` 一说出自设计草案注释**非代码**（见 source_audit §4），但内核源码证实 `sva_matt_inner_map_phys_sg` 收**变长条目**（core_matt.c:160-210），且 GPU 映射 domain 的 `pgsize_bitmap` = 硬件 cap（GRAN4K 时含 2M）——**可行性只剩 GRAN 位一问，node1 上 1 分钟 grep/sysfs 定案**。
 
 - 前提 A（10 分钟，只读）：**VRAM 物理连续性** —— 打印 64KB 物理地址，数 512 条里有几个连续 2MB 段。新分配的大池子（GPU 刚重启、无碎片）大概率几乎全连续；做法上"能拼多少拼多少"，不假设全连续。
-- 前提 B（10 分钟，只读）：`ummu_sva_matt_map_phys_sg` 入口是否收**变长条目**（标准 sg 每条自带长度 → 直接喂；固定 page_size → 连 page_size 参数一起改 2MB）。
+- 前提 B ✅ **已过**（内核源码证实 `ummu_sva_matt_map_phys_sg` 收变长条目，且 domain bitmap=硬件 cap、`sva.c:474` 的 PAGE_SIZE 强制不影响 GPU 路径——audit §7.2）。
 - 实现：挂模块参数（如 `coalesce=2m`，与现有 `gpu_vendor` 参数风格一致，默认关，不影响默认路径）。
 - 预期收益一：**注册税 ÷32**——整池 setup 从 0.06ms/entry×512 条 → 16 条；T4b16/T8b8 那种 setup 126~143s 的场景缩到几秒。
-- 预期收益二（大奖）：若数据面 IOTLB 按**条数**计费，256MB 从 4096 条降回 128 条（与 cpu 大页同级），**第二墙消失，带宽往 ~24 的链路天花板爬**。
+- 预期收益二（大奖）：若数据面 IOTLB 按**条数/页粒度**计费——第三轮修正（audit §7.3）：4K granule 下每 64KB sg 实际拆成 16 条 4K PTE，256MB = **65536 个 4K TLB 条目**（旧估 4096 低估 16×）；合并成 2M block 后降回 **128 条（512×）**（与 cpu 大页同级），**第二墙消失，带宽往 ~24 的链路天花板爬**。
 - 若落空（UMMU 内部把 2MB 映射拆回 64KB IOTLB 条目）：墙不动，但拿到铁证"墙在 UMMU 内部"，附录 B Q6 带数据发 UMDK。**两个结果都有价值。**
 
 **2. 便宜补扫（各 60s）**
@@ -76,7 +76,8 @@ GPU peermem：URMA_PERF_REGION_REG=1  -o 4M -T 4 -b 8   → 16.6 GB/s（inflight
 |------|---------|
 | 整池 T2b8（64MB footprint） | 若 >16.6 → 128MB 已在墙的斜坡上；兼出更优部署配置 |
 | 读方向 `-r` A/B | 写方向结论的对称性验证 |
-| cpu 整池注册时数 dmesg `map entry` 粒度 | 验证"host=2MB 条目"推断（32MB 出 16 条还是 512 条），结果直接进附录 B |
+| （可选，降级）`IOMMU_MMIO`→Normal-NC A/B（`core_matt.c:152-153`） | MMIO 属**刻意设计**——翻译对象是 GPU BAR 空间，不能按 cacheable 建表（2026-10-11 项目侧确认，audit §7.4-1）；仅当①②修完③仍在时、确认 BAR 窗口读无副作用后才试，**不可回 CACHE** |
+| cpu 整池注册时数 dmesg `map entry` 粒度 | 验证"host=2MB 条目"推断——机制已实锤（cpu 走 `iommu_map_sgtable` 按 bitmap 选最优 pgsize，GPU 走逐条固定 64KB，audit §7.4-2），剩条数实测，结果直接进附录 B |
 | T4b8 整池 setup 的 dmesg 小账 | 3403 条 map vs 预期条数对不上的 ~1100 条差额来源（grep 窗口残留 / preflight 是否额外注册） |
 
 ### 3.4 UMDK 侧（外部依赖）
@@ -128,8 +129,8 @@ node2 A100：gen4 x16 + **BAR1 64GB** + 原生 dmabuf 可测，analysis.md 预�
 | 1 | **抢救 P1 15 行改动进 git**：从 node1 `urma_perf.c:810-824` 取 diff → 本地 commit → **立即 push** → node1 `reset --hard` 对齐重建 → 复跑 T4b8 确认 16.6 从库里复现 | node1 + 本仓库 | 30 分钟 | 改动不再悬空，部署链顺带验证 |
 | 2 | 修 §4 审阅待修项（勘误 + 乱码） | 《4090D_V100_peermem.md》 | 30 分钟 | 附录 B 可转发 |
 | 3 | 附录 B 发 UMDK/UB 团队 | 外部 | — | 开启 UMDK 侧排期 |
-| 4 | bridge 大页合并：前提 A/B 验证 → `coalesce=2m` 实现 → setup 验证 ÷32 → T4b16/T8b8 看第二墙动不动 | node1 `/home/tong/urma_driver` | 0.5~2 天 | 正反结果都直接进附录 B Q6 |
-| 5 | 便宜补扫：T2b8 整池 / 读方向 / cpu 注册条目粒度 | node1 | 1 小时 | 峰值确认 + 推断补证 |
+| 4 | bridge 大页合并：定粒度（1 分钟 grep/sysfs，audit §7.2）→ 前提 A 验证（B 已过）→ `coalesce=2m` 实现（模块参数默认关）→ setup 验证 ÷32 → T4b16/T8b8 看第二墙动不动（TLB 条目 65536→128，audit §7.3） | node1 `/home/tong/urma_driver` | 0.5~2 天 | 正反结果都直接进附录 B Q6 |
+| 5 | 便宜补扫：T2b8 整池 / 读方向 / cpu 注册条目粒度（MMIO A/B 降级为可选，见 §3.3-2） | node1 | 1 小时 | 峰值确认 + 推断补证 |
 
 ## 6. 目标与判定
 
