@@ -1185,20 +1185,21 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		int deferred = __atomic_exchange_n(&uqpair->deferred_error, 0, __ATOMIC_ACQ_REL);
 
 		if (deferred != 0) {
-			return deferred;
+			rc = deferred;
+			goto fail;
 		}
 	}
 	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		rc = nvme_urma_process_capsule_completions(uqpair, max_completions);
 		if (rc < 0) {
-			return rc;
+			goto fail;
 		}
 		completed = rc;
 		if (completed == 0) {
 			/* SE_Review #6: 无完成可取时检查 bootstrap socket 的 EOF/错误。 */
 			rc = nvme_urma_check_lifetime_socket(uqpair);
 			if (rc < 0) {
-				return rc;
+				goto fail;
 			}
 		}
 	} else {
@@ -1212,10 +1213,12 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 				break;
 			}
 			if (recv_rc == 0) {
-				return -ECONNRESET;
+				rc = -ECONNRESET;
+				goto fail;
 			}
 			if (recv_rc < 0) {
-				return -errno;
+				rc = -errno;
+				goto fail;
 			}
 			if ((size_t)recv_rc < sizeof(hdr)) {
 				break;
@@ -1224,7 +1227,8 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 				int available = 0;
 
 				if (ioctl(uqpair->fd, FIONREAD, &available) != 0) {
-					return -errno;
+					rc = -errno;
+					goto fail;
 				}
 				if ((size_t)available < sizeof(hdr) + hdr.length) {
 					break;
@@ -1235,14 +1239,15 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 			    hdr.type != SPDK_URMA_MSG_CAPSULE_RSP || hdr.qid != qpair->id ||
 			    hdr.length != sizeof(rsp) ||
 			    nvme_urma_read_full(uqpair->fd, &rsp, sizeof(rsp)) != 0) {
-				return -EPROTO;
+				rc = -EPROTO;
+				goto fail;
 			}
 			__atomic_add_fetch(&g_timing.compl_ticks, spdk_get_ticks() - t_compl0,
 					   __ATOMIC_RELAXED);
 			__atomic_add_fetch(&g_timing.compl_count, 1, __ATOMIC_RELAXED);
 			rc = nvme_urma_complete_response(uqpair, &rsp);
 			if (rc < 0) {
-				return rc;
+				goto fail;
 			}
 			completed += rc;
 		}
@@ -1258,10 +1263,21 @@ nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		if (rc == 0) {
 			nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
 		} else if (rc != -EAGAIN) {
-			return rc;
+			goto fail;
 		}
 	}
 	return completed;
+
+fail:
+	/* SE_Review #4/场景C: 连接级故障必须走断开并返回 -ENXIO。此前直接把
+	 * -ECONNRESET 等抛给上层：qpair 停在 ENABLED，epoch/teardown（#4）
+	 * 无触发路径，标准重连例程只认 DISCONNECTED + -ENXIO，重连不可达。
+	 * 对齐 nvme_tcp.c fail: 语义。 */
+	SPDK_ERRLOG("URMA qpair %u: fatal rc=%d, disconnecting for reconnect\n",
+		    qpair->id, rc);
+	qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_UNKNOWN;
+	nvme_ctrlr_disconnect_qpair(qpair);
+	return -ENXIO;
 }
 
 static void
