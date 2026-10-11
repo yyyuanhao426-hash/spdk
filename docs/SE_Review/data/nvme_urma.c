@@ -1,0 +1,1631 @@
+/*   SPDX-License-Identifier: BSD-3-Clause
+ *   Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ */
+
+/* Experimental independent NVMe/URMA initiator transport.  TCP is always used
+ * for bootstrap. NVMe capsules use TCP or URMA SEND/RECV, while payload bytes
+ * move through URMA READ/WRITE. */
+
+#include "nvme_internal.h"
+#include "nvme_urma_internal.h"
+
+#include "spdk/dma.h"
+#include "spdk/env.h"
+#include "spdk/nvmf.h"
+
+#include <netdb.h>
+#include <netinet/tcp.h>
+#include <sys/ioctl.h>
+
+/* Modified By Yida: rdtsc-style per-phase timing for performance diagnosis */
+struct nvme_urma_timing {
+	uint64_t reg_ticks;      /* register_memory (cache miss only) */
+	uint64_t reg_count;
+	uint64_t cache_hit_count;
+	uint64_t send_ticks;     /* capsule submit (TCP write or inline URMA SEND) */
+	uint64_t send_count;
+	uint64_t compl_ticks;    /* response polling and delivery */
+	uint64_t compl_count;
+	uint64_t release_ticks;  /* cache_release or unregister (cache release is near-zero) */
+	uint64_t release_count;
+	uint64_t total_ticks;    /* submit + completion round-trip */
+	uint64_t total_count;
+};
+
+static struct nvme_urma_timing g_timing;
+
+/* Modified By Yida(v4): per-I/O send trace for cross-machine correlation with
+ * the target's per-I/O rx trace (lib/nvmf/urma.c g_rx_trace), joined by
+ * (qid, cid). send_end means the TCP write or inline URMA SEND post returned;
+ * it does not mean that the peer received the frame. Comparing it with the
+ * target receive tick requires clock sync across hosts. */
+struct nvme_urma_tx_trace {
+	uint64_t submit_tick;
+	uint64_t send_end_tick;
+	uint32_t length;
+	uint16_t qid;
+	uint16_t cid;
+	uint8_t opcode;
+	uint8_t xfer;
+};
+
+#define NVME_URMA_TX_TRACE_SIZE 8192
+static struct nvme_urma_tx_trace g_tx_trace[NVME_URMA_TX_TRACE_SIZE];
+static uint64_t g_tx_trace_idx;
+
+/* Modified By Yida(v6): per-I/O tx trace CSV 默认关闭（每轮最多 8192 行，刷屏）；
+ * SPDK_URMA_TRACE=1 时才采集并 dump，聚合 breakdown 不受影响。 */
+static int
+nvme_urma_trace_enabled(void)
+{
+	static int enabled = -1;
+
+	if (enabled == -1) {
+		const char *v = getenv("SPDK_URMA_TRACE");
+
+		enabled = (v != NULL && v[0] == '1');
+	}
+	return enabled;
+}
+
+static void
+nvme_urma_timing_dump(void)
+{
+	uint64_t hz = spdk_get_ticks_hz();
+	uint64_t reg = __atomic_load_n(&g_timing.reg_ticks, __ATOMIC_RELAXED);
+	uint64_t reg_n = __atomic_load_n(&g_timing.reg_count, __ATOMIC_RELAXED);
+	uint64_t hit = __atomic_load_n(&g_timing.cache_hit_count, __ATOMIC_RELAXED);
+	uint64_t send = __atomic_load_n(&g_timing.send_ticks, __ATOMIC_RELAXED);
+	uint64_t send_n = __atomic_load_n(&g_timing.send_count, __ATOMIC_RELAXED);
+	uint64_t compl = __atomic_load_n(&g_timing.compl_ticks, __ATOMIC_RELAXED);
+	uint64_t compl_n = __atomic_load_n(&g_timing.compl_count, __ATOMIC_RELAXED);
+	uint64_t rel = __atomic_load_n(&g_timing.release_ticks, __ATOMIC_RELAXED);
+	uint64_t rel_n = __atomic_load_n(&g_timing.release_count, __ATOMIC_RELAXED);
+	uint64_t tot = __atomic_load_n(&g_timing.total_ticks, __ATOMIC_RELAXED);
+	uint64_t tot_n = __atomic_load_n(&g_timing.total_count, __ATOMIC_RELAXED);
+
+	/* Modified By Yida: use printf instead of SPDK_NOTICELOG — urma_perf's
+	 * default log level filters NOTICE, but results are printed via printf
+	 * which always shows on stdout. */
+	/* Modified By Yida: avg 一律先除 n 再乘系数——ticks×1e9 在累计超过 ~1.8e10
+	 * ticks（约 184ms·万次）时会溢出 uint64，长跑打印出错的 avg */
+	printf("==== URMA timing breakdown (hz=%lu) ====\n", hz);
+	printf("  register (cache miss): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       reg, reg_n, reg_n ? reg / reg_n * 1000000000ULL / hz : 0, reg * 1000 / hz);
+	printf("  cache_hit:             n=%lu\n", hit);
+	printf("  capsule submit:        %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       send, send_n, send_n ? send / send_n * 1000000000ULL / hz : 0, send * 1000 / hz);
+	printf("  completion_wait:       %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       compl, compl_n, compl_n ? compl / compl_n * 1000000000ULL / hz : 0, compl * 1000 / hz);
+	printf("  release (cache/unreg): %lu ticks, n=%lu, avg=%lu ns, total=%lu ms\n",
+	       rel, rel_n, rel_n ? rel / rel_n * 1000000000ULL / hz : 0, rel * 1000 / hz);
+	printf("  TOTAL (submit+compl):  %lu ticks, n=%lu, avg=%lu us, total=%lu ms\n",
+	       tot, tot_n, tot_n ? tot / tot_n * 1000000ULL / hz : 0, tot * 1000 / hz);
+	if (tot > 0) {
+		printf("  breakdown: reg=%.1f%% send=%.1f%% compl=%.1f%% release=%.1f%%\n",
+		       100.0 * reg / tot, 100.0 * send / tot,
+		       100.0 * compl / tot, 100.0 * rel / tot);
+	}
+	/* Modified By Yida(v4): per-I/O send trace CSV (joined with target rx trace
+	 * by qid+cid). Ticks are initiator-local TSC.
+	 * Modified By Yida(v6): SPDK_URMA_TRACE=1 才打印，默认关闭。 */
+	if (nvme_urma_trace_enabled()) {
+		uint64_t total = __atomic_load_n(&g_tx_trace_idx, __ATOMIC_RELAXED);
+		uint64_t n = total < NVME_URMA_TX_TRACE_SIZE ? total : NVME_URMA_TX_TRACE_SIZE;
+		uint64_t start = total - n;
+
+		printf("==== URMA tx trace (most recent %lu of %lu; submit/send_end are initiator-local TSC) ====\n",
+		       n, total);
+		printf("seq,qid,cid,opcode,length,submit_tick,send_end_tick\n");
+		for (uint64_t i = 0; i < n; i++) {
+			const struct nvme_urma_tx_trace *rec =
+				&g_tx_trace[(start + i) % NVME_URMA_TX_TRACE_SIZE];
+
+			printf("%lu,%u,%u,%u,%u,%lu,%lu\n",
+			       start + i, rec->qid, rec->cid, rec->opcode, rec->length,
+			       rec->submit_tick, rec->send_end_tick);
+		}
+	}
+	fflush(stdout);
+}
+
+void
+spdk_nvme_urma_dump_timing(void)
+{
+	nvme_urma_timing_dump();
+}
+
+/* Modified By Yida: Memory registration cache (Initiator 侧)
+ * Modified By Yida(v6): 64 → 128。缓存只进不出、填满即冻结：urma_perf 的
+ * preflight 缓冲先连先占 1 槽，-b 64 时 64 个任务地址只剩 63 个空位，
+ * 每 qpair 恒有 1 个地址永久入不了缓存 → 每轮一遍 ~100ms UMMU 注册税
+ * （实测 6 盘 4MB 只剩 6 GiB/s）。128 与 target 侧 NVMF_URMA_REG_CACHE_SIZE
+ * 对齐，覆盖 b=64 + preflight 的完整工作集。 */
+#define NVME_URMA_REG_CACHE_SIZE 128
+
+struct nvme_urma_reg_entry {
+	void *va;
+	size_t len;
+	struct spdk_nvme_urma_memory_region *region;
+	int refcount;   /* 引用计数，>0 表示有在途 I/O 正在使用 */
+	bool used;
+};
+
+enum nvme_urma_cqe_type {
+	NVME_URMA_CQE_CAPSULE_TX = 1,
+	NVME_URMA_CQE_CAPSULE_RX,
+};
+
+struct nvme_urma_cqe_ctx {
+	enum nvme_urma_cqe_type type;
+	void *owner;
+	/* SE_Review #4: 每轮连接一个代数，旧连接的遗留 CR 靠它识别并丢弃。 */
+	uint32_t epoch;
+};
+
+struct nvme_urma_qpair;
+
+struct nvme_urma_rsp_rx_slot {
+	struct nvme_urma_cqe_ctx cqe;
+	struct nvme_urma_qpair *qpair;
+	struct spdk_urma_capsule_rsp_frame frame;
+	urma_sge_t sge;
+	urma_jfr_wr_t wr;
+};
+
+struct nvme_urma_req {
+	struct nvme_request *req;
+	struct spdk_nvme_urma_memory_region *region;
+	/* Modified By Yida: cache entry when region is cached (NULL if not cached) */
+	struct nvme_urma_reg_entry *cache_entry; /* NULL if not cached */
+	/* Modified By Yida(v7): region 来自整池注册表采纳——release 不得 unregister */
+	bool region_external;
+	uint64_t submit_tick;   /* 总往返计时起点 */
+	uint64_t send_start;    /* send 阶段计时起点 */
+	TAILQ_ENTRY(nvme_urma_req) link;
+};
+
+struct nvme_urma_qpair {
+	struct spdk_nvme_qpair qpair;
+	struct spdk_urma_device *device;
+	urma_jetty_t **jettys;
+	urma_target_jetty_t **target_jettys;
+	urma_jfr_t **jfrs;
+	uint32_t jetty_count;
+	uint32_t next_jetty;
+	uint32_t send_jfc_index;
+	int fd;
+	uint32_t num_entries;
+	uint32_t max_io_size;
+	/* Modified by Yin: 新增 transport-level CID 计数器（submit 时分配唯一 cid） */
+	uint16_t next_cid;
+	/* Modified By Yida (v3): CID 位图，保证 outstanding 的 cid 绝不重复 */
+	uint8_t *cid_bitmap;
+	enum spdk_urma_capsule_transport capsule_transport;
+	struct nvme_urma_cqe_ctx capsule_tx_cqe;
+	struct nvme_urma_rsp_rx_slot *capsule_rx_slots;
+	struct spdk_nvme_urma_memory_region *capsule_rx_region;
+	uint32_t capsule_rx_count;
+	/* SE_Review #4: RX slot 数组只在首次连接分配一次（地址作为 CR user_ctx
+	 * 必须存活到旧连接的遗留 CR 排干为止），cap 记录容量；断连只 unregister
+	 * region，不释放数组。 */
+	uint32_t capsule_rx_slots_cap;
+	uint32_t epoch;
+	struct spdk_urma_capsule_rsp *pending_rsps;
+	uint32_t pending_rsp_head;
+	uint32_t pending_rsp_tail;
+	uint32_t pending_rsp_count;
+	pthread_mutex_t pending_rsp_lock;
+	bool pending_rsp_lock_initialized;
+	/* Modified By Yida: memory registration cache */
+	struct nvme_urma_reg_entry reg_cache[NVME_URMA_REG_CACHE_SIZE];
+	TAILQ_HEAD(, nvme_urma_req) outstanding;
+	/* SE_Review #5: 共享 JFC 轮询可能取出别的 qpair 的错误 CR，不能把 -EIO
+	 * 归给当前 poller。错误按 user_ctx 归属，原子标志由 owner 自己的下一次
+	 * process_completions 消费。 */
+	int deferred_error;
+};
+
+struct nvme_urma_ctrlr {
+	struct spdk_nvme_ctrlr ctrlr;
+	struct spdk_urma_transport_opts opts;
+};
+
+struct nvme_urma_poll_group {
+	struct spdk_nvme_transport_poll_group group;
+};
+
+static inline struct nvme_urma_qpair *
+nvme_urma_qpair(struct spdk_nvme_qpair *qpair)
+{
+	return SPDK_CONTAINEROF(qpair, struct nvme_urma_qpair, qpair);
+}
+
+static inline uint32_t
+nvme_urma_next_jetty(struct nvme_urma_qpair *uqpair)
+{
+	return uqpair->next_jetty++ % uqpair->jetty_count;
+}
+
+/* Modified By Yida (v3): CID 位图分配器。旧计数器在 fail_outstanding（重置
+ * queue_depth=0）或 send 失败路径上与实际在飞请求脱钩后，wrap 可能撞上仍在
+ * 飞（outstanding）的 cid，completion 按 cid 匹配会命中错误 request。位图
+ * 从 next_cid 起找第一个空闲位，保证任一时刻 outstanding 的 cid 唯一。
+ * 位图分配失败时退回旧计数器行为（不阻塞连接建立）。 */
+static uint16_t
+nvme_urma_cid_alloc(struct nvme_urma_qpair *uqpair)
+{
+	uint32_t count = uqpair->num_entries;
+	uint32_t i;
+
+	if (uqpair->cid_bitmap == NULL) {
+		uint16_t cid = uqpair->next_cid++;
+		if (uqpair->next_cid >= count) {
+			uqpair->next_cid = 0;
+		}
+		return cid;
+	}
+	for (i = 0; i < count; i++) {
+		uint32_t idx = (uqpair->next_cid + i) % count;
+		uint8_t mask = (uint8_t)(1u << (idx & 7));
+		if ((uqpair->cid_bitmap[idx >> 3] & mask) == 0) {
+			uqpair->cid_bitmap[idx >> 3] |= mask;
+			uqpair->next_cid = (uint16_t)((idx + 1) % count);
+			return (uint16_t)idx;
+		}
+	}
+	/* 位图满（理论上不会发生：submit 前已检查 queue_depth < num_entries） */
+	return (uint16_t)count;
+}
+
+static void
+nvme_urma_cid_free(struct nvme_urma_qpair *uqpair, uint16_t cid)
+{
+	if (uqpair->cid_bitmap != NULL && cid < uqpair->num_entries) {
+		uqpair->cid_bitmap[cid >> 3] &= (uint8_t)~(1u << (cid & 7));
+	}
+}
+
+/* Modified By Yida(v7): 应用侧整池注册入口。urma_perf 等应用在 qpair 建立后把
+ * 一整块连续缓冲（如每 worker 的 allocation）注册一次；提交 I/O 时
+ * spdk_nvme_urma_region_registry_find() 采纳覆盖缓冲的 region，跳过 per-I/O
+ * register，capsule.data.seg 携带全区描述，target 可整池 import 一次。
+ * region 生命周期由应用管理：spdk_nvme_urma_unregister_memory() 注销时
+ * 同步移出注册表。 */
+int
+spdk_nvme_urma_register_memory_for_qpair(struct spdk_nvme_qpair *qpair, void *addr,
+		size_t length, enum spdk_nvme_urma_memory_type type,
+		struct spdk_nvme_urma_memory_region **region)
+{
+	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
+	int rc;
+
+	if (uqpair->device == NULL) {
+		return -ENXIO;
+	}
+	rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr, length, type, region);
+	if (rc == 0) {
+		rc = spdk_nvme_urma_region_registry_add(uqpair->device->context, addr, length, *region);
+		if (rc != 0) {
+			spdk_nvme_urma_unregister_memory(*region);
+			*region = NULL;
+		}
+	}
+	return rc;
+}
+
+/* Modified By Yida: registration cache helpers */
+/* Look up registration cache by (va, len). Returns entry if found, NULL if miss. */
+static struct nvme_urma_reg_entry *
+nvme_urma_reg_cache_lookup(struct nvme_urma_qpair *uqpair, void *va, size_t len)
+{
+	for (int i = 0; i < NVME_URMA_REG_CACHE_SIZE; i++) {
+		struct nvme_urma_reg_entry *e = &uqpair->reg_cache[i];
+		if (e->used && e->va == va && e->len == len) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* Find a free slot in the registration cache and insert. Returns entry on
+ * success, NULL if cache is full (caller falls back to uncached register). */
+static struct nvme_urma_reg_entry *
+nvme_urma_reg_cache_insert(struct nvme_urma_qpair *uqpair, void *va, size_t len,
+			   struct spdk_nvme_urma_memory_region *region)
+{
+	for (int i = 0; i < NVME_URMA_REG_CACHE_SIZE; i++) {
+		struct nvme_urma_reg_entry *e = &uqpair->reg_cache[i];
+		if (!e->used) {
+			e->va = va;
+			e->len = len;
+			e->region = region;
+			e->refcount = 1;
+			e->used = true;
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* Release a cache entry's refcount. Does NOT unregister — the region stays
+ * cached for future I/O reuse. Actual unregister happens at qpair destroy. */
+static void
+nvme_urma_reg_cache_release(struct nvme_urma_reg_entry *entry)
+{
+	if (entry != NULL && entry->refcount > 0) {
+		entry->refcount--;
+	}
+}
+
+static int
+nvme_urma_write_full(int fd, const void *buf, size_t length)
+{
+	const uint8_t *pos = buf;
+
+	while (length != 0) {
+		ssize_t rc = send(fd, pos, length, MSG_NOSIGNAL);
+		if (rc < 0 && errno == EINTR) {
+			continue;
+		}
+		if (rc <= 0) {
+			return rc == 0 ? -ECONNRESET : -errno;
+		}
+		pos += rc;
+		length -= rc;
+	}
+	return 0;
+}
+
+static int
+nvme_urma_read_full(int fd, void *buf, size_t length)
+{
+	uint8_t *pos = buf;
+
+	while (length != 0) {
+		ssize_t rc = recv(fd, pos, length, 0);
+		if (rc < 0 && errno == EINTR) {
+			continue;
+		}
+		if (rc <= 0) {
+			return rc == 0 ? -ECONNRESET : -errno;
+		}
+		pos += rc;
+		length -= rc;
+	}
+	return 0;
+}
+
+static int
+nvme_urma_connect_socket(const struct spdk_nvme_transport_id *trid)
+{
+	struct addrinfo hints = {}, *result = NULL, *it;
+	int fd = -1, rc;
+
+	hints.ai_family = trid->adrfam == SPDK_NVMF_ADRFAM_IPV6 ? AF_INET6 : AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	rc = getaddrinfo(trid->traddr, trid->trsvcid, &hints, &result);
+	if (rc != 0) {
+		return -EINVAL;
+	}
+	for (it = result; it != NULL; it = it->ai_next) {
+		fd = socket(it->ai_family, it->ai_socktype | SOCK_CLOEXEC, it->ai_protocol);
+		if (fd >= 0) {
+			/* Modified by Yin: 禁用 Nagle——capsule 分 hdr/capsule 两次小 write，
+			 * Nagle+delayed-ACK 会让每个包卡 ~40ms，低深度时端到端延迟被抬到 ~88ms */
+			int flag = 1;
+			setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+		}
+		if (fd >= 0 && connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
+			break;
+		}
+		if (fd >= 0) {
+			close(fd);
+			fd = -1;
+		}
+	}
+	freeaddrinfo(result);
+	return fd < 0 ? -errno : fd;
+}
+
+static int
+nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
+{
+	urma_jfs_cfg_t jfs = {};
+	uint32_t capsule_inline_size = sizeof(struct spdk_urma_capsule_cmd_frame);
+	uint32_t i;
+
+	uqpair->jetty_count = spdk_min(uqpair->device->opts.num_jetty_per_ep,
+				      (uint32_t)SPDK_URMA_MAX_JETTY_PER_EP);
+	if (uqpair->jetty_count == 0) {
+		uqpair->jetty_count = 1;
+	}
+	uqpair->jettys = calloc(uqpair->jetty_count, sizeof(*uqpair->jettys));
+	uqpair->target_jettys = calloc(uqpair->jetty_count, sizeof(*uqpair->target_jettys));
+	uqpair->jfrs = calloc(uqpair->jetty_count, sizeof(*uqpair->jfrs));
+	if (uqpair->jettys == NULL || uqpair->target_jettys == NULL || uqpair->jfrs == NULL) {
+		return -ENOMEM;
+	}
+	uqpair->send_jfc_index = spdk_urma_device_next_send_jfc(uqpair->device);
+	jfs.depth = uqpair->device->opts.jetty_depth;
+	jfs.trans_mode = uqpair->device->opts.transport_mode;
+	jfs.priority = uqpair->device->priority;
+	jfs.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
+	jfs.flag.bs.multi_path = uqpair->device->opts.bonding_multipath ? 1 : 0;
+	if (uqpair->device->opts.capsule_transport ==
+	    SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
+		if (uqpair->device->attr.dev_cap.max_jfs_inline_len < capsule_inline_size) {
+			SPDK_ERRLOG("URMA capsule SEND requires %u inline bytes, device supports %u\n",
+				    capsule_inline_size,
+				    uqpair->device->attr.dev_cap.max_jfs_inline_len);
+			return -EMSGSIZE;
+		}
+		jfs.max_inline_data = capsule_inline_size;
+	}
+	jfs.rnr_retry = SPDK_URMA_DEFAULT_RNR_RETRY;
+	jfs.err_timeout = SPDK_URMA_DEFAULT_ERR_TIMEOUT;
+	jfs.jfc = uqpair->device->send_jfcs[uqpair->send_jfc_index];
+	for (i = 0; i < uqpair->jetty_count; i++) {
+		urma_jetty_cfg_t cfg = {};
+		uint32_t jfr_index = spdk_urma_device_next_jfr(uqpair->device);
+		urma_jfr_cfg_t jfr_cfg = uqpair->device->jfrs[jfr_index]->jfr_cfg;
+
+		/* JFCs belong to the NIC context, but receive queues must belong to
+		 * the endpoint.  Otherwise posted receive WRs outlive a disconnected
+		 * qpair in the context-wide JFR and can consume the next connection's
+		 * capsule. */
+		jfr_cfg.jfc = uqpair->device->recv_jfcs[jfr_index];
+		uqpair->jfrs[i] = urma_create_jfr(uqpair->device->context, &jfr_cfg);
+		if (uqpair->jfrs[i] == NULL) {
+			goto error;
+		}
+		cfg.jfs_cfg = jfs;
+		cfg.flag.bs.share_jfr = 1;
+		cfg.shared.jfr = uqpair->jfrs[i];
+		cfg.shared.jfc = uqpair->device->recv_jfcs[jfr_index];
+		uqpair->jettys[i] = urma_create_jetty(uqpair->device->context, &cfg);
+		if (uqpair->jettys[i] == NULL) {
+			goto error;
+		}
+	}
+	return 0;
+
+error:
+	for (uint32_t j = 0; j <= i; j++) {
+		if (uqpair->jettys[j] != NULL) {
+			urma_delete_jetty(uqpair->jettys[j]);
+		}
+		if (uqpair->jfrs[j] != NULL) {
+			urma_delete_jfr(uqpair->jfrs[j]);
+		}
+	}
+	free(uqpair->jfrs);
+	free(uqpair->jettys);
+	free(uqpair->target_jettys);
+	uqpair->jfrs = NULL;
+	uqpair->jettys = NULL;
+	uqpair->target_jettys = NULL;
+	return -EIO;
+}
+
+static int
+nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
+{
+	struct spdk_urma_msg_hdr hdr = {};
+	struct spdk_urma_endpoint_desc local = {}, remote = {};
+	urma_rjetty_t rjetty = {};
+	int rc;
+
+	hdr.magic = SPDK_URMA_WIRE_MAGIC;
+	hdr.version = SPDK_URMA_WIRE_VERSION;
+	hdr.type = SPDK_URMA_MSG_HELLO;
+	hdr.length = sizeof(local);
+	hdr.qid = uqpair->qpair.id;
+	local.eid = uqpair->device->eid;
+	local.jetty_count = uqpair->jetty_count;
+	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
+		local.jetty_ids[i] = uqpair->jettys[i]->jetty_id.id;
+	}
+	local.transport_mode = uqpair->device->opts.transport_mode;
+	local.tp_type = uqpair->device->opts.tp_type;
+	local.max_queue_depth = spdk_min(uqpair->num_entries + 1,
+					 (uint32_t)spdk_min(
+						 (uint64_t)uqpair->jfrs[0]->jfr_cfg.depth *
+						 uqpair->jetty_count, (uint64_t)UINT32_MAX));
+	local.max_io_size = uqpair->max_io_size;
+	local.capsule_transport = uqpair->device->opts.capsule_transport;
+	rc = nvme_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
+	if (rc == 0) {
+		rc = nvme_urma_write_full(uqpair->fd, &local, sizeof(local));
+	}
+	if (rc == 0) {
+		rc = nvme_urma_read_full(uqpair->fd, &hdr, sizeof(hdr));
+	}
+	if (rc == 0 && (hdr.magic != SPDK_URMA_WIRE_MAGIC ||
+			 hdr.version != SPDK_URMA_WIRE_VERSION ||
+			 hdr.type != SPDK_URMA_MSG_HELLO_RSP || hdr.length != sizeof(remote))) {
+		rc = -EPROTO;
+	}
+	if (rc == 0) {
+		rc = nvme_urma_read_full(uqpair->fd, &remote, sizeof(remote));
+	}
+	if (rc != 0) {
+		return rc;
+	}
+	if (remote.transport_mode != uqpair->device->opts.transport_mode ||
+	    remote.tp_type != uqpair->device->opts.tp_type ||
+	    remote.capsule_transport != uqpair->device->opts.capsule_transport) {
+		SPDK_ERRLOG("URMA handshake mode mismatch: local transport=%u tp=%u capsule=%s, "
+			    "remote transport=%u tp=%u capsule=%s\n",
+			    (unsigned)uqpair->device->opts.transport_mode,
+			    (unsigned)uqpair->device->opts.tp_type,
+			    spdk_urma_capsule_transport_name(uqpair->device->opts.capsule_transport),
+			    remote.transport_mode,
+			    remote.tp_type,
+			    spdk_urma_capsule_transport_name(remote.capsule_transport));
+		return -EPROTONOSUPPORT;
+	}
+	if (remote.max_queue_depth < 2 || remote.max_io_size == 0 ||
+	    remote.jetty_count == 0 || remote.jetty_count != uqpair->jetty_count ||
+	    remote.jetty_count > SPDK_URMA_MAX_JETTY_PER_EP) {
+		return -EPROTO;
+	}
+	uqpair->num_entries = spdk_min(uqpair->num_entries, remote.max_queue_depth - 1);
+	uqpair->num_entries = spdk_min(uqpair->num_entries, local.max_queue_depth - 1);
+	uqpair->capsule_transport = uqpair->device->opts.capsule_transport;
+	uqpair->max_io_size = spdk_min(uqpair->max_io_size, remote.max_io_size);
+	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
+		urma_token_t token = {.token = SPDK_URMA_DEFAULT_TOKEN};
+		urma_status_t status;
+
+		memset(&rjetty, 0, sizeof(rjetty));
+		rjetty.jetty_id.eid = remote.eid;
+		rjetty.jetty_id.id = remote.jetty_ids[i];
+		rjetty.trans_mode = remote.transport_mode;
+		rjetty.type = URMA_JETTY;
+		rjetty.tp_type = remote.tp_type;
+		uqpair->target_jettys[i] = urma_import_jetty(uqpair->device->context, &rjetty, &token);
+		if (uqpair->target_jettys[i] == NULL) {
+			return -EIO;
+		}
+		if (uqpair->device->opts.transport_mode != URMA_TM_RC) {
+			continue;
+		}
+		status = urma_bind_jetty(uqpair->jettys[i], uqpair->target_jettys[i]);
+		if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+			return -EIO;
+		}
+	}
+	return 0;
+}
+
+static int
+nvme_urma_post_rsp_receive(struct nvme_urma_rsp_rx_slot *slot)
+{
+	urma_jfr_wr_t *bad_wr = NULL;
+
+	return urma_post_jetty_recv_wr(slot->qpair->jettys[
+		       (uint32_t)(slot - slot->qpair->capsule_rx_slots) % slot->qpair->jetty_count],
+		       &slot->wr, &bad_wr) ==
+	       URMA_SUCCESS ? 0 : -EIO;
+}
+
+static int
+nvme_urma_capsule_resources_init(struct nvme_urma_qpair *uqpair)
+{
+	urma_target_seg_t *tseg;
+	int rc;
+
+	if (uqpair->capsule_transport != SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
+		return 0;
+	}
+	/* SE_Review #4: 新一轮连接，旧连接的遗留 CR 由代数差识别丢弃。 */
+	uqpair->epoch++;
+	uqpair->capsule_tx_cqe.epoch = uqpair->epoch;
+	uqpair->capsule_rx_count = uqpair->num_entries;
+	if (uqpair->capsule_rx_count == 0 ||
+	    (uint64_t)uqpair->capsule_rx_count >
+	    (uint64_t)uqpair->jfrs[0]->jfr_cfg.depth * uqpair->jetty_count) {
+		return -EINVAL;
+	}
+	if (uqpair->capsule_rx_slots == NULL) {
+		/* 首次连接分配，容量按本 qpair 的 num_entries 上限；此后各轮连接
+		 * 只会用它的前 capsule_rx_count 项。地址进 CR user_ctx，必须
+		 * 活到 qpair 销毁，中途断连/重连不释放。 */
+		uqpair->capsule_rx_slots_cap = uqpair->capsule_rx_count;
+		uqpair->capsule_rx_slots = calloc(uqpair->capsule_rx_slots_cap,
+						  sizeof(*uqpair->capsule_rx_slots));
+	}
+	uqpair->pending_rsps = calloc(uqpair->capsule_rx_count, sizeof(*uqpair->pending_rsps));
+	if (uqpair->capsule_rx_slots == NULL || uqpair->pending_rsps == NULL) {
+		return -ENOMEM;
+	}
+	if (pthread_mutex_init(&uqpair->pending_rsp_lock, NULL) != 0) {
+		return -EIO;
+	}
+	uqpair->pending_rsp_lock_initialized = true;
+	rc = spdk_nvme_urma_register_memory(uqpair->device->context,
+			uqpair->capsule_rx_slots,
+			uqpair->capsule_rx_slots_cap * sizeof(*uqpair->capsule_rx_slots),
+			SPDK_NVME_URMA_MEM_HOST, &uqpair->capsule_rx_region);
+	if (rc != 0) {
+		return rc;
+	}
+	tseg = spdk_urma_memory_region_get_tseg(uqpair->capsule_rx_region);
+	for (uint32_t i = 0; i < uqpair->capsule_rx_count; i++) {
+		struct nvme_urma_rsp_rx_slot *slot = &uqpair->capsule_rx_slots[i];
+
+		slot->cqe.type = NVME_URMA_CQE_CAPSULE_RX;
+		slot->cqe.owner = slot;
+		slot->cqe.epoch = uqpair->epoch;
+		slot->qpair = uqpair;
+		slot->sge.addr = (uint64_t)&slot->frame;
+		slot->sge.len = sizeof(slot->frame);
+		slot->sge.tseg = tseg;
+		slot->wr.src.sge = &slot->sge;
+		slot->wr.src.num_sge = 1;
+		slot->wr.user_ctx = (uint64_t)&slot->cqe;
+		if (nvme_urma_post_rsp_receive(slot) != 0) {
+			return -EIO;
+		}
+	}
+	return 0;
+}
+
+static void
+nvme_urma_capsule_resources_fini(struct nvme_urma_qpair *uqpair)
+{
+	spdk_nvme_urma_unregister_memory(uqpair->capsule_rx_region);
+	uqpair->capsule_rx_region = NULL;
+	if (uqpair->pending_rsp_lock_initialized) {
+		pthread_mutex_destroy(&uqpair->pending_rsp_lock);
+		uqpair->pending_rsp_lock_initialized = false;
+	}
+	free(uqpair->pending_rsps);
+	uqpair->pending_rsps = NULL;
+	uqpair->pending_rsp_head = 0;
+	uqpair->pending_rsp_tail = 0;
+	uqpair->pending_rsp_count = 0;
+	uqpair->capsule_rx_count = 0;
+	/* SE_Review #4: capsule_rx_slots 不在这里释放——slot 地址是已取出未处理
+	 * 的 CR 的 user_ctx，旧连接的遗留 CR 排干前必须保持可解引用；
+	 * 交给 delete_io_qpair 在 qpair 销毁时释放。 */
+}
+
+static int
+nvme_urma_send_cmd_capsule(struct nvme_urma_qpair *uqpair,
+			   struct spdk_urma_capsule_cmd_frame *frame)
+{
+	urma_sge_t sge = {
+		.addr = (uint64_t)frame,
+		.len = sizeof(*frame),
+	};
+	urma_jfs_wr_t wr = {}, *bad_wr = NULL;
+	urma_status_t status;
+	uint32_t jetty_index = nvme_urma_next_jetty(uqpair);
+
+	wr.opcode = URMA_OPC_SEND;
+	wr.flag.bs.complete_enable = 1;
+	wr.flag.bs.inline_flag = 1;
+	wr.tjetty = uqpair->target_jettys[jetty_index];
+	wr.user_ctx = (uint64_t)&uqpair->capsule_tx_cqe;
+	wr.send.src.sge = &sge;
+	wr.send.src.num_sge = 1;
+	status = urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr, &bad_wr);
+	if (status != URMA_SUCCESS) {
+		SPDK_ERRLOG("capsule SEND post failed: status=%d qid=%u cid=%u jetty=%u "
+			    "send_jfc=%u queue_depth=%u/%u bad_wr=%p\n",
+			    status, uqpair->qpair.id, frame->capsule.cmd.cid, jetty_index,
+			    uqpair->send_jfc_index, uqpair->qpair.queue_depth,
+			    uqpair->num_entries, bad_wr);
+		return -EIO;
+	}
+	return 0;
+}
+
+static enum spdk_nvme_urma_memory_type
+nvme_urma_req_memory_type(const struct nvme_request *req)
+{
+	const char *id;
+
+	if (req->payload.opts == NULL || req->payload.opts->memory_domain == NULL ||
+	    req->payload.opts->memory_domain == spdk_memory_domain_get_system_domain()) {
+		return SPDK_NVME_URMA_MEM_HOST;
+	}
+	id = spdk_memory_domain_get_dma_device_id(req->payload.opts->memory_domain);
+	if (id != NULL && strcasestr(id, "cuda") != NULL) {
+		return SPDK_NVME_URMA_MEM_CUDA;
+	}
+	if (id != NULL && strcasestr(id, "rocm") != NULL) {
+		return SPDK_NVME_URMA_MEM_ROCM;
+	}
+	if (id != NULL && (strcasestr(id, "npu") != NULL || strcasestr(id, "ascend") != NULL)) {
+		return SPDK_NVME_URMA_MEM_NPU;
+	}
+	return SPDK_NVME_URMA_MEM_XDS;
+}
+
+static int
+nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
+{
+	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
+	struct nvme_urma_req *ureq;
+	struct spdk_urma_msg_hdr hdr = {};
+	struct spdk_urma_capsule_cmd capsule = {};
+	void *addr = NULL;
+	int rc;
+
+	if (qpair->queue_depth >= uqpair->num_entries) {
+		return -EAGAIN;
+	}
+	if (req->payload.size != 0 && nvme_req_payload_type(req) != NVME_PAYLOAD_TYPE_CONTIG) {
+		return -ENOTSUP;
+	}
+	ureq = calloc(1, sizeof(*ureq));
+	if (ureq == NULL) {
+		return -ENOMEM;
+	}
+	ureq->req = req;
+	ureq->submit_tick = spdk_get_ticks();  /* total round-trip start */
+	/* Modified by Yin: submit 前分配唯一 cid，防 completion 匹配到错误 request。
+	 * Modified By Yida (v3): 改用位图分配器保证 outstanding 的 cid 唯一。 */
+	req->cmd.cid = nvme_urma_cid_alloc(uqpair);
+	if ((uint32_t)req->cmd.cid >= uqpair->num_entries) {
+		free(ureq);
+		return -EAGAIN;
+	}
+	capsule.cmd = req->cmd;
+	if (req->payload.size != 0) {
+		capsule.cmd.dptr.sgl1.address = 0;
+		capsule.cmd.dptr.sgl1.unkeyed.length = req->payload.size;
+		capsule.cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK;
+		capsule.cmd.dptr.sgl1.unkeyed.subtype = SPDK_NVME_SGL_SUBTYPE_TRANSPORT;
+		addr = (void *)((uintptr_t)req->payload.contig_or_cb_arg + req->payload.offset);
+		/* Modified By Yida(v7): 整池注册采纳——应用预注册的连续大区（urma_perf
+		 * 每 worker 一块 allocation）直接作为本 I/O 的 region：跳过 per-I/O
+		 * register（W/reg 阶段），capsule.data.seg 携带全区描述，target 可整池
+		 * import 一次。注册表按共享 urma_context 键控，同一 NIC 的 qpair 可复用；
+		 * 采纳语义与 per-I/O 注册一致；region 生命周期由应用管理。 */
+		ureq->region_external = false;
+		ureq->cache_entry = NULL;
+		ureq->region = spdk_nvme_urma_region_registry_find(uqpair->device->context,
+				(uint64_t)addr, req->payload.size);
+		if (ureq->region != NULL) {
+			ureq->region_external = true;
+			__atomic_add_fetch(&g_timing.cache_hit_count, 1, __ATOMIC_RELAXED);
+		} else {
+			/* Modified By Yida: check registration cache before doing a full register */
+			uint64_t t_reg0 = spdk_get_ticks();
+			struct nvme_urma_reg_entry *entry = nvme_urma_reg_cache_lookup(uqpair, addr,
+					req->payload.size);
+			if (entry != NULL) {
+				ureq->region = entry->region;
+				ureq->cache_entry = entry;
+				entry->refcount++;
+				__atomic_add_fetch(&g_timing.cache_hit_count, 1, __ATOMIC_RELAXED);
+			} else {
+				rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr,
+						req->payload.size, nvme_urma_req_memory_type(req), &ureq->region);
+				if (rc != 0) {
+					nvme_urma_cid_free(uqpair, req->cmd.cid);
+					free(ureq);
+					return rc;
+				}
+				ureq->cache_entry = nvme_urma_reg_cache_insert(uqpair, addr,
+						req->payload.size, ureq->region);
+				/* If cache_entry is NULL (cache full), region stays uncached and
+				 * will be unregistered on completion (old behavior). */
+				uint64_t t_reg1 = spdk_get_ticks();
+				__atomic_add_fetch(&g_timing.reg_ticks, t_reg1 - t_reg0, __ATOMIC_RELAXED);
+				__atomic_add_fetch(&g_timing.reg_count, 1, __ATOMIC_RELAXED);
+			}
+		}
+		capsule.data.seg = spdk_urma_memory_region_get_tseg(ureq->region)->seg;
+		capsule.data.address = (uint64_t)addr;
+		capsule.data.length = req->payload.size;
+		capsule.data.chip_id = uqpair->device->opts.numa_affinity ?
+					spdk_urma_memory_chip_id(addr) : SPDK_URMA_INVALID_CHIP_ID;
+	}
+	hdr.magic = SPDK_URMA_WIRE_MAGIC;
+	hdr.version = SPDK_URMA_WIRE_VERSION;
+	hdr.type = SPDK_URMA_MSG_CAPSULE_CMD;
+	hdr.length = sizeof(capsule);
+	hdr.qid = qpair->id;
+	/* Keep the wire frame contiguous. TCP emits it with one write; SEND/RECV
+	 * copies the same bytes inline into the WQE, so the stack frame may be
+	 * released as soon as urma_post_jetty_send_wr() returns. */
+	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
+		struct spdk_urma_capsule_cmd_frame frame = {
+			.hdr = hdr,
+			.capsule = capsule,
+		};
+
+		ureq->send_start = spdk_get_ticks();
+		rc = nvme_urma_send_cmd_capsule(uqpair, &frame);
+	} else {
+		uint8_t msg[sizeof(hdr) + sizeof(capsule)];
+
+		memcpy(msg, &hdr, sizeof(hdr));
+		memcpy(msg + sizeof(hdr), &capsule, sizeof(capsule));
+		ureq->send_start = spdk_get_ticks();  /* send-phase start */
+		rc = nvme_urma_write_full(uqpair->fd, msg, sizeof(msg));
+	}
+	{
+		uint64_t t_send1 = spdk_get_ticks();
+		__atomic_add_fetch(&g_timing.send_ticks, t_send1 - ureq->send_start, __ATOMIC_RELAXED);
+		__atomic_add_fetch(&g_timing.send_count, 1, __ATOMIC_RELAXED);
+		/* Modified By Yida(v4): per-I/O send trace record
+		 * Modified By Yida(v6): SPDK_URMA_TRACE=1 才采集，默认关闭 */
+		if (nvme_urma_trace_enabled()) {
+			uint64_t idx = __atomic_fetch_add(&g_tx_trace_idx, 1, __ATOMIC_RELAXED) %
+				       NVME_URMA_TX_TRACE_SIZE;
+			struct nvme_urma_tx_trace *rec = &g_tx_trace[idx];
+
+			rec->submit_tick = ureq->submit_tick;
+			rec->send_end_tick = t_send1;
+			rec->length = req->payload.size;
+			rec->qid = qpair->id;
+			rec->cid = req->cmd.cid;
+			rec->opcode = req->cmd.opc;
+			rec->xfer = (uint8_t)spdk_nvme_opc_get_data_transfer(req->cmd.opc);
+		}
+	}
+	if (rc != 0) {
+		/* Modified By Yida: on send failure, release cache refcount if cached.
+		 * Modified By Yida(v7): 整池采纳的 region_external 不 unregister。 */
+		if (ureq->cache_entry != NULL) {
+			nvme_urma_reg_cache_release(ureq->cache_entry);
+		} else if (!ureq->region_external) {
+			spdk_nvme_urma_unregister_memory(ureq->region);
+		}
+		/* Modified By Yida (v3): 归还 cid 位 */
+		nvme_urma_cid_free(uqpair, req->cmd.cid);
+		free(ureq);
+		return rc;
+	}
+	TAILQ_INSERT_TAIL(&uqpair->outstanding, ureq, link);
+	qpair->queue_depth++;
+	return 0;
+}
+
+static int
+nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
+			    const struct spdk_urma_capsule_rsp *rsp)
+{
+	struct spdk_nvme_qpair *qpair = &uqpair->qpair;
+	struct nvme_urma_req *ureq;
+	uint64_t t_rel0, t_rel1, t_total1;
+
+	TAILQ_FOREACH(ureq, &uqpair->outstanding, link) {
+		if (ureq->req->cmd.cid == rsp->cpl.cid) {
+			break;
+		}
+	}
+	if (ureq == NULL) {
+		SPDK_ERRLOG("process_completions: no matching ureq for cid=%u\n",
+			    rsp->cpl.cid);
+		return -EPROTO;
+	}
+	TAILQ_REMOVE(&uqpair->outstanding, ureq, link);
+	qpair->queue_depth--;
+	nvme_urma_cid_free(uqpair, ureq->req->cmd.cid);
+	t_rel0 = spdk_get_ticks();
+	if (ureq->cache_entry != NULL) {
+		nvme_urma_reg_cache_release(ureq->cache_entry);
+	} else if (!ureq->region_external) {
+		spdk_nvme_urma_unregister_memory(ureq->region);
+	}
+	t_rel1 = spdk_get_ticks();
+	__atomic_add_fetch(&g_timing.release_ticks, t_rel1 - t_rel0, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&g_timing.release_count, 1, __ATOMIC_RELAXED);
+	t_total1 = spdk_get_ticks();
+	__atomic_add_fetch(&g_timing.total_ticks, t_total1 - ureq->submit_tick, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&g_timing.total_count, 1, __ATOMIC_RELAXED);
+	nvme_complete_request(ureq->req->cb_fn, ureq->req->cb_arg, qpair, ureq->req, &rsp->cpl);
+	free(ureq);
+	return 1;
+}
+
+static int
+nvme_urma_queue_response(struct nvme_urma_qpair *uqpair,
+			 const struct spdk_urma_capsule_rsp *rsp)
+{
+	int rc = 0;
+
+	pthread_mutex_lock(&uqpair->pending_rsp_lock);
+	if (uqpair->pending_rsp_count == uqpair->capsule_rx_count) {
+		SPDK_ERRLOG("pending response queue full: qid=%u cid=%u count=%u\n",
+			    uqpair->qpair.id, rsp->cpl.cid, uqpair->pending_rsp_count);
+		rc = -ENOSPC;
+	} else {
+		uqpair->pending_rsps[uqpair->pending_rsp_tail] = *rsp;
+		uqpair->pending_rsp_tail = (uqpair->pending_rsp_tail + 1) % uqpair->capsule_rx_count;
+		uqpair->pending_rsp_count++;
+	}
+	pthread_mutex_unlock(&uqpair->pending_rsp_lock);
+	return rc;
+}
+
+static int
+nvme_urma_drain_queued_responses(struct nvme_urma_qpair *uqpair,
+				 uint32_t max_completions)
+{
+	uint32_t completed = 0;
+
+	while (completed < max_completions) {
+		struct spdk_urma_capsule_rsp rsp;
+		bool found = false;
+		int rc;
+
+		pthread_mutex_lock(&uqpair->pending_rsp_lock);
+		if (uqpair->pending_rsp_count != 0) {
+			rsp = uqpair->pending_rsps[uqpair->pending_rsp_head];
+			uqpair->pending_rsp_head = (uqpair->pending_rsp_head + 1) %
+						  uqpair->capsule_rx_count;
+			uqpair->pending_rsp_count--;
+			found = true;
+		}
+		pthread_mutex_unlock(&uqpair->pending_rsp_lock);
+		if (!found) {
+			break;
+		}
+		rc = nvme_urma_complete_response(uqpair, &rsp);
+		if (rc < 0) {
+			return rc;
+		}
+		completed += rc;
+	}
+	return completed;
+}
+
+static struct nvme_urma_qpair *
+nvme_urma_cr_owner_qpair(const struct nvme_urma_cqe_ctx *ctx)
+{
+	if (ctx->type == NVME_URMA_CQE_CAPSULE_TX) {
+		return ctx->owner;
+	}
+	if (ctx->type == NVME_URMA_CQE_CAPSULE_RX) {
+		return ((struct nvme_urma_rsp_rx_slot *)ctx->owner)->qpair;
+	}
+	return NULL;
+}
+
+static void
+nvme_urma_qpair_defer_error(struct nvme_urma_qpair *uqpair, int err)
+{
+	if (err == 0) {
+		return;
+	}
+	SPDK_ERRLOG("capsule completion error routed to qpair qid=%u: err=%d\n",
+		    uqpair->qpair.id, err);
+	__atomic_store_n(&uqpair->deferred_error, err, __ATOMIC_RELEASE);
+}
+
+static int32_t
+nvme_urma_process_capsule_cr(struct nvme_urma_qpair *poller, const urma_cr_t *cr,
+			     uint32_t *completed)
+{
+	struct nvme_urma_cqe_ctx *ctx;
+	struct nvme_urma_qpair *owner;
+	uint64_t t_compl0 = spdk_get_ticks();
+
+	if (spdk_urma_cr_is_fake(cr)) {
+		return 0;
+	}
+	ctx = (void *)cr->user_ctx;
+	if (ctx == NULL) {
+		/* SE_Review #5: 无法归属的 CR 只能放弃整个 poller。 */
+		SPDK_ERRLOG("capsule completion failed: status=%d user_ctx=NULL\n", cr->status);
+		return -EIO;
+	}
+	owner = nvme_urma_cr_owner_qpair(ctx);
+	if (owner == NULL) {
+		SPDK_ERRLOG("capsule completion with unknown ctx type=%d\n", ctx->type);
+		return -EPROTO;
+	}
+	if (owner->epoch != ctx->epoch) {
+		/* SE_Review #4: 上一轮连接的遗留 CR——旧 jetty/RX slot 已随断连
+		 * 销毁，其响应与新连接无关，直接丢弃。 */
+		return 0;
+	}
+	if (cr->status != URMA_CR_SUCCESS) {
+		/* SE_Review #5: 错误 CR 归属 owner，而不是恰好轮到它的 poller。 */
+		nvme_urma_qpair_defer_error(owner, -EIO);
+		return 0;
+	}
+	if (ctx->type == NVME_URMA_CQE_CAPSULE_TX) {
+		if (cr->flag.bs.s_r != 0) {
+			/* s_r 表示对端已关连接：故障属于 owner 这条连接。 */
+			nvme_urma_qpair_defer_error(owner, -ECONNRESET);
+		}
+		return 0;
+	}
+	if (ctx->type == NVME_URMA_CQE_CAPSULE_RX) {
+		struct nvme_urma_rsp_rx_slot *slot = ctx->owner;
+		struct spdk_urma_capsule_rsp_frame frame = slot->frame;
+		int rc;
+
+		if (cr->flag.bs.s_r == 0 || cr->opcode != URMA_CR_OPC_SEND ||
+		    cr->completion_len != (uint32_t)sizeof(frame)) {
+			nvme_urma_qpair_defer_error(owner, -EPROTO);
+			return 0;
+		}
+		rc = nvme_urma_post_rsp_receive(slot);
+		if (rc != 0) {
+			nvme_urma_qpair_defer_error(owner, rc);
+			return 0;
+		}
+		if (frame.hdr.magic != SPDK_URMA_WIRE_MAGIC ||
+		    frame.hdr.version != SPDK_URMA_WIRE_VERSION ||
+		    frame.hdr.type != SPDK_URMA_MSG_CAPSULE_RSP ||
+		    frame.hdr.length != sizeof(frame.capsule) ||
+		    frame.hdr.qid != owner->qpair.id) {
+			nvme_urma_qpair_defer_error(owner, -EPROTO);
+			return 0;
+		}
+		__atomic_add_fetch(&g_timing.compl_ticks, spdk_get_ticks() - t_compl0,
+				   __ATOMIC_RELAXED);
+		__atomic_add_fetch(&g_timing.compl_count, 1, __ATOMIC_RELAXED);
+		if (owner != poller) {
+			rc = nvme_urma_queue_response(owner, &frame.capsule);
+			if (rc < 0) {
+				/* owner 的 pending 队列满是 owner 的故障，不是 poller 的。 */
+				nvme_urma_qpair_defer_error(owner, rc);
+				return 0;
+			}
+			return rc;
+		}
+		rc = nvme_urma_complete_response(owner, &frame.capsule);
+		if (rc < 0) {
+			return rc;
+		}
+		*completed += rc;
+		return 0;
+	}
+	return -EPROTO;
+}
+
+static int32_t
+nvme_urma_process_capsule_completions(struct nvme_urma_qpair *uqpair,
+				       uint32_t max_completions)
+{
+	uint32_t completed = 0;
+	urma_cr_t cr[64];
+	uint64_t requested_budget = (uint64_t)max_completions * 2 + 8;
+	uint32_t budget = requested_budget > SPDK_COUNTOF(cr) ? SPDK_COUNTOF(cr) :
+			  (uint32_t)requested_budget;
+	int hard_err = 0;
+
+	int pending = nvme_urma_drain_queued_responses(uqpair, max_completions);
+
+	if (pending < 0) {
+		return pending;
+	}
+	completed = pending;
+	for (uint32_t j = 0; j < uqpair->device->send_jfc_count && completed < max_completions &&
+	     hard_err == 0; j++) {
+		int count = spdk_urma_device_poll_send_jfc(uqpair->device, j, budget, cr);
+		if (count < 0) {
+			hard_err = -EIO;
+			break;
+		}
+		for (int i = 0; i < count; i++) {
+			int rc = nvme_urma_process_capsule_cr(uqpair, &cr[i], &completed);
+			if (rc != 0 && hard_err == 0) {
+				/* SE_Review #5: 记下错误但继续处理本批剩余 CR，
+				 * 避免连带丢弃其他 qpair 的成功完成。 */
+				hard_err = rc;
+			}
+		}
+	}
+	for (uint32_t j = 0; j < uqpair->device->recv_jfc_count && completed < max_completions &&
+	     hard_err == 0; j++) {
+		uint32_t remaining = max_completions - completed;
+		uint32_t recv_budget = spdk_min(budget, remaining);
+		int count = spdk_urma_device_poll_recv_jfc(uqpair->device, j, recv_budget, cr);
+		if (count < 0) {
+			hard_err = -EIO;
+			break;
+		}
+		for (int i = 0; i < count; i++) {
+			int rc = nvme_urma_process_capsule_cr(uqpair, &cr[i], &completed);
+			if (rc != 0 && hard_err == 0) {
+				hard_err = rc;
+			}
+		}
+	}
+	if (hard_err == 0) {
+		int deferred = 0;
+
+		/* 本轮路由给自己的错误在同一笔 poll 里就上报。 */
+		deferred = __atomic_exchange_n(&uqpair->deferred_error, 0, __ATOMIC_ACQ_REL);
+		if (deferred != 0) {
+			hard_err = deferred;
+		}
+	}
+	return hard_err != 0 ? hard_err : (int32_t)completed;
+}
+
+/* SE_Review #6: 与 target 的 nvmf_urma_check_lifetime_socket() 对称。URMA
+ * capsule 模式下 SEND 成功后不保证再有 JFC 通知退出，target 若在发响应前
+ * 消失，只能靠 bootstrap socket 的 EOF 发现。仅在零完成的空闲 poll 上调用，
+ * 热路径不加 syscall。 */
+static int
+nvme_urma_check_lifetime_socket(struct nvme_urma_qpair *uqpair)
+{
+	uint8_t byte;
+	ssize_t rc;
+
+	rc = recv(uqpair->fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+	if (rc > 0) {
+		/* SEND/RECV 模式下 bootstrap socket 不应携带任何数据。 */
+		return -EPROTO;
+	}
+	if (rc == 0) {
+		return -ECONNRESET;
+	}
+	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+		return 0;
+	}
+	return -errno;
+}
+
+static int32_t
+nvme_urma_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_completions)
+{
+	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
+	uint32_t completed = 0;
+	int rc;
+
+	if (max_completions == 0) {
+		max_completions = UINT32_MAX;
+	}
+	{
+		/* SE_Review #5: 消费别的 poller 线程路由过来的连接故障。 */
+		int deferred = __atomic_exchange_n(&uqpair->deferred_error, 0, __ATOMIC_ACQ_REL);
+
+		if (deferred != 0) {
+			return deferred;
+		}
+	}
+	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
+		rc = nvme_urma_process_capsule_completions(uqpair, max_completions);
+		if (rc < 0) {
+			return rc;
+		}
+		completed = rc;
+		if (completed == 0) {
+			/* SE_Review #6: 无完成可取时检查 bootstrap socket 的 EOF/错误。 */
+			rc = nvme_urma_check_lifetime_socket(uqpair);
+			if (rc < 0) {
+				return rc;
+			}
+		}
+	} else {
+		while (completed < max_completions) {
+			struct spdk_urma_msg_hdr hdr;
+			struct spdk_urma_capsule_rsp rsp;
+			uint64_t t_compl0 = spdk_get_ticks();  /* completion-wait start */
+			ssize_t recv_rc = recv(uqpair->fd, &hdr, sizeof(hdr), MSG_PEEK | MSG_DONTWAIT);
+
+			if (recv_rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+				break;
+			}
+			if (recv_rc == 0) {
+				return -ECONNRESET;
+			}
+			if (recv_rc < 0) {
+				return -errno;
+			}
+			if ((size_t)recv_rc < sizeof(hdr)) {
+				break;
+			}
+			{
+				int available = 0;
+
+				if (ioctl(uqpair->fd, FIONREAD, &available) != 0) {
+					return -errno;
+				}
+				if ((size_t)available < sizeof(hdr) + hdr.length) {
+					break;
+				}
+			}
+			if (nvme_urma_read_full(uqpair->fd, &hdr, sizeof(hdr)) != 0 ||
+			    hdr.magic != SPDK_URMA_WIRE_MAGIC || hdr.version != SPDK_URMA_WIRE_VERSION ||
+			    hdr.type != SPDK_URMA_MSG_CAPSULE_RSP || hdr.qid != qpair->id ||
+			    hdr.length != sizeof(rsp) ||
+			    nvme_urma_read_full(uqpair->fd, &rsp, sizeof(rsp)) != 0) {
+				return -EPROTO;
+			}
+			__atomic_add_fetch(&g_timing.compl_ticks, spdk_get_ticks() - t_compl0,
+					   __ATOMIC_RELAXED);
+			__atomic_add_fetch(&g_timing.compl_count, 1, __ATOMIC_RELAXED);
+			rc = nvme_urma_complete_response(uqpair, &rsp);
+			if (rc < 0) {
+				return rc;
+			}
+			completed += rc;
+		}
+	}
+	if (nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING) {
+		/* Modified by Yin: 加 in_connect_poll 守卫，切断 connect_poll 互递归 */
+		if (qpair->in_connect_poll) {
+			return completed;
+		}
+		qpair->in_connect_poll = true;
+		rc = nvme_fabric_qpair_connect_poll(qpair);
+		qpair->in_connect_poll = false;
+		if (rc == 0) {
+			nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
+		} else if (rc != -EAGAIN) {
+			return rc;
+		}
+	}
+	return completed;
+}
+
+static void
+nvme_urma_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
+{
+	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
+	struct nvme_urma_req *ureq, *tmp;
+	struct spdk_nvme_cpl cpl = {};
+
+	cpl.sqid = qpair->id;
+	cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+	cpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
+	cpl.status.dnr = dnr;
+	TAILQ_FOREACH_SAFE(ureq, &uqpair->outstanding, link, tmp) {
+		TAILQ_REMOVE(&uqpair->outstanding, ureq, link);
+		/* Modified By Yida (v3): 归还 cid 位 */
+		nvme_urma_cid_free(uqpair, ureq->req->cmd.cid);
+		/* Modified By Yida: release cache refcount, unregister only uncached.
+		 * Modified By Yida(v7): 整池采纳的 region_external 不 unregister。 */
+		if (ureq->cache_entry != NULL) {
+			nvme_urma_reg_cache_release(ureq->cache_entry);
+		} else if (!ureq->region_external) {
+			spdk_nvme_urma_unregister_memory(ureq->region);
+		}
+		nvme_complete_request(ureq->req->cb_fn, ureq->req->cb_arg, qpair, ureq->req, &cpl);
+		free(ureq);
+	}
+	qpair->queue_depth = 0;
+}
+
+static struct spdk_nvme_qpair *
+nvme_urma_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid, uint32_t qsize,
+			     enum spdk_nvme_qprio qprio, uint32_t requests, bool async)
+{
+	struct nvme_urma_qpair *uqpair = calloc(1, sizeof(*uqpair));
+
+	if (uqpair == NULL) {
+		return NULL;
+	}
+	uqpair->fd = -1;
+	uqpair->num_entries = qsize - 1;
+	uqpair->capsule_tx_cqe.type = NVME_URMA_CQE_CAPSULE_TX;
+	uqpair->capsule_tx_cqe.owner = uqpair;
+	/* Modified By Yida (v3): CID 位图按创建时 num_entries 分配；connect 阶段
+	 * 只会向下收窄 num_entries，位图始终覆盖所有可能的 cid。 */
+	if (uqpair->num_entries > 0) {
+		uqpair->cid_bitmap = calloc((uqpair->num_entries + 7) / 8, 1);
+		if (uqpair->cid_bitmap == NULL) {
+			free(uqpair);
+			return NULL;
+		}
+	}
+	TAILQ_INIT(&uqpair->outstanding);
+	if (nvme_qpair_init(&uqpair->qpair, qid, ctrlr, qprio, requests, async) != 0) {
+		free(uqpair->cid_bitmap);
+		free(uqpair);
+		return NULL;
+	}
+	return &uqpair->qpair;
+}
+
+static struct spdk_nvme_qpair *
+nvme_urma_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
+				const struct spdk_nvme_io_qpair_opts *opts)
+{
+	return nvme_urma_ctrlr_create_qpair(ctrlr, qid, opts->io_queue_size, opts->qprio,
+					   opts->io_queue_requests, opts->async_mode);
+}
+
+static void
+nvme_urma_qpair_release_transport(struct nvme_urma_qpair *uqpair)
+{
+	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
+		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
+			if (uqpair->device != NULL && uqpair->device->opts.transport_mode == URMA_TM_RC) {
+				urma_unbind_jetty(uqpair->jettys[i]);
+			}
+			urma_unimport_jetty(uqpair->target_jettys[i]);
+		}
+		if (uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
+			urma_delete_jetty(uqpair->jettys[i]);
+		}
+		if (uqpair->jfrs != NULL && uqpair->jfrs[i] != NULL) {
+			urma_delete_jfr(uqpair->jfrs[i]);
+		}
+	}
+	free(uqpair->target_jettys);
+	free(uqpair->jettys);
+	free(uqpair->jfrs);
+	uqpair->target_jettys = NULL;
+	uqpair->jettys = NULL;
+	uqpair->jfrs = NULL;
+	uqpair->jetty_count = 0;
+	nvme_urma_capsule_resources_fini(uqpair);
+	if (uqpair->fd >= 0) {
+		close(uqpair->fd);
+	}
+	uqpair->fd = -1;
+	/* Modified By Yida: unregister all cached memory regions before closing the device */
+	for (int i = 0; i < NVME_URMA_REG_CACHE_SIZE; i++) {
+		struct nvme_urma_reg_entry *e = &uqpair->reg_cache[i];
+
+		if (e->used) {
+			spdk_nvme_urma_unregister_memory(e->region);
+			e->used = false;
+			e->refcount = 0;
+			e->region = NULL;
+		}
+	}
+	/* SE_Review #4: cid_bitmap 是 qpair 级资源（create_qpair 分配一次），
+	 * 不能在断连时释放，否则下一轮 connect 的 CID 分配拿到 NULL；
+	 * 交给 delete_io_qpair 释放。 */
+	if (uqpair->device != NULL) {
+		spdk_urma_device_close(uqpair->device);
+		uqpair->device = NULL;
+	}
+}
+
+static int
+nvme_urma_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
+{
+	struct nvme_urma_ctrlr *uctrlr = SPDK_CONTAINEROF(ctrlr, struct nvme_urma_ctrlr, ctrlr);
+	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
+	int rc;
+
+	/* SE_Review #4: 新一轮连接从干净的错误状态开始。 */
+	__atomic_store_n(&uqpair->deferred_error, 0, __ATOMIC_RELAXED);
+	uqpair->max_io_size = uctrlr->opts.max_io_size;
+	rc = spdk_urma_device_open(&uctrlr->opts, &uqpair->device);
+	if (rc != 0) {
+		return rc;
+	}
+	uqpair->capsule_transport = uqpair->device->opts.capsule_transport;
+	rc = nvme_urma_create_jetty(uqpair);
+	if (rc != 0) {
+		goto fail;
+	}
+	uqpair->fd = nvme_urma_connect_socket(&ctrlr->trid);
+	if (uqpair->fd < 0) {
+		rc = uqpair->fd;
+		goto fail;
+	}
+	{
+		/* SE_Review #3（对偶）: hello 交换是阻塞收发，target 异常时由
+		 * 超时兜底，最坏阻塞 5s 而不是无限期卡住 initiator 线程。 */
+		struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+
+		setsockopt(uqpair->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		setsockopt(uqpair->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	}
+	rc = nvme_urma_exchange_hello(uqpair);
+	if (rc != 0) {
+		goto fail;
+	}
+	rc = nvme_urma_capsule_resources_init(uqpair);
+	if (rc != 0) {
+		goto fail;
+	}
+	uctrlr->opts.max_io_size = spdk_min(uctrlr->opts.max_io_size, uqpair->max_io_size);
+	rc = nvme_fabric_qpair_connect_async(qpair, uqpair->num_entries + 1);
+	if (rc < 0) {
+		goto fail;
+	}
+	return 0;
+
+fail:
+	nvme_urma_qpair_release_transport(uqpair);
+	return rc;
+}
+
+static void
+nvme_urma_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
+{
+	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
+
+	nvme_urma_qpair_abort_reqs(qpair, qpair->abort_dnr);
+	/* SE_Review #4: 先换代再拆资源——其他 poller 线程共享 JFC 可能正取到
+	 * 本 qpair 的 CR，代数失配让它们直接丢弃，不再触碰即将释放的资源。
+	 * （已进入 queue_response 等持锁路径的极小 TOCTOU 窗口保留，
+	 * 多线程 initiator 才可能出现，量级远小于修复前的泄漏。） */
+	uqpair->epoch++;
+	/* SE_Review #4: 断连必须回收连接级 transport 资源（device 引用、jetty、
+	 * JFR、capsule RX、region 缓存），否则下一轮 connect 会直接覆盖旧指针，
+	 * 反复断连/重连会泄漏 context 引用并重复 init mutex。cid 位图与 RX
+	 * slot 数组是 qpair 级资源，保留给重连复用。 */
+	nvme_urma_qpair_release_transport(uqpair);
+	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
+	nvme_transport_ctrlr_disconnect_qpair_done(qpair);
+}
+
+static int
+nvme_urma_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
+{
+	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
+
+	nvme_urma_qpair_abort_reqs(qpair, qpair->abort_dnr);
+	nvme_urma_qpair_release_transport(uqpair);
+	free(uqpair->cid_bitmap);
+	uqpair->cid_bitmap = NULL;
+	free(uqpair->capsule_rx_slots);
+	uqpair->capsule_rx_slots = NULL;
+	nvme_qpair_deinit(qpair);
+	free(uqpair);
+	return 0;
+}
+
+static struct spdk_nvme_ctrlr *
+nvme_urma_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
+			  const struct spdk_nvme_ctrlr_opts *opts, void *devhandle)
+{
+	struct nvme_urma_ctrlr *uctrlr = calloc(1, sizeof(*uctrlr));
+
+	if (uctrlr == NULL) {
+		return NULL;
+	}
+	uctrlr->ctrlr.opts = *opts;
+	uctrlr->ctrlr.trid = *trid;
+	spdk_urma_opts_init(&uctrlr->opts);
+	if (nvme_ctrlr_construct(&uctrlr->ctrlr) != 0) {
+		free(uctrlr);
+		return NULL;
+	}
+	uctrlr->ctrlr.adminq = nvme_urma_ctrlr_create_qpair(&uctrlr->ctrlr, 0,
+				       opts->admin_queue_size, 0, opts->admin_queue_size, true);
+	if (uctrlr->ctrlr.adminq == NULL) {
+		nvme_ctrlr_destruct_finish(&uctrlr->ctrlr);
+		free(uctrlr);
+		return NULL;
+	}
+	if (nvme_ctrlr_add_process(&uctrlr->ctrlr, 0) != 0) {
+		nvme_urma_ctrlr_delete_io_qpair(&uctrlr->ctrlr, uctrlr->ctrlr.adminq);
+		uctrlr->ctrlr.adminq = NULL;
+		nvme_ctrlr_destruct_finish(&uctrlr->ctrlr);
+		free(uctrlr);
+		return NULL;
+	}
+	return &uctrlr->ctrlr;
+}
+
+static int
+nvme_urma_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
+{
+	struct nvme_urma_ctrlr *uctrlr = SPDK_CONTAINEROF(ctrlr, struct nvme_urma_ctrlr, ctrlr);
+
+	if (ctrlr->adminq != NULL) {
+		nvme_urma_ctrlr_delete_io_qpair(ctrlr, ctrlr->adminq);
+	}
+	nvme_ctrlr_destruct_finish(ctrlr);
+	free(uctrlr);
+	return 0;
+}
+
+static int nvme_urma_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr) { return 0; }
+static int nvme_urma_qpair_reset(struct spdk_nvme_qpair *qpair) { return 0; }
+static uint32_t nvme_urma_ctrlr_get_max_xfer_size(struct spdk_nvme_ctrlr *ctrlr)
+{
+	return SPDK_CONTAINEROF(ctrlr, struct nvme_urma_ctrlr, ctrlr)->opts.max_io_size;
+}
+static uint16_t nvme_urma_ctrlr_get_max_sges(struct spdk_nvme_ctrlr *ctrlr) { return 1; }
+
+static int
+nvme_urma_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
+				 int (*iter_fn)(struct nvme_request *, void *), void *arg)
+{
+	struct nvme_urma_req *ureq;
+	TAILQ_FOREACH(ureq, &nvme_urma_qpair(qpair)->outstanding, link) {
+		int rc = iter_fn(ureq->req, arg);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+	return 0;
+}
+
+static int nvme_urma_qpair_authenticate(struct spdk_nvme_qpair *qpair) { return -ENOTSUP; }
+static void nvme_urma_admin_qpair_abort_aers(struct spdk_nvme_qpair *qpair)
+{
+	nvme_urma_qpair_abort_reqs(qpair, 0);
+}
+
+static struct spdk_nvme_transport_poll_group *
+nvme_urma_poll_group_create(void)
+{
+	return calloc(1, sizeof(struct nvme_urma_poll_group));
+}
+
+static int64_t
+nvme_urma_poll_group_process_completions(struct spdk_nvme_transport_poll_group *tgroup,
+		uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
+{
+	struct spdk_nvme_qpair *qpair;
+	int64_t total = 0;
+	STAILQ_FOREACH(qpair, &tgroup->connected_qpairs, poll_group_stailq) {
+		int rc = nvme_urma_qpair_process_completions(qpair, completions_per_qpair);
+		if (rc < 0) {
+			return rc;
+		}
+		total += rc;
+	}
+	return total;
+}
+
+static void
+nvme_urma_poll_group_check_disconnected_qpairs(struct spdk_nvme_transport_poll_group *tgroup,
+		spdk_nvme_disconnected_qpair_cb cb)
+{
+	struct spdk_nvme_qpair *qpair;
+	STAILQ_FOREACH(qpair, &tgroup->disconnected_qpairs, poll_group_stailq) {
+		cb(qpair, tgroup->group->ctx);
+	}
+}
+
+static int nvme_urma_poll_group_destroy(struct spdk_nvme_transport_poll_group *tgroup)
+{
+	free(tgroup);
+	return 0;
+}
+
+static int
+nvme_urma_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
+				   struct spdk_memory_domain **domains, int array_size)
+{
+	if (domains != NULL && array_size > 0) {
+		const struct nvme_urma_qpair *uqpair = nvme_urma_qpair(ctrlr->adminq);
+		domains[0] = uqpair->device != NULL ? uqpair->device->memory_domain :
+			     spdk_memory_domain_get_system_domain();
+	}
+	return 1;
+}
+
+const struct spdk_nvme_transport_ops urma_ops = {
+	.name = "URMA",
+	.type = SPDK_NVME_TRANSPORT_URMA,
+	.ctrlr_construct = nvme_urma_ctrlr_construct,
+	.ctrlr_scan = nvme_fabric_ctrlr_scan,
+	.ctrlr_destruct = nvme_urma_ctrlr_destruct,
+	.ctrlr_enable = nvme_urma_ctrlr_enable,
+	.ctrlr_set_reg_4 = nvme_fabric_ctrlr_set_reg_4,
+	.ctrlr_set_reg_8 = nvme_fabric_ctrlr_set_reg_8,
+	.ctrlr_get_reg_4 = nvme_fabric_ctrlr_get_reg_4,
+	.ctrlr_get_reg_8 = nvme_fabric_ctrlr_get_reg_8,
+	.ctrlr_set_reg_4_async = nvme_fabric_ctrlr_set_reg_4_async,
+	.ctrlr_set_reg_8_async = nvme_fabric_ctrlr_set_reg_8_async,
+	.ctrlr_get_reg_4_async = nvme_fabric_ctrlr_get_reg_4_async,
+	.ctrlr_get_reg_8_async = nvme_fabric_ctrlr_get_reg_8_async,
+	.ctrlr_get_max_xfer_size = nvme_urma_ctrlr_get_max_xfer_size,
+	.ctrlr_get_max_sges = nvme_urma_ctrlr_get_max_sges,
+	.ctrlr_create_io_qpair = nvme_urma_ctrlr_create_io_qpair,
+	.ctrlr_delete_io_qpair = nvme_urma_ctrlr_delete_io_qpair,
+	.ctrlr_connect_qpair = nvme_urma_ctrlr_connect_qpair,
+	.ctrlr_disconnect_qpair = nvme_urma_ctrlr_disconnect_qpair,
+	.ctrlr_get_memory_domains = nvme_urma_ctrlr_get_memory_domains,
+	.qpair_abort_reqs = nvme_urma_qpair_abort_reqs,
+	.qpair_reset = nvme_urma_qpair_reset,
+	.qpair_submit_request = nvme_urma_qpair_submit_request,
+	.qpair_process_completions = nvme_urma_qpair_process_completions,
+	.qpair_iterate_requests = nvme_urma_qpair_iterate_requests,
+	.qpair_authenticate = nvme_urma_qpair_authenticate,
+	.admin_qpair_abort_aers = nvme_urma_admin_qpair_abort_aers,
+	.poll_group_create = nvme_urma_poll_group_create,
+	.poll_group_process_completions = nvme_urma_poll_group_process_completions,
+	.poll_group_check_disconnected_qpairs = nvme_urma_poll_group_check_disconnected_qpairs,
+	.poll_group_destroy = nvme_urma_poll_group_destroy,
+};
+
+SPDK_NVME_TRANSPORT_REGISTER(urma, &urma_ops);
+SPDK_LOG_REGISTER_COMPONENT(nvme_urma)

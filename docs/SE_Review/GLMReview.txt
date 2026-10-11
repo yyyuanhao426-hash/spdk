@@ -1,0 +1,60 @@
+8 条全部修完，按拆分表落成 7 个提交已 push（dc86d1ba7..fba60e72e）。拆分表的 ②③（JFC 路由 + lifetime socket）因两处 hunk 交织在同一个函数里，合并成了一个提交，其余与表一致：
+
+┌───────────┬─────────────────────────────────────────────────────────────┬───────────┐
+│   提交    │                            内容                             │ SE_Review │
+├───────────┼─────────────────────────────────────────────────────────────┼───────────┤
+│ dc86d1ba7 │ 响应身份收敛到 send_response，CID=0 打 WARN                 │ #2        │
+├───────────┼─────────────────────────────────────────────────────────────┼───────────┤
+│ c9db9c011 │ JFC 错误按 user_ctx 归属 owner + 批量不丢 + lifetime socket │ #5/#6     │
+├───────────┼─────────────────────────────────────────────────────────────┼───────────┤
+│ 0278f32f3 │ iobuf 表容量 + 边界单测                                     │ #7        │
+├───────────┼─────────────────────────────────────────────────────────────┼───────────┤
+│ 2e46861e4 │ registry 改名 spdk_nvme_urma_*（进现有通配）                │ #8        │
+├───────────┼─────────────────────────────────────────────────────────────┼───────────┤
+│ 0fab5b576 │ initiator hello 前 5s socket 超时                           │ #3 对偶   │
+├───────────┼─────────────────────────────────────────────────────────────┼───────────┤
+│ ddf4a888b │ 重连拆连接级 teardown + epoch 丢旧 CR                       │ #4        │
+├───────────┼─────────────────────────────────────────────────────────────┼───────────┤
+│ fba60e72e │ target 握手非阻塞状态机 + qpair_fini 排水状态机             │ #1/#3     │
+└───────────┴─────────────────────────────────────────────────────────────┴───────────┘
+
+---
+
+机器验证方案（151 initiator / 245 target）
+
+前置：两台都 git fetch && git reset --hard origin/urma_enable_v2（照旧不能 pull），正常构建。
+
+验证 #8（target 排水）——最核心
+
+场景 A：高压下 kill initiator（20–50 轮）
+1. target 起后 initiator 跑 urma_perf/fio，多 q 多深度，保证断连瞬间 target 有 PULLING/PUSHING 在途写
+2. initiator 侧 kill -9（不要优雅退出）
+3. target 观察：
+   - 日志不应出现 drain deadline exceeded（出现就说明排空判定有洞，把 pending_wr/pending_msgs 数值发我）
+   - qpair 秒级消失，iobuf 池回到基线（修前是 UAF：往已归还 buffer 写）
+4. 每轮记 target RSS，20+ 轮应平稳
+
+场景 B：ASAN 版 target 跑 3–5 轮场景 A（最有说服力）
+- ./configure --enable-asan 重建 target，重复 kill。修前必报 use-after-free，修后应干净退出
+
+回归：正常压测带宽与修前持平（排水只走断连路径，不碰稳态）。
+
+验证 #4（initiator 重连）
+
+场景 C：循环 kill target（20+ 轮）
+1. initiator 长跑，循环：kill -9 target → 等重连 → 重启 target → I/O 恢复 → 再 kill
+2. 每轮记 initiator VmRSS——修前每轮泄漏 jetty/JFC/context 引用，第二轮 connect 就会撞 cid_bitmap NULL / mutex 重复 init
+3. 高压时 kill（不是空闲时），epoch guard 和排水才真正被压到
+
+场景 D：数据正确性——重连后首轮 I/O 用 fio --verify=md5，确认旧连接 CR 没污染新连接。
+
+顺手 5 分钟验证 #3（nc DoS）
+
+nc <245的IP> <监听端口> 连上不发 HELLO 挂 6 秒：修前 target accept 线程永久卡死（后续连接全无响应）；修后 5 秒关连接，target 继续正常服务。再来个并发 nc 确认。
+
+顺手验证 #7/#8
+
+- 跑 test/unit/lib/thread/iobuf.c/iobuf_ut（含新边界测试）
+- ./configure --enable-shared && make 冒烟——#8 这种静态构建永远测不出来
+
+回报重点：各场景每轮 RSS 数字、日志里 drain deadline / CID=0 WARN / epoch 丢弃是否出现。CI 有 shared 构建的话，2e46861e4 那条过不过也能直接佐证 #8。
