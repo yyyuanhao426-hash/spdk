@@ -244,6 +244,30 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P227（批次 P2-27 回执，用户带回）—— priority 假设证伪；故障收窄到 SPDK transport 集成逻辑
+
+**判定：A ✅ liburma 同版本（版本差异排除）；B ❌ env 矩阵 7/7 全败
+（priority/depth 无影响）；D ✅ 最小 UMDK 探针矩阵——priority 0/2/6/15
+× RM/RC 全部 IMPORT_OK（share_jfr=1），探针甚至在 0000c 设备上
+import 成功 → **故障为 SPDK nvmf-URMA transport 自身集成缺陷**
+（target 侧 jetty/eid/tpid 构建流程），非任何单参数。E ✅ 还原。**
+
+- **A ✅**：urma_perf 与 p219 探针实际加载**同一份**
+  /usr/lib64/liburma.so.0.0.3（系统内另有 0.0.2，软链未指向）。
+- **B ❌**：7 组 env（PRIORITY 2/6/0、DEPTH 256/64、组合）全 rc=-5。
+- **D ✅ 收窄证据链**：
+  1. 唯一失败维度 = share_jfr=0：UMDK 在废弃 jfr_cfg 路径下
+     urma_create_jetty 返回 NULL（能力边界，SPDK 固定 share_jfr=1
+     不适用）；
+  2. **priority 彻底排除**：share_jfr=1 时 prio 0/2/6/15 全 IMPORT_OK；
+  3. 探针在 udmac1d1e5（=0000c）上 import 也成功 → 再证非设备单点；
+  4. dmesg 全程无 ctrl queue/get tp list/create_tpid/import_jetty
+     报错 → 最小 UMDK 路径 TP 建立正常。
+- **结论**：SPDK 路径与探针路径剩余的结构性差异 = SPDK jetty 绑定
+  显式 JFC(4096)+共享 JFR(2048, token 0xACFE)（探针裸 jetty）+
+  import token（探针 0 / SPDK 0xACFE）→ 由外部判别探针 p228 二分
+  （指令 #60）。
+
 ### 回执导入 2026-10-09 #P225（批次 P2-25 回执，用户带回）—— RA jetty 单进程跑通；V2 仍被 133 UB 控制队列故障阻塞
 
 **判定：A/B ✅（代码同步重编 + RA jetty 单进程跑通）；C ⚠️ 无
@@ -1407,6 +1431,62 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #60：批次 P2-28（判别探针 p228——SPDK 创建序列复刻 + 全参数二分）
+
+**背景**：P2-27 已排除 liburma 版本/priority/depth/share_jfr/mode/设备。
+剩余嫌疑收敛到 SPDK 创建序列的结构性差异——探针（成功）与 SPDK
+（失败）的 jetty 有一个本质不同：**SPDK 的 jetty 绑定在显式创建的
+JFC(depth 4096) + 共享 JFR(depth 2048, token 0xACFE) 上，探针是裸
+jetty**。另 import token：探针 0 / SPDK 0xACFE。外部已备好判别探针
+`doc/agents/debug/p228_probe.c`（完整复刻 SPDK 序列 + 全 env 旋钮）。
+
+**A. 编译探针**：
+```bash
+# 同步 doc/agents/debug/p228_probe.c（外部已 push，git pull 或文件同步）
+gcc -O2 -o /tmp/p228_probe p228_probe.c \
+  -I/usr/include/ub/umdk/urma -l:liburma.so -lpthread
+# 头文件路径若不同，照 p227_d_probe 的编译参数
+```
+
+**B. 对照组先跑（应成功）**：
+```bash
+# 终端 1：CREATE_JFC=0 CREATE_JFR=0 /tmp/p228_probe p1   （记下 EID/JETTY）
+# 终端 2：CREATE_JFC=0 CREATE_JFR=0 /tmp/p228_probe p2 <eid> <jetty_id> 0
+# 期望 import OK（=复刻 p227 裸 jetty 成功路径）
+```
+
+**C. SPDK 序列复刻（关键）**：
+```bash
+# 终端 1：/tmp/p228_probe p1（全默认 = JFC4096+JFR2048+token 0xACFE+prio15）
+# 终端 2：/tmp/p228_probe p2 <eid> <jetty_id> 0xACFE
+# 记录 import 结果 + dmesg 新增行
+```
+
+**D. 若 C 复现失败 → 逐旋钮二分（每次只改一个，p1/p2 同 env）**：
+```bash
+IMPORT_TOKEN=0        # import token 与探针对齐
+JFR_TOKEN=0           # JFR token 归零（token 配对语义排查）
+CREATE_JFR=0          # 去掉共享 JFR（share_jfr=1 但不提供）
+CREATE_JFC=0          # 去掉 JFC
+JFC_DEPTH=64
+JFR_DEPTH=256
+JETTY_PRIORITY=2
+MAX_SGE=1
+# 每个组合记录：p1 建资源是否成功 / p2 import 成败 / dmesg
+# 目标：找到把 FAIL 翻成 OK 的最小旋钮集合
+```
+
+**E. 判定与交付**：
+- 找到翻成 OK 的旋钮 → 带回组合，外部改 SPDK 对应参数/代码后出 V2 批
+- 全部旋钮下 SPDK 序列仍失败而裸序列成功 → 带回完整记录
+  （= 失败维度在创建序列的组合语义里，外部读代码再深挖）
+
+**F. 现场还原**（/tmp/p228_probe 与日志清理，p1 进程务必 kill）。
+
+**约束**：用户态；探针在 /tmp 或 p228_log/，跑完即清。
+
+**回传**：B/C/D 各组合结果表 + dmesg 对照，注明「批次 P2-28 完毕」。
 
 ### 指令 2026-10-09 #59：批次 P2-27（SPDK jetty 参数矩阵排查——priority 嫌疑 + 最小双进程对照，命中则就地 V2）
 
