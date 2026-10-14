@@ -1374,6 +1374,62 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
 
+### 指令 2026-10-09 #57：批次 P2-25（RA jetty 单进程验证 + 段合成验证 + 回环重试探测，回环恢复则就地 V2）
+
+**背景**：模块 B/C 代码已全部完成（外部 commit bbf96a2：RA jetty =
+RaCtxCqCreate+RaCtxQpCreate，QP key 切片出 {eid,uasid,jetty_id}，
+get_segment_info 全 sourced）。本批不需要回环的部分先验证；回环探测
+恢复则就地跑 V2。
+
+**A. 同步代码 + 重编**：
+```bash
+# 外部若已 push 成功：git pull --ff-only（期望含 bbf96a2
+# "Module A adds RA jetty"）
+# 若外部 push 仍未恢复：按 P2-22 方式文件同步 urma_perf_npu.c
+# （外部将提供 md5）+ nvme_urma.h/nvme_urma.c/nvme_urma_common.c/
+# nvme_urma_internal.h 四个库文件
+# 只编 urma_perf 目录（P2-20 绕行方式）
+```
+
+**B. 单进程验证 RA jetty（不需要回环）**：
+```bash
+LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64:/usr/lib64 \
+  ./urma_perf -r '' -M npu -g 0 -t 5 -n 1 -l 0
+```
+期望日志（新增两行）：
+```
+RA jetty ready (uasid=<n> jetty_id=<n> eid=<32位hex>)
+RA/HCCP context ready (phy_id=0 eid_index=0)
+```
+
+**C. 单进程验证段合成（direct 路径生效判据）**：
+同一启动命令的 stderr 中**不得出现**：
+`falling back to urma_register_seg`
+urma_perf 启动即分配注册 HBM 大块；无 fallback 消息 = provider
+get_segment_info 成功、direct 路径生效。若有 fallback，带回完整
+stderr（会是后续修证的输入）。
+
+**D. 回环重试探测（5 分钟成本）**：
+```bash
+# 复现 P2-22 D 的最小回环：nvmf_tgt(URMA,4420) + urma_perf -M cpu
+# 若仍 handshake failed rc=-5 → 带回 dmesg 新增的 ub/urma 行后停手
+# 若握手恢复 → 就地跑 V2（见下）
+```
+
+**D'. V2 数据判决（仅当 D 项回环恢复）**：
+```bash
+# target：nvmf_tgt + loop 盘 + nvmf_create_transport -t URMA + listener
+#   （照 P2-22 D 的部署）
+# initiator：urma_perf -M npu（同 Phase 1 参数形态，短跑 30s）
+# 判定：completed errors=0 且数据校验一致 = V2 通过 🎯
+# 附加观察：initiator stderr 无 fallback 消息（direct 路径全程生效）
+```
+
+**E. 现场还原**（进程/回环盘/大页/SOP 巡检）。
+
+**回传**：git HEAD 或文件同步 md5 + B 项日志原文 + C 项判定 +
+D/D' 项结果，注明「批次 P2-25 完毕」。
+
 ### 指令 2026-10-09 #56：批次 P2-24（CCDK key 解析格式提取 + URMA 回环 rc=-5 诊断）
 
 **背景**：模块 B/C 管线已由外部完成（capsule 段信息合成 + NPU 注册分
