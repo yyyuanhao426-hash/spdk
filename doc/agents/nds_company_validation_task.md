@@ -244,6 +244,55 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P224（批次 P2-24 回执，用户带回）—— key 解析格式 + rc=-5 根因坐实
+
+**判定：A~D 交付（uasid 解析 = QpKey 前 24B 直接切片；token_id 直接用
+out.ub 无需解析；自建 jetty 参数齐备；libnds 备选可行）；E 🎯 rc=-5
+根因坐实 = 133 UB 内核驱动控制队列故障（环境回归，非我方代码）。**
+
+- **A · nds_parse_jetty_info（nds_urma.c:44）**：整个函数就是一句
+  memcpy——把 RaCtxQpCreate 输出 QpCreateInfo.key.value 的**前 24 字节**
+  按结构体重叠解释：`nds_urma_jetty_info_t{eid[16]@0, uasid@16,
+  id@20, sizeof=24}`。外部复刻 = QpCreateInfo.key.value[0..23] 直接切。
+  （QpKey{value[64], size}，QpCreateInfo.key 在结构体最前。）
+- **B · nds_parse_segment_info（nds_urma.c:49）**：同样是 memcpy
+  （{ubva[28], len@32(⚠4B 对齐填充), seg_attr@40, token_id@44}，
+  sizeof=48）。**结论：直接用 RaCtxLmemRegister 的 out.ub.token_id
+  已足够，无需解析 128B key**（MemRegInfo.ub.tokenId 直接字段）。
+- **C · nds_init_ub_resources / nds_init_qp（nds.c:174/154）自建
+  RA jetty 实测取值**：CqCreateAttr{depth=16384（CQ_DEPTH=
+  1024*1024/64），ub.mode=JFC_MODE_NORMAL(0)，其余 0}；
+  QpCreateAttr{scq=rcq=同一 cq_handle（共享 CQ），srq=NULL，
+  sqDepth=16，rqDepth=256，transportMode=CONN_RM(1)，
+  ub.mode=JETTY_MODE_URMA_NORMAL(0)，ub.priority=2，ub.rnrRetry=7，
+  ub.flag.bs.shareJfr=1，ub.jfsFlag.bs.errorSuspend=1，jettyId=0}。
+  宏：HDC_TYPE=18、EID_INDEX=0、RAINIT_REPEAT_RET_CODE=328002。
+- **D · libnds 可用**：/home/tools/app/colleague_c_repo/output/libnds.so
+  （485136B，导出 nds_get_segment_info/nds_init/nds_buf_register 等）。
+  ⚠ NEEDED liburma.so.0（连带加载系统版 liburma）——与 CANN 同进程
+  有 507033 风险，**备选保留，主路仍走 libra 直调**。
+- **E 🎯 rc=-5 根因链（dmesg 确定性复现 3/3）**：
+  ```
+  rc=-5 (handshake failed)
+   ← uburma_cmd_import_jetty_ex: ubcore_import_jetty failed
+    ← ubcore_create_tpid_priv: Failed to query/select tpid, ret=-28
+     ← ubcore_get_tp_list_from_ops: get tp list failed
+      ← ubase 0000c: UDMA ctrl queue get TP id list failed, ret=-2
+       ← ubase 0000c: UDMA ctrl queue send message failed, ret=-2 ★根因
+  ```
+  = UB 底层控制队列与设备 0000c 通信故障 → 无法分配 TP ID。
+  旁证：Sep 22 L-14/L-15 同命令回环全零错误；期间 133 多次外部重启
+  （uptime 4天→18h→16h，日期跳到 Oct-13/14）；旧 dmesg 还有
+  type156 attr 校验错（重启后已清）。**结论：环境回归，与 Module A、
+  NPU 代码路径均无关（-M cpu 对照同报）。**
+  版本对照：系统版 liburma.so.0.0.38（381ebd702）≠ UMDK 版 0.0.35
+  （5f1d88b1）；urma_admin show 26 端点全 ACTIVE（配置层正常）。
+- **限制**：测试 agent 无独立 NPU 节点的 SSH 配置（仅 133 一台），
+  独立节点复测待用户安排。
+
+**对模块 B 的直接交付**：uasid/jetty_id/eid = QpCreateInfo.key.value
+前 24B 切片；token_id = out.ub.token_id；自建 jetty 取值表（C 项）。
+
 ### 回执导入 2026-10-09 #P222（批次 P2-22 回执，用户带回）—— Module A 修正固化 + npu 快验通过；npu-staged 回归被环境阻塞
 
 **判定：A/B/C ✅（修正固化进 git + 重编通过 + RA/HCCP context ready）；

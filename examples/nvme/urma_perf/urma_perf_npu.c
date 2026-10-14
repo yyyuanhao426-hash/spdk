@@ -189,6 +189,153 @@ struct ra_lmem_reg_info {
 	struct ra_mem_reg_info out;
 };
 
+/* ===== RA jetty (RaCtxCqCreate/RaCtxQpCreate) — source of {eid, uasid,
+ * jetty_id} for the direct-route segment descriptor =====
+ * Layouts mirror rdma_agent_plugin.h exactly; attribute values follow
+ * colleague_c nds.c nds_init_qp (P2-24 C, measured on 133). */
+union ra_jfc_flag {
+	struct {
+		uint32_t lock_free	: 1;
+		uint32_t jfc_inline	: 1;
+		uint32_t reserved	: 30;
+	} bs;
+	uint32_t value;
+};
+
+union ra_jfs_flag {
+	struct {
+		uint32_t lock_free	: 1;
+		uint32_t error_suspend	: 1;
+		uint32_t outorder_comp	: 1;
+		uint32_t order_type	: 8;
+		uint32_t multi_path	: 1;
+		uint32_t reserved	: 20;
+	} bs;
+	uint32_t value;
+};
+
+union ra_jetty_flag {
+	struct {
+		uint32_t share_jfr	: 1;
+		uint32_t reserved	: 31;
+	} bs;
+	uint32_t value;
+};
+
+struct ra_cq_create_attr {
+	void *chan_handle;
+	uint32_t depth;
+	union {
+		struct {
+			uint64_t cq_context;
+			uint32_t mode;
+			uint32_t comp_vector;
+		} rdma;
+		struct {
+			uint64_t user_ctx;
+			uint32_t mode;		/* enum JfcMode */
+			uint32_t ceqn;
+			union ra_jfc_flag flag;
+			struct {
+				bool valid;
+				uint32_t cqe_flag;
+			} ccu_ex_cfg;
+		} ub;
+	};
+};
+
+struct ra_cq_create_info {
+	uint64_t va;
+	uint32_t id;
+	uint32_t cqe_size;
+	uint64_t buf_addr;
+	uint64_t swdb_addr;
+};
+
+struct ra_cq_info {
+	struct ra_cq_create_attr in;
+	struct ra_cq_create_info out;
+};
+
+struct ra_qp_create_attr {
+	void *scq_handle;
+	void *rcq_handle;
+	void *srq_handle;
+	uint32_t sq_depth;
+	uint32_t rq_depth;
+	uint32_t transport_mode;	/* enum TransportModeT */
+	union {
+		struct {
+			uint32_t mode;
+			uint32_t udp_sport;
+			uint8_t traffic_class;
+			uint8_t sl;
+			uint8_t timeout;
+			uint8_t rnr_retry;
+			uint8_t retry_cnt;
+		} rdma;
+		struct {
+			uint32_t mode;		/* enum JettyMode */
+			uint32_t jetty_id;
+			union ra_jetty_flag flag;
+			union ra_jfs_flag jfs_flag;
+			void *token_id_handle;
+			uint32_t token_value;
+			uint8_t priority;
+			uint8_t rnr_retry;
+			uint8_t err_timeout;
+		} ub;
+	};
+	uint32_t resv[16];
+};
+
+struct ra_qp_key {
+	uint8_t value[64];
+	uint8_t size;
+};
+
+struct ra_qp_create_info {
+	struct ra_qp_key key;
+	union {
+		struct {
+			uint32_t uasid;
+			uint32_t id;
+			uint64_t sq_buff_va;
+			uint64_t wqebb_size;
+			uint64_t db_addr;
+			uint32_t db_token_id;
+			uint32_t share_info_len;
+			uint64_t share_info_addr;
+		} ub;
+	};
+	uint64_t va;
+	uint32_t resv[16];
+};
+
+/* nds_parse_jetty_info semantics (P2-24 A): the first 24 bytes of
+ * QpCreateInfo.key.value overlay this struct directly. */
+struct ra_jetty_info {
+	uint8_t eid[16];
+	uint32_t uasid;
+	uint32_t id;
+};
+
+/* CCDK nds.c measured values (P2-24 C). */
+#define RA_CQ_DEPTH 16384
+#define RA_SQ_DEPTH 16
+#define RA_RQ_DEPTH 256
+#define RA_TRANSPORT_CONN_RM 1
+#define RA_JETTY_MODE_URMA_NORMAL 0
+#define RA_JETTY_PRIORITY 2
+#define RA_JETTY_RNR_RETRY 7
+
+typedef int (*ra_cq_create_fn)(void *ctx_handle, struct ra_cq_info *info,
+			       void **cq_handle);
+typedef int (*ra_cq_destroy_fn)(void *ctx_handle, void *cq_handle);
+typedef int (*ra_qp_create_fn)(void *ctx_handle, struct ra_qp_create_attr *attr,
+			       struct ra_qp_create_info *info, void **qp_handle);
+typedef int (*ra_qp_destroy_fn)(void *qp_handle);
+
 typedef int (*ra_init_fn)(struct ra_init_config *config);
 typedef int (*ra_deinit_fn)(struct ra_init_config *config);
 typedef int (*ra_ctx_init_fn)(struct ra_ctx_init_cfg *cfg,
@@ -231,9 +378,20 @@ struct npu_driver {
 	ra_ctx_deinit_fn ra_ctx_deinit;
 	ra_get_eid_num_fn ra_get_eid_num;
 	ra_get_eid_list_fn ra_get_eid_list;
+	ra_cq_create_fn ra_cq_create;
+	ra_cq_destroy_fn ra_cq_destroy;
+	ra_qp_create_fn ra_qp_create;
+	ra_qp_destroy_fn ra_qp_destroy;
+	void *ra_cq_handle;
+	void *ra_qp_handle;
 	rt_open_net_service_fn rt_open_net_service;
 	aclrt_get_phy_dev_id_fn get_phy_dev_id;
+	/* RA jetty coordinates, parsed from QpCreateInfo.key.value
+	 * (nds_parse_jetty_info semantics): the authoritative source for the
+	 * direct-route segment descriptor (P2-23 B / P2-24 A). */
+	uint8_t ra_seg_eid[16];
 	uint32_t ra_uasid;
+	uint32_t ra_jetty_id;
 	bool ra_uasid_valid;
 	bool ra_ready;
 	uint8_t ra_eid[16];
@@ -429,6 +587,63 @@ npu_ra_init(int32_t device_id)
 	}
 	memcpy(g_npu.ra_eid, eid_list[0].eid.raw, sizeof(g_npu.ra_eid));
 	free(eid_list);
+
+	/* Step 6: RA jetty — CQ then QP (nds.c nds_init_ub_resources /
+	 * nds_init_qp, P2-24 C measured values). The QP output key carries
+	 * the {eid, uasid, jetty_id} that the direct-route segment
+	 * descriptor is built from. */
+	g_npu.ra_cq_create = (ra_cq_create_fn)dlsym(g_npu.ra_library, "RaCtxCqCreate");
+	g_npu.ra_cq_destroy = (ra_cq_destroy_fn)dlsym(g_npu.ra_library, "RaCtxCqDestroy");
+	g_npu.ra_qp_create = (ra_qp_create_fn)dlsym(g_npu.ra_library, "RaCtxQpCreate");
+	g_npu.ra_qp_destroy = (ra_qp_destroy_fn)dlsym(g_npu.ra_library, "RaCtxQpDestroy");
+	if (g_npu.ra_cq_create == NULL || g_npu.ra_qp_create == NULL) {
+		fprintf(stderr, "RA RaCtxCqCreate/RaCtxQpCreate missing\n");
+		return -1;
+	}
+	{
+		struct ra_cq_info cq_info = {};
+		struct ra_qp_create_attr qp_attr = {};
+		struct ra_qp_create_info qp_info = {};
+		struct ra_jetty_info jetty;
+
+		cq_info.in.depth = RA_CQ_DEPTH;
+		cq_info.in.ub.mode = 0;	/* JFC_MODE_NORMAL */
+		ret = g_npu.ra_cq_create(g_npu.ra_ctx_handle, &cq_info,
+					 &g_npu.ra_cq_handle);
+		if (ret != 0) {
+			fprintf(stderr, "RaCtxCqCreate failed: ret %d\n", ret);
+			return -1;
+		}
+		qp_attr.scq_handle = g_npu.ra_cq_handle;
+		qp_attr.rcq_handle = g_npu.ra_cq_handle;
+		qp_attr.sq_depth = RA_SQ_DEPTH;
+		qp_attr.rq_depth = RA_RQ_DEPTH;
+		qp_attr.transport_mode = RA_TRANSPORT_CONN_RM;
+		qp_attr.ub.mode = RA_JETTY_MODE_URMA_NORMAL;
+		qp_attr.ub.priority = RA_JETTY_PRIORITY;
+		qp_attr.ub.rnr_retry = RA_JETTY_RNR_RETRY;
+		qp_attr.ub.flag.bs.share_jfr = 1;
+		qp_attr.ub.jfs_flag.bs.error_suspend = 1;
+		ret = g_npu.ra_qp_create(g_npu.ra_ctx_handle, &qp_attr, &qp_info,
+					 &g_npu.ra_qp_handle);
+		if (ret != 0) {
+			fprintf(stderr, "RaCtxQpCreate failed: ret %d\n", ret);
+			return -1;
+		}
+		memcpy(&jetty, qp_info.key.value, sizeof(jetty));
+		memcpy(g_npu.ra_seg_eid, jetty.eid, sizeof(g_npu.ra_seg_eid));
+		g_npu.ra_uasid = jetty.uasid;
+		g_npu.ra_jetty_id = jetty.id;
+		g_npu.ra_uasid_valid = true;
+		{
+			uint64_t eid_hi, eid_lo;
+
+			memcpy(&eid_lo, g_npu.ra_seg_eid, 8);
+			memcpy(&eid_hi, g_npu.ra_seg_eid + 8, 8);
+			printf("RA jetty ready (uasid=%u jetty_id=%u eid=%016lx%016lx)\n",
+			       g_npu.ra_uasid, g_npu.ra_jetty_id, eid_hi, eid_lo);
+		}
+	}
 	g_npu.ra_ready = true;
 	printf("RA/HCCP context ready (phy_id=%u eid_index=%u)\n",
 	       g_npu.ra_phy_id, ra_attr.ub.eid_index);
@@ -525,6 +740,14 @@ fail:
 void
 npu_driver_fini(void)
 {
+	if (g_npu.ra_qp_handle != NULL && g_npu.ra_qp_destroy != NULL) {
+		g_npu.ra_qp_destroy(g_npu.ra_qp_handle);
+		g_npu.ra_qp_handle = NULL;
+	}
+	if (g_npu.ra_cq_handle != NULL && g_npu.ra_cq_destroy != NULL) {
+		g_npu.ra_cq_destroy(g_npu.ra_ctx_handle, g_npu.ra_cq_handle);
+		g_npu.ra_cq_handle = NULL;
+	}
 	if (g_npu.ra_ctx_handle != NULL && g_npu.ra_ctx_deinit != NULL) {
 		g_npu.ra_ctx_deinit(g_npu.ra_ctx_handle);
 		g_npu.ra_ctx_handle = NULL;
@@ -752,11 +975,10 @@ npu_provider_pin(void *provider_ctx, void *addr, size_t length, void **pin_handl
 }
 
 /* NDS direct route: synthesize the peer-importable segment descriptor.
- * eid/va/len/token_id are all available from the RA path (P2-23 B); uasid
- * comes from the RA jetty key (RaCtxQpCreate output, nds_parse_jetty_info)
- * which is not sourced yet — gated until that format is extracted from the
- * CCDK. Returning nonzero here makes registration fall back to the legacy
- * urma_register_seg path (harmless: it fails visibly on 133). */
+ * {eid, uasid} come from the RA jetty key (RaCtxQpCreate output, P2-24 A),
+ * token_id from RaCtxLmemRegister out.ub (P2-24 B). Returning nonzero
+ * makes registration fall back to the legacy urma_register_seg path
+ * (harmless: it fails visibly on 133). */
 static int
 npu_provider_get_segment_info(void *provider_ctx, void *pin_handle,
 			      struct spdk_nvme_urma_seg_info *info)
@@ -771,7 +993,7 @@ npu_provider_get_segment_info(void *provider_ctx, void *pin_handle,
 		return -ENOTSUP;
 	}
 	memset(info, 0, sizeof(*info));
-	memcpy(info->eid, g_npu.ra_eid, sizeof(info->eid));
+	memcpy(info->eid, g_npu.ra_seg_eid, sizeof(info->eid));
 	info->uasid = g_npu.ra_uasid;
 	info->va = (uint64_t)(uintptr_t)handle->entry->addr;
 	info->token_id = handle->token_id;
