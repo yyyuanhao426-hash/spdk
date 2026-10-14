@@ -244,6 +244,40 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P229（批次 P2-29 回执，用户带回）—— 老二进制假设证伪；故障收窄为 DPDK 进程运行时特有
+
+**判定：A ✅ 取证坐实老二进制（nvmf_tgt/urma.o 全是 May 28 2000）；
+B ✅ 重编成功；C ❌ 新 target 仍 rc=-5（故障链一字不差）→ 老二进制
+假设证伪；D ✅ 握手 dump 对照——线数据完全正确（eid/id 两侧一致），
+同 liburma 同设备上裸进程 import 成功，nvmf_tgt 失败（单核亦然）→
+**故障为 SPDK 进程（DPDK EAL）运行时环境特有**。E ✅ 还原（含恢复
+被误删的 P2-22 改动）。**
+
+- **A ✅**：nvmf_tgt/lib/nvmf/urma.o mtime=2000-05-28（Phase 1 时代），
+  133 树 a0feee19b；ldd 与 p228 同为 /usr/lib64/liburma.so.0（另含
+  liburma_common.so.0）。
+- **B ✅**：make -C lib/nvmf / lib/nvme / app/nvmf_tgt 全 rc=0，
+  nvmf_tgt 15:57 更新（14.9MB）。
+- **C ❌**：新 target 回环仍 rc=-5，dmesg 故障链一字不差
+  （ubase 00005 ctrl queue send -2 → tp list → tpid -28 →
+  import_jetty failed）。
+- **D ✅ 关键对照**：
+  - 两侧 NDS-DBG：tgt import eid=`00000000003f020000100000df080b00`
+    id=61906 / ini jetty eid 同 id=61906——**线协议握手数据正确**；
+  - p228 跨进程 import（同设备）成功（token 0xacfe）；
+  - 单核 target（-m 0x1）仍失败 → 非核数/线程；
+  - ldd nvmf_tgt 干净（同 liburma，无 RPATH）。
+  → **同设备/同库/同 wire 下裸进程成功、nvmf_tgt 失败 → 进程运行时
+  环境问题，头号嫌疑 DPDK EAL（hugepages/base-virtaddr/
+  match-allocations）**。
+- **事项记录**：① #61 补丁 hunk 行数损坏无法 git apply（测试 agent
+  按意图等效注入）；外部已出修正版 p230_handshake_debug.patch；
+  ② `git checkout -- lib/nvme/nvme_urma.c` 误删 P2-22 的 direct-route
+  改动，已从权威本地副本（D:\NDS\spdk_nds_v1）回填——**后续指令
+  禁用 git checkout 触碰那 5 个文件**，改用反向补丁。
+- **测试 agent 建议**：对照 urma_perf(DPDK) 创建的 jetty 能否被裸
+  进程 import（隔离"DPDK 进程建的 jetty"变量）。
+
 ### 回执导入 2026-10-09 #P228（批次 P2-28 回执，用户带回）—— SPDK 创建序列在 UMDK 层全部跑通；故障在其上层代码路径
 
 **判定：C 🎯 完整 SPDK 序列（JFC4096 + 共享 JFR2048/token 0xACFE +
@@ -1461,6 +1495,67 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #62：批次 P2-30（DPDK 隔离实验——"DPDK 进程建的 jetty 能否被裸进程 import"）
+
+**背景**：P2-29 证据链：wire 数据正确（eid/id 两侧一致）+ 同 liburma
++ 同设备 + 裸进程 import 成功 + nvmf_tgt 重编后仍败 + 单核亦然 →
+**故障为 SPDK 进程（DPDK EAL）运行时环境特有**。头号嫌疑：DPDK 内存
+布局（hugepages / base-virtaddr=0x200000000000）影响 jetty 资源在内核
+侧的 TP 建立。本批用隔离实验判定：是**创建方**（DPDK 建的 jetty 不可
+导入）还是**导入方**（DPDK 进程做 import 会失败）。
+
+**准备（探针已升级 rev2，外部已 push）**：
+```bash
+# doc/agents/debug/p228_probe.c rev2：setvbuf + 按 dev_cap clamp +
+# p2 侧新增 P2_CREATE_JFC/P2_CREATE_JFR 旋钮（导入方状态实验用）
+gcc -O2 -o /tmp/p228_probe p228_probe.c \
+  -I/usr/include/ub/umdk/urma -L/usr/lib64 -l:liburma.so -lpthread
+# 同步 doc/agents/debug/p230_handshake_debug.patch（#61 补丁的修正版，
+# 行数已修正；若仍 git apply 失败，按上次方式脚本注入等效 dump）
+git apply doc/agents/debug/p230_handshake_debug.patch   # 只影响 dump，跑完还原
+# 重编 nvmf_tgt + urma_perf（make -C lib/nvmf && make -C lib/nvme && make -C app/nvmf_tgt）
+```
+
+**E1（核心）· DPDK 建的 jetty → 裸进程 import**：
+```bash
+# 1. 起一个假 TCP 目标占住 4420（让 urma_perf 停在等待 HELLO 应答，
+#    jetty 保持存活）：nc -l 4420 或等效 python 一行
+# 2. urma_perf -M cpu 连它（会打印 "NDS-DBG: ini jetty eid=… id=…" 后阻塞）
+# 3. 另一终端：/tmp/p228_probe p2 <ini打印的eid> <id> 0xACFE
+# 判定：
+#   import FAILED  → 创建方（DPDK）问题坐实 🎯
+#   import OK      → 创建方无责，转 E2
+# 注：urma_perf 若因 connect 后无响应超时退出，重试步骤 2-3（打印先到手）
+```
+
+**E2（若 E1 OK）· 裸进程建的 jetty → DPDK 进程 import**：
+无法让 nvmf_tgt import 指定 jetty，改用导入方状态实验：
+```bash
+# p228 p1（裸）建 jetty → p228 p2 带 P2_CREATE_JFC=1 P2_CREATE_JFR=1
+# （= p2 先建与 nvmf_tgt 相同的 JFC/JFR 再 import）：
+#   FAILED → 导入方"已有资源状态"问题（与 DPDK 无关，是 SPDK target
+#   建 JFC/JFR 后再 import 的路径问题）
+#   OK     → 导入方资源状态也无责 → 唯一剩余差异 = SPDK 进程的
+#            DPDK EAL 环境，外部转码内定位（env init 参数实验）
+```
+
+**E3（补充）· 双 DPDK 复跑 + dump**：
+```bash
+# 正常 nvmf_tgt + urma_perf 回环（带 dump），带回两侧 NDS-DBG 行 +
+# target import 失败时的 dmesg 窗口（确认仍是 create_tpid -28）
+```
+
+**D. 还原（重要）**：
+```bash
+# ⚠️ 勿用 git checkout -- lib/nvme/nvme_urma.c（会删 P2-22 改动）！
+# dump 注销：git apply -R doc/agents/debug/p230_handshake_debug.patch
+# 或仅重编覆盖；5 个已同步文件保持 P2-22 状态（git status 应为
+# M urma_perf_npu.c / nvme_urma.h / nvme_urma.c / nvme_urma_common.c /
+# nvme_urma_internal.h，lib/nvmf/urma.c 干净）
+```
+
+**回传**：E1/E2/E3 结果 + NDS-DBG 行 + dmesg，注明「批次 P2-30 完毕」。
 
 ### 指令 2026-10-09 #61：批次 P2-29（nvmf_tgt 老二进制嫌疑——重编 target + 握手 dump 对照）
 

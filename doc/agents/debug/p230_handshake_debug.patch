@@ -1,0 +1,40 @@
+--- a/lib/nvmf/urma.c
++++ b/lib/nvmf/urma.c
+@@ -492,6 +492,18 @@
+ 	rjetty.type = URMA_JETTY;
+ 	rjetty.tp_type = URMA_CTP;
++	{
++		int _i;
++
++		fprintf(stderr, "NDS-DBG: tgt import eid=");
++		for (_i = 0; _i < 16; _i++) {
++			fprintf(stderr, "%02x", rjetty.jetty_id.eid.raw[_i]);
++		}
++		fprintf(stderr, " id=%u uasid=%u mode=%d type=%d tp=%d dev=%s\n",
++			rjetty.jetty_id.id, rjetty.jetty_id.uasid,
++			(int)rjetty.trans_mode, (int)rjetty.type, (int)rjetty.tp_type,
++			device->opts.dev_name);
++	}
+ 	{
+ 		urma_token_t token = {.token = SPDK_URMA_DEFAULT_TOKEN};
+ 		uqpair->target_jetty = urma_import_jetty(device->context, &rjetty, &token);
+--- a/lib/nvme/nvme_urma.c
++++ b/lib/nvme/nvme_urma.c
+@@ -393,4 +393,16 @@
+ 	cfg.shared.jfc = uqpair->device->jfcs[0];
+ 	uqpair->jetty = urma_create_jetty(uqpair->device->context, &cfg);
+-	return uqpair->jetty == NULL ? -EIO : 0;
++	if (uqpair->jetty == NULL) {
++		return -EIO;
++	}
++	{
++		int _i;
++
++		fprintf(stderr, "NDS-DBG: ini jetty eid=");
++		for (_i = 0; _i < 16; _i++) {
++			fprintf(stderr, "%02x", uqpair->device->eid.raw[_i]);
++		}
++		fprintf(stderr, " id=%u\n", uqpair->jetty->jetty_id.id);
++	}
++	return 0;
+ }
