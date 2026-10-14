@@ -244,6 +244,40 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P225（批次 P2-25 回执，用户带回）—— RA jetty 单进程跑通；V2 仍被 133 UB 控制队列故障阻塞
+
+**判定：A/B ✅（代码同步重编 + RA jetty 单进程跑通）；C ⚠️ 无
+fallback 消息但未达注册点（受 D 阻塞）；D ❌ rc=-5 确定性复现
+（同 P2-24 根因链）；D' 未执行；E ✅ 还原。**
+
+- **A ✅ 同步+重编**：pull c607790→1175808（含 bbf96a2）；133 无法
+  访问 GitHub，按 P2-22 方式同步 5 文件（urma_perf_npu.c +
+  nvme_urma.h/nvme_urma.c/nvme_urma_common.c/nvme_urma_internal.h，
+  md5 全核对）；lib/nvme 与 urma_perf 两个目标增量 rc=0。
+- **B ✅ RA jetty 跑通**：
+  ```
+  RA jetty ready (uasid=0 jetty_id=9859 eid=000100df000010000002000000000000)
+  RA/HCCP context ready (phy_id=0 eid_index=0)
+  ```
+  （uasid=0 与 P2-19 实测一致；jetty_id 动态分配正常；注：eid 打印
+  为 hi||lo 两个 8 字节段，与 P2-21 探针的逐字节打印方向不同。）
+  小插曲：指令给的 `-r ''` 被 parse_args 拒绝，测试 agent 改用合法
+  trid 格式，不影响（jetty 建立在 npu_driver_init，早于 connect）。
+- **C ⚠️**：可达的 stdout/stderr 无 fallback 消息；但进程在 probe
+  阶段 Connection refused(-111) 中止，未走到 HBM 注册——
+  npu_provider_get_segment_info 在 prepare_workers（probe 之后）才被
+  调用（nvme_urma_common.c:363）。**direct 生效的 positive 确认需
+  回环恢复**。
+- **D ❌ rc=-5 确定性复现**：dmesg 与 P2-24 完全同一条因果链
+  （ubase 0000c ctrl queue send ret=-2 → TP id list 失败 → tpid -28
+  → import_jetty 失败 → 握手 rc=-5）；-M cpu 对照同报。遵令停手。
+- **E ✅ 还原**：无残留进程、大页回基线 0、loop.img/临时脚本已清；
+  133 工作区保留 5 个同步文件（M 状态）。
+
+**结论：模块 A/B/C 代码路径正确（单进程可验部分全通过）；C/D'/V2
+三项全部卡在 133 UB 驱动控制队列故障（设备 0000c），环境问题与代码
+无关。**
+
 ### 回执导入 2026-10-09 #P224（批次 P2-24 回执，用户带回）—— key 解析格式 + rc=-5 根因坐实
 
 **判定：A~D 交付（uasid 解析 = QpKey 前 24B 直接切片；token_id 直接用
@@ -1373,6 +1407,54 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #58：批次 P2-26（UB 设备级探测——绕开 0000c 故障控制器找可用设备，找到则就地 V2）
+
+**背景**：rc=-5 根因固定在 **ubase 0000c**（一台 UB 控制器的 UDMA
+控制队列 send failed ret=-2）。但 133 有两台 UB 控制器
+（ub_bus_controller0/1，urma 设备 udmac0d1e2..e6 + udmac1d1e2..e6 共
+10 个），且传输层支持指定设备：initiator 用环境变量
+`SPDK_URMA_DEV_NAME`，target 用 `nvmf_create_transport -t URMA` 的
+`-o dev_name` 参数。**若故障只坏 0000c 一台，其余设备上回环应可用
+→ V2 就能跑。** 本批逐设备探测。
+
+**A. 设备映射（只读）**：
+```bash
+ls -l /sys/bus/ub/devices/
+# 对每个 udmac* 找出其所属 controller（parent）：
+#   readlink -f /sys/bus/ub/devices/udmac*/device 2>/dev/null 或
+#   find /sys/devices -name "udmac*" -maxdepth 6 | head -20
+# dmesg 里的 "ubase 0000c" 对应哪台 controller/设备（grep dmesg）
+# urma_admin show 对照各设备 eid
+# 带回：设备 → controller → 是否 0000c 的映射表
+```
+
+**B. 逐设备回环探测（核心）**：
+```bash
+# 对每个非 0000c 的 udmac 设备 X（如 udmac1d1e2）：
+#   target: nvmf_create_transport -t URMA -o dev_name X
+#   initiator: SPDK_URMA_DEV_NAME=X urma_perf -M cpu probe
+# 记录每台设备：握手 成功/rc=-5
+# 若 udmac0d1e* 全坏，优先试 udmac1d1e*（另一台 controller）
+```
+
+**C. 找到可用设备 → 就地 V2（数据判决）**：
+```bash
+# 在可用设备 Y 上完整部署：
+#   target: loop.img 2G + bdev_aio + nvmf_create_transport -t URMA
+#     -o dev_name Y + listener 4420
+#   initiator: SPDK_URMA_DEV_NAME=Y urma_perf -M npu（短跑 30s，
+#     LD_LIBRARY_PATH 照旧勿含 UMDK/lib）
+# 判定：completed errors=0 + 数据校验一致 + initiator stderr 全程
+#   无 "falling back to urma_register_seg" = V2 通过 🎯
+```
+
+**D. 现场还原**（进程/回环盘/大页/SOP）。
+
+**约束**：全部用户态操作；不改内核、不装卸模块、不碰系统服务。
+
+**回传**：A 项映射表 + B 项逐设备结果 + C 项输出（若跑），注明
+「批次 P2-26 完毕」。
 
 ### 指令 2026-10-09 #57：批次 P2-25（RA jetty 单进程验证 + 段合成验证 + 回环重试探测，回环恢复则就地 V2）
 
