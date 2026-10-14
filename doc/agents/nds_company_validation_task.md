@@ -244,6 +244,26 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P230（批次 P2-30 回执，用户带回）—— 创建方/导入方资源状态均无责；唯一剩余变量 = DPDK EAL 运行时
+
+**判定：E1 🎯 urma_perf（DPDK）建的 jetty 被裸进程 import **成功**
+（假 TCP 目标保活，id=3862，token 0xACFE，dmesg 干净）→ 创建方
+（DPDK）无责；E2 ✅ 裸 jetty → 带预建 JFC/JFR 的裸 p2 import 全 OK
+→ 导入方资源状态无责；E3 ✅ 双 DPDK 回环 eid/id 两侧一致
+（4261=4261）仍 create_tpid -28。**结论：唯一剩余差异 = SPDK 进程
+（DPDK EAL 运行时）自身**——hugepages / base-virtaddr /
+match-allocations。F ✅ 还原（权威副本回填，未用 git checkout）。**
+
+- E1 前插曲：首轮假目标 bind 0.0.0.0 撞上他人占用的 127.0.0.1:4420
+  （未触碰他人进程），改绑具体 IP 后有效重跑。
+- p230 补丁 hunk 起始行仍偏 1（-492 → -493），外部已修正；本批仍
+  脚本等效注入（nvmf=1/nvme=1 处 dump）。
+- **下一步裁决点**：导入方（DPDK 进程做 import）尚未单独隔离——
+  需要"裸进程发起方"让 nvmf_tgt import 裸建的 jetty（外部已备
+  p231_fake_ini.c：裸进程完整复刻 SPDK 控制面握手——建资源 →
+  TCP connect → HELLO(desc) → 收 HELLO_RSP → import 对端 jetty →
+  bind）+ nvmf_tgt EAL 参数变体实验（--no-huge 等）。
+
 ### 回执导入 2026-10-09 #P229（批次 P2-29 回执，用户带回）—— 老二进制假设证伪；故障收窄为 DPDK 进程运行时特有
 
 **判定：A ✅ 取证坐实老二进制（nvmf_tgt/urma.o 全是 May 28 2000）；
@@ -1495,6 +1515,57 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #63：批次 P2-31（导入方隔离实验——裸发起方 p231 + nvmf_tgt EAL 参数变体）
+
+**背景**：P2-30 判定创建方（DPDK 建 jetty）与导入方资源状态均无责，
+唯一剩余变量 = SPDK 进程的 DPDK EAL 运行时。还差最后一块拼图：
+**nvmf_tgt import 裸进程建的 jetty 会怎样**（此前只测过 DPDK 建的
+jetty + 裸导入）。外部已备 `doc/agents/debug/p231_fake_ini.c`——裸
+进程完整复刻 SPDK 控制面：建资源（SPDK 同款）→ TCP connect → 发
+HELLO{eid,jetty_id} → 收 HELLO_RSP → import 对端 jetty → bind。
+
+**A. 编译 p231**：
+```bash
+gcc -O2 -o /tmp/p231 p231_fake_ini.c \
+  -I/usr/include/ub/umdk/urma -L/usr/lib64 -l:liburma.so -lpthread
+```
+
+**E-A（关键）· 裸发起方 → nvmf_tgt import**：
+```bash
+# 1. nvmf_tgt 正常起（loop.img + URMA transport + listener 4420，
+#    带 NDS-DBG dump 版二进制，脚本注入或 p230 补丁）
+# 2. /tmp/p231 141.61.133.123 4420
+# 观察：
+#   target 侧日志：tgt import eid=… id=… 是否与 p231 打印一致；
+#   target import OK/failed + dmesg
+#   p231 侧：收到 HELLO_RSP 则继续 import/bind
+# 判定：
+#   target import FAILED（裸 jetty 也失败）→ 导入方（DPDK 进程）坐实 🎯
+#   target import OK 且 p231 收到 RSP 并 import/bind 成功 →
+#     裸发起方完整握手全通 → DPDK EAL 是唯一变量坐实，转 E-B
+```
+
+**E-B（E-A 后做）· nvmf_tgt EAL 参数变体（用 urma_perf 回环验证）**：
+```bash
+# 逐个试（每变体跑一次 -M cpu 回环）：
+nvmf_tgt --no-huge -s 512            # 无大页模式
+nvmf_tgt -s 256                      # 减小内存足迹
+nvmf_tgt --single-file-segments      # 单文件内存段
+# 哪个变体握手通过 → 该变体即 V2 的运行配置，就地跑 V2 🎯
+# （urma_perf 侧也可对照加同样参数）
+```
+
+**E-C · 若 E-B 某变体通过 → 就地 V2**：
+```bash
+# 用通过变体起 target + urma_perf -M npu 短跑 30s
+# 判定照 P2-26 C 项（errors=0 + 数据一致 + 无 fallback stderr）
+```
+
+**D. 还原**：禁用 git checkout 触碰 5 文件；dump 用反向补丁/重编覆盖。
+
+**回传**：E-A target/p231 双侧日志 + dmesg；E-B 各变体结果；
+E-C 输出（若跑），注明「批次 P2-31 完毕」。
 
 ### 指令 2026-10-09 #62：批次 P2-30（DPDK 隔离实验——"DPDK 进程建的 jetty 能否被裸进程 import"）
 

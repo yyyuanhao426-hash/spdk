@@ -1,6 +1,6 @@
 --- a/lib/nvmf/urma.c
 +++ b/lib/nvmf/urma.c
-@@ -492,6 +492,18 @@
+@@ -493,6 +493,18 @@
  	rjetty.type = URMA_JETTY;
  	rjetty.tp_type = URMA_CTP;
 +	{
