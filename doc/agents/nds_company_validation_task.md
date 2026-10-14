@@ -244,6 +244,36 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P228（批次 P2-28 回执，用户带回）—— SPDK 创建序列在 UMDK 层全部跑通；故障在其上层代码路径
+
+**判定：C 🎯 完整 SPDK 序列（JFC4096 + 共享 JFR2048/token 0xACFE +
+jetty prio15/share_jfr=1，import token 0xACFE）在裸 UMDK API 上
+import_jetty 成功——且在 udmac0d1e2 与 0000c(udmac1d1e5) 双设备均
+成立，dmesg 干净。#60 的"JFC/JFR/token 组合语义"假设证伪。
+rc=-5 无法在 create+import 层复现 → 故障位于 SPDK 传输层以上
+（jetty 建好之后到 nvmf 握手之间的代码路径）。F ✅ 还原。**
+
+- **A ✅ 编译**：rc=0，liburma 0.0.3。探针两处注意：① 未 setvbuf
+  导致 p1 成功输出被缓冲（用 stdbuf -oL 规避）；② 设备 cap
+  max_jfr_sge=4（max_jfs_sge=13）——探针默认 MAX_SGE=5 超 cap 建
+  JFR 必败（探针缺 clamp），SPDK 代码有 clamp（common.c:720）。
+- **B ✅ 对照组**：字面配置（无 JFC 无 JFR）因探针硬编码 share_jfr=1
+  不可行；真正对照 B_ctrl（JFR_DEPTH=256 MAX_SGE=1, itok 0）→
+  create+import 全 OK。
+- **C 🎯**：SPDK 等效序列（MAX_SGE 按 cap clamp 到 4）→ 全部成功。
+  C_spdkraw 失败纯属探针自身 max_sge 缺陷。
+- **D ✅ 单旋钮二分**：IMPORT_TOKEN=0 / JFR_TOKEN=0 / depth 64/256 /
+  prio 2 / max_sge 1 全部 OK（CREATE_JFR=0/CREATE_JFC=0 不可行，
+  share_jfr=1 必须有 JFR）。**没有任何旋钮能复现 FAIL——因为 UMDK
+  层根本不 FAIL**。
+- **测试 agent 建议**：① 修正探针（setvbuf + clamp）；② 下一步聚焦
+  jetty 建好之后的动作（TP/连接建立、create_jetty 调用序、target
+  侧 listener/qpair 初始化）。
+- **外部新嫌疑（接手判定）**：nvmf_tgt 为 Phase 1 时代的老二进制
+  （133 树停在 a0feee19b，5 文件同步不含 lib/nvmf/urma.c，target
+  从未在 rc2 内核下重编）——老头文件结构布局 vs 新内核 ABI 错位
+  是头号候选（Phase 1 成功=老头文件配老内核）。批次 P2-29 验证。
+
 ### 回执导入 2026-10-09 #P227（批次 P2-27 回执，用户带回）—— priority 假设证伪；故障收窄到 SPDK transport 集成逻辑
 
 **判定：A ✅ liburma 同版本（版本差异排除）；B ❌ env 矩阵 7/7 全败
@@ -1431,6 +1461,60 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #61：批次 P2-29（nvmf_tgt 老二进制嫌疑——重编 target + 握手 dump 对照）
+
+**背景**：P2-28 证明 SPDK 创建序列在裸 UMDK 层全通——故障在 SPDK 代码
+更高层。**外部头号嫌疑：nvmf_tgt 是 Phase 1 时代的老二进制**。133 树
+停在 a0feee19b，P2-22 只同步了 lib/nvme 侧 5 文件，**lib/nvmf/urma.c
+（target 侧传输层）从未在 rc2 内核下重编**；Phase 1 成功 = 老头文件配
+老内核，驱动升级后 target 的 urma 结构布局（urma_rjetty_t 等）可能与
+新内核 ABI 错位——用户态传参错位恰好会让内核走错 TP 查询路径
+（create_tpid -28）。
+
+**A. target 现状取证（只读）**：
+```bash
+cd /home/tools/app/spdk
+ldd build/bin/nvmf_tgt | grep -i urma
+ls -la build/lib/libspdk_nvmf.a lib/nvmf/urma.o 2>/dev/null   # 构建日期
+git status --short lib/nvmf/ lib/nvme/ include/spdk/nvme_urma.h
+git log --oneline -1
+```
+
+**B. 重编 nvmf_tgt（当前树，含已同步的 lib/nvme 文件）**：
+```bash
+# 只编 nvmf 库与 nvmf_tgt（增量）：
+make lib/nvmf 2>/dev/null || make -C lib/nvmf
+# 或按 P2-20 绕行方式编 app/nvmf_tgt 目标
+# rc=0 后确认 build/bin/nvmf_tgt 时间戳已更新
+```
+
+**C. 回环重试（新 target 二进制）**：
+```bash
+# 照 P2-22 D 最小部署重跑 -M cpu 回环
+# 握手成功 → 就地跑 V2（urma_perf -M npu，判定照 P2-26 C 项）🎯
+# 仍 rc=-5 → 执行 D
+```
+
+**D. 握手 dump 对照（C 仍失败时）**：
+```bash
+# 同步 doc/agents/debug/p229_handshake_debug.patch（外部已 push）
+git apply doc/agents/debug/p229_handshake_debug.patch
+# 重编 nvmf_tgt + urma_perf，重跑回环，带回两侧 NDS-DBG 行：
+#   tgt import eid=… id=… uasid=… mode=… tp=… dev=…
+#   ini jetty eid=… id=…
+# 对照要点：tgt 收到的 eid/id 与 ini 打印是否一致；
+# 再用该 eid/id 跑 /tmp/p228_probe p2 <eid> <id> 0xACFE
+# （p228 探针仍在，或按 #60 重编）——
+#   若 p228 import 同一 jetty 成功而 nvmf_tgt 失败 → target 进程环境问题
+#   （ldd/线程/DPDK），带回 ldd nvmf_tgt 全文
+# 跑完 git checkout -- lib/nvmf/urma.c lib/nvme/nvme_urma.c 还原
+```
+
+**E. 现场还原**。
+
+**回传**：A 项取证 + B 编译结果 + C/D 项输出与 NDS-DBG 行，注明
+「批次 P2-29 完毕」。
 
 ### 指令 2026-10-09 #60：批次 P2-28（判别探针 p228——SPDK 创建序列复刻 + 全参数二分）
 
