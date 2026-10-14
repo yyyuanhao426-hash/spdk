@@ -244,6 +244,30 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P231（批次 P2-31 回执，用户带回）—— 🎯 导入方坐实：DPDK 进程做 import 必败（与 jetty 由谁建无关）
+
+**判定：E-A 🎯 nvmf_tgt（DPDK）import **裸进程建的 jetty** 也失败
+（线数据一致：eid=`…df080b00` id=8476 两侧相同；dmesg 同一故障链）
+→ **"DPDK 进程做 import"= 故障点坐实**。E-B ❌ 三个 EAL 内存变体
+（--no-huge -s 512 / -s 256 / --single-file-segments）全败，且
+--no-huge 被 SPDK env 自动附加 --iova-mode=va --legacy-mem
+（lib/env_dpdk/init.c:479-481）→ iova-mode/hugepage 布局假设排除。
+E-C 未执行（无命中变体）。E ✅ 还原（含清理 --single-file-segments
+遗留的 208 个 surplus 大页）。**
+
+- **矩阵总结**：DPDK 建 jetty → 裸导入 OK（P2-30 E1）；裸建 jetty →
+  DPDK 导入 FAIL（P2-31 E-A）；裸建 → 裸导入 OK（多次）。**唯一
+  失败模式 = import 的执行者是 DPDK 进程**。
+- **排除项新增**：EAL 内存布局 / iova-mode / --no-huge /
+  single-file-segments。
+- **测试 agent 建议 + 外部下一步**：聚焦 DPDK 进程环境对 liburma
+  create_tpid/get_tp_list 的影响。策略 = 拆最小：p232 探针（裸探针 +
+  spdk_env_init，其余不变）让 nvmf_tgt import——若复现 → DPDK init
+  本身是触发器，再二分 env 参数与 urma_init/env_init 顺序；若不复现
+  → 差异在 nvmf_tgt 更上层（多上下文/RPC/bdev 层）。
+- 另查：nvmf_tgt 的 ldd 里有 **liburma_common.so.0**（urma_perf 与
+  探针是否也加载？）——低成本确认项。
+
 ### 回执导入 2026-10-09 #P230（批次 P2-30 回执，用户带回）—— 创建方/导入方资源状态均无责；唯一剩余变量 = DPDK EAL 运行时
 
 **判定：E1 🎯 urma_perf（DPDK）建的 jetty 被裸进程 import **成功**
@@ -1515,6 +1539,52 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #64：批次 P2-32（DPDK 触发器最小化——p232 = 裸探针 + spdk_env_init）
+
+**背景**：P2-31 坐实"DPDK 进程做 import 必败"且 EAL 内存参数无效。
+本批把 DPDK 变量拆到最小：**p232 = p231（裸发起方，已证握手逻辑正确）
++ spdk_env_init**。若 p232 打 nvmf_tgt 就能让 target import 失败 →
+DPDK init 本身是触发器；再按旋钮二分。若 p232 反而成功 → 差异在
+nvmf_tgt 更上层（多上下文/RPC/bdev）。
+
+**A. 低成本确认（只读）**：
+```bash
+ldd build/bin/nvmf_tgt | grep urma_common
+ldd build/examples/urma_perf | grep urma_common
+ldd /tmp/p231 | grep urma_common
+# nvmf_tgt 的 ldd 里有 liburma_common.so.0——确认另两者是否也加载，
+# 以及 /usr/lib64/liburma_common.so.0 的版本/日期
+```
+
+**B. 编译 p232**（同 p231 + SPDK env 库）：
+```bash
+gcc -O2 -o /tmp/p232 p232_fake_ini_dpdk.c \
+  -I include -I include/spdk -I/usr/include/ub/umdk/urma \
+  -L build/lib -L/usr/lib64 \
+  -lspdk_env_dpdk -lspdk_log -lspdk_util \
+  $(ls build/lib/librte_*.a | tr '\n' ' ') \
+  -l:liburma.so -lpthread -ldl -lnuma -lbsd -lssl -lcrypto
+# 链接报缺库时按提示补（照 nvmf_tgt 的链接闭包）
+```
+
+**C. 对照矩阵（每行 = 起好 nvmf_tgt(4420) 后跑一次 p232）**：
+```bash
+# 1) SPDK_ENV=0                 → 裸路径，target import 应 OK（对照）
+# 2) SPDK_ENV=1（env 在 urma 之前）
+# 3) SPDK_ENV=1 ENV_ORDER_URMA_FIRST=1（urma_init 在 env 之前）
+# 4) SPDK_ENV=1 ENV_NO_PCI=0
+# 5) SPDK_ENV=1 ENV_MEM=512
+# 6) SPDK_ENV=1 ENV_NO_HUGE=1
+# 每行记录：p232 端（spdk_env_init ok / HELLO / import/bind 结果）+
+# target 侧 tgt import 行 + dmesg（有无 create_tpid -28）
+# 判定：2~6 任一复现 target import FAIL → DPDK init 触发器坐实，
+# 带回是哪个组合；全 OK → 差异在 nvmf_tgt 更上层（外部转码内排查）
+```
+
+**D. 还原**（继续避开 git checkout 触碰 5 文件）。
+
+**回传**：A 项 + C 项矩阵表，注明「批次 P2-32 完毕」。
 
 ### 指令 2026-10-09 #63：批次 P2-31（导入方隔离实验——裸发起方 p231 + nvmf_tgt EAL 参数变体）
 
