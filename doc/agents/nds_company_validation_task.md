@@ -1408,6 +1408,70 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
 
+### 指令 2026-10-09 #59：批次 P2-27（SPDK jetty 参数矩阵排查——priority 嫌疑 + 最小双进程对照，命中则就地 V2）
+
+**背景**：P2-26 反转了诊断——硬件/UMDK/探针路径正常，故障为 SPDK
+nvmf-URMA 回环路径特有（任何设备都 import_jetty → create_tpid -28）。
+对比两条路径的 jetty 参数，发现一个高嫌疑差异：
+
+| 参数 | SPDK jetty（-M cpu 失败路径） | P2-19 探针 RA jetty（成功路径） |
+|------|------------------------------|--------------------------------|
+| priority | **15**（SPDK 默认，env 可覆盖） | **2**（CCDK nds_init_qp） |
+| share_jfr | 1（共享 JFR 预建） | 1 |
+| max_sge | 5 | — |
+| depth | SPDK_URMA_JETTY_DEPTH 默认值 | SQ16/RQ256 |
+| liburma | 待确认（预计 /usr/lib64 系统版 0.0.38） | 待确认 |
+
+优先嫌疑 = **priority 15**：若 rc2 内核的 TP ID 选择对 priority 敏感
+（liburma 提示 CTP 建议 6），get_tp_list 正好会失败。该参数有环境变量
+开关，**不用重编**。
+
+**A. liburma 加载确认（只读）**：
+```bash
+# urma_perf（SPDK）与 p219 探针各自实际加载的 liburma 路径/版本：
+LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64:/usr/lib64 \
+  ldd urma_perf | grep urma
+# 探针二进制同理（或看其运行日志）
+```
+
+**B. 参数矩阵快扫（不用重编，env 覆盖，-M cpu 回环逐个试）**：
+```bash
+# 1) priority 嫌疑（最优先）：
+SPDK_URMA_JETTY_PRIORITY=2   # 对齐 CCDK 探针
+SPDK_URMA_JETTY_PRIORITY=6   # liburma CTP 建议值
+SPDK_URMA_JETTY_PRIORITY=0
+# 2) depth 嫌疑：
+SPDK_URMA_JETTY_DEPTH=256
+SPDK_URMA_JETTY_DEPTH=64
+# 3) 组合（如 PRIORITY=2 + DEPTH=256）
+# 记录每组合：握手 成功/rc=-5（env 只加在 initiator/target 任一侧即可，
+# 两侧都加更稳）
+```
+
+**C. B 命中 → 就地 V2**：
+```bash
+# 用命中的 env 组合 + SPDK_URMA_DEV_NAME=<可用设备> 完整部署，
+# urma_perf -M npu 短跑 30s。判定照 P2-26 C 项（errors=0 + 数据一致
+# + 无 fallback stderr）。
+```
+
+**D. B 全部失败 → 最小双进程对照（纯 UMDK API，脱离 SPDK）**：
+```c
+// 自编最小探针（照 p219 探针骨架）：
+// P1: urma_create_jetty（矩阵：priority{0,2,6,15} × share_jfr{0,1}
+//     × RM/RC，depth 固定 256）→ 导出 {eid, jetty_id}
+// P2: urma_import_jetty(CTP) → 成功/失败
+// 记录每个组合的 import 结果 → 把失败维度收窄到单参数
+// （P1/P2 各自 ldd 的 liburma 也记录）
+```
+
+**E. 现场还原**。
+
+**约束**：用户态操作；D 项自编探针放 /tmp 或 p227_log/，跑完即清。
+
+**回传**：A 项 liburma 对照 + B 项矩阵结果 + C/D 项输出，注明
+「批次 P2-27 完毕」。
+
 ### 指令 2026-10-09 #58：批次 P2-26（UB 设备级探测——绕开 0000c 故障控制器找可用设备，找到则就地 V2）
 
 **背景**：rc=-5 根因固定在 **ubase 0000c**（一台 UB 控制器的 UDMA
