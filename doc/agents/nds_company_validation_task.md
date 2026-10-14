@@ -244,6 +244,29 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P232（批次 P2-32 回执，用户带回）—— 发起方 env 无影响（含设计缺口修正）；变量必须移到 nvmf_tgt
+
+**判定：A ✅ liburma_common.so.0(0.0.1) 三者（nvmf_tgt/urma_perf/裸
+探针）均加载，非 nvmf_tgt 独有——排除；B ✅ p232 编译成功（链接闭包
+修正为 pkg-config spdk_env_dpdk，rpath 生效）；C ❗ 7/7 全失败（含
+r1 裸路径对照）→ **发起方是否 DPDK 对结果零影响**（与 P2-31 E-A
+一致）。D ✅ 还原。**
+
+- **外部裁决点采纳（设计缺口承认）**：#64 的 r1 预期"应 OK"是外部
+  的设计错误——P2-31 E-A 已证明裸发起方 → DPDK target 必败，r1 本
+  就不该成功。矩阵变化的变量（发起方 env）不是决定性变量。
+- **净结论（三方矩阵定格）**：DPDK 建→裸导入 OK；裸建→裸导入 OK；
+  **任意建→DPDK 导入（nvmf_tgt）必败**。触发条件 = 导入方进程跑过
+  spdk_env_init（DPDK）。
+- **工程备忘**：DPDK 库在 dpdk/build/lib/（30 个 librte_*.a），SPDK
+  闭包用 `PKG_CONFIG_PATH=build/lib/pkgconfig pkg-config --libs
+  spdk_env_dpdk`（任务书给的路径有误，已修正记录）。
+- **下一步（测试 agent 建议 + 外部采纳）**：把导入方变成变量：
+  ① strace 对比 import 的 ioctl 序列（裸成功 vs nvmf_tgt 失败）；
+  ② 用带 TLV 适配的 UMDK liburma（本地 7 提交）加调试打印重编，
+   nvmf_tgt 换用它跑回环——既可能直接修复（系统 0.0.3 与新内核
+   组合的缺陷），又能拿到 import 路径的精确内核参数。
+
 ### 回执导入 2026-10-09 #P231（批次 P2-31 回执，用户带回）—— 🎯 导入方坐实：DPDK 进程做 import 必败（与 jetty 由谁建无关）
 
 **判定：E-A 🎯 nvmf_tgt（DPDK）import **裸进程建的 jetty** 也失败
@@ -1539,6 +1562,59 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #65：批次 P2-33（导入方攻坚——strace 对比 + 带调试的 UMDK liburma 换装试验）
+
+**背景**：P2-32 矩阵定格：**唯一失败模式 = 导入方是 DPDK 进程**
+（发起方 env 已证无影响，r1 预期错误为外部设计失误，已修正认知）。
+本批不再变化发起方，直接攻导入方：对比"裸成功 vs DPDK 失败"在内核
+交互层的差异，并用带 TLV 适配的 UMDK liburma（本地 7 提交）做换装
+试验——若 nvmf_tgt 换用 UMDK liburma 后 import 通过，修复方向即
+锁定（系统 0.0.3 与 rc2 内核组合缺陷）。
+
+**A. strace 对比（ioctl 序列级）**：
+```bash
+which strace || echo NO_STRACE
+# 成功侧：裸 import（p228 p2 / p231 流程）
+strace -f -o /tmp/p233_bare.strace -e trace=ioctl /tmp/p231 <ip> 4420
+# 失败侧：nvmf_tgt（handshake 时刻）
+strace -f -o /tmp/p233_tgt.strace -e trace=ioctl build/bin/nvmf_tgt ...
+# 提取两侧的 uburma 设备 ioctl（fd 指向 /dev/ub/* 的）：
+grep -n "ioctl" /tmp/p233_bare.strace | tail -40
+grep -n "ioctl" /tmp/p233_tgt.strace | tail -40
+# 带回：两侧 uburma ioctl 的 cmd 号/fd/序列差异（尤其 import 那条）
+```
+
+**B. UMDK liburma 调试换装（核心）**：
+```bash
+cd /home/tools/app/umdk && git log --oneline -3
+# 1. 找 urma_import_jetty 的用户态实现（src/urma/lib/urma/core/ 下）
+#    在其中加 fprintf(stderr) dump：入参 rjetty 全字段 + 解析到的
+#    device 名 + 本 context 的 uasid + 发往内核的 ucmd 关键字段 +
+#    ioctl 返回值/errno
+# 2. 重编 UMDK liburma（照 P2-24 D 的构建方式，产物 liburma.so.0.0.35+）
+# 3. nvmf_tgt 捎带换装跑 -M cpu 回环：
+LD_LIBRARY_PATH=/home/tools/app/umdk/lib:$CANN_LIB64:... nvmf_tgt ...
+#    （注意 P2-22 曾报 UMDK 版 "device open failed for ''"——若复现，
+#    带回 dump，那是另一个兼容点，也修）
+# 4. 记录：换装后 import 成败 + liburma 用户态 dump 原文
+# 判定：
+#   UMDK liburma 下 import OK → 修复方向锁定（换 UMDK liburma），
+#     就地跑 V2 🎯（urma_perf 也换 UMDK liburma）
+#   仍 FAIL → dump 即"发往内核的精确参数"，与裸成功侧的 dump 逐字段对比
+```
+
+**C. 内核调试参数（只读）**：
+```bash
+ls /sys/module/ubcore/parameters/ /sys/module/uburma/parameters/ 2>/dev/null
+cat 上述目录下可读参数（只读，不修改）
+```
+
+**D. 还原**（5 文件状态照旧；umdk 树的调试打印可留在工作区不入库，
+带回 diff 原文即可）。
+
+**回传**：A 项 ioctl 序列对比 + B 项换装结果与 dump 原文 + C 项清单，
+注明「批次 P2-33 完毕」。
 
 ### 指令 2026-10-09 #64：批次 P2-32（DPDK 触发器最小化——p232 = 裸探针 + spdk_env_init）
 
