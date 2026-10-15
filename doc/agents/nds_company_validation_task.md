@@ -244,6 +244,30 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P248（批次 P2-48 回执，用户带回）—— TP 域假设证伪（决定性反转）：裸自建 jetty 对 RA HBM 的 READ 成功
+
+**判定：A ✅ 清零区回读 UNCHANGED → 失败 WRITE 未发生 DMA（与
+status=9/ACK_TIMEOUT 一致）；B ❌ import_flag 对齐证伪（-M cpu 回归
+全通、-M npu 仍 -71/status=9）；C 🎯 **TP 域假设证伪**——p248 变体
+（p219 改造：自建 core→ctx/jfc/jetty（SPDK 同款）+ import_jetty(CTP)
++ import_seg(RA HBM) + READ 挂自建 jetty）**完全成功**（post status=0、
+cr.status=0、READ verify MATCH）→ **liburma 域自建 jetty 可以远端读
+RA 注册的 HBM 段**。D ✅ 还原（urma.c 已还原至 HEAD，变体 diff 留
+p248_log/c_variant.diff）。**
+
+- **排查矩阵再收口**：import_flag（CACHEABLE/R|W vs
+  NON_CACHEABLE/R|W|A）、TP 域（RA jetty vs 自建 jetty）双双排除。
+  同款形态（自建 jetty + import seg + READ）在裸路径成功、在 SPDK
+  数据面失败 → **差异只剩 SPDK 数据面代码与探针的逐行细节**。
+- **候选细节（外部待查）**：WR 构造字段（complete_enable/user_ctx/
+  op_flag）、sge 填充（addr/tseg/user_tseg）、post 的 wrapper 函数、
+  JFC 关联——需 p248 探针源码（在 133，外部本地无）与 SPDK
+  post 路径的字段 dump 做逐行 diff。
+- **下一步（#81）**：① 测试 agent 带回 p248_probe.cpp 全文（含
+  urma_read_remote 的 WR 构造原文）；② 外部出 SPDK post 路径的
+  字段 dump 注入（local_sge/remote_sge/wr 全字段打印）；③ 逐行
+  diff → 修复。
+
 ### 回执导入 2026-10-09 #P247（批次 P2-47 回执，用户带回）—— ABI 审计干净；失败精确定性 = pull WR 对 HBM 段 ACK 超时（status=9）
 
 **判定：A ✅ 数据路径 ABI 审计干净（CCDK vs ccdkcompat 除 seg_cfg
@@ -1973,6 +1997,59 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #81：批次 P2-49（逐行对比素材——p248 源码带回 + SPDK post 路径原始字节 dump）
+
+**背景**：P2-48 证伪全部低成本假设后，修法 = SPDK 数据面与 p248
+探针逐行对比。本批收集对比素材：① p248 探针源码带回（外部本地无
+此文件）；② SPDK post 路径的 wr/sge/seg 原始字节 dump。
+
+**A. 带回探针源码（只读）**：
+```bash
+# 1) p248 变体全文（含 urma_read_remote 的 WR 构造原文）：
+cp /home/tools/app/p248_log/p248_probe.cpp p249_log/p248_probe.cpp
+# 2) p219 原版（若仍存在）：
+cp /home/tools/app/p219_scratch/p219_probe.cpp p249_log/ 2>/dev/null
+# 原样带回两份 .cpp
+```
+
+**B. SPDK post 路径原始字节 dump（脚本等效注入，照既有模式）**：
+```c
+// lib/nvmf/urma.c nvmf_urma_post_data 内、urma_post_jetty_send_wr 调用前插入：
+{
+	const uint64_t *ww = (const uint64_t *)&wr;
+	const uint64_t *sw = (const uint64_t *)&ureq->remote_data.seg;
+	fprintf(stderr,
+		"NDS-PULL: wr80=%016lx %016lx %016lx %016lx %016lx %016lx %016lx %016lx %016lx %016lx\n",
+		ww[0], ww[1], ww[2], ww[3], ww[4],
+		ww[5], ww[6], ww[7], ww[8], ww[9]);
+	fprintf(stderr,
+		"NDS-PULL: seg48=%016lx %016lx %016lx %016lx %016lx %016lx\n",
+		sw[0], sw[1], sw[2], sw[3], sw[4], sw[5]);
+	fprintf(stderr,
+		"NDS-PULL: lsg=%p/%lu/%p/%p rsg=%p/%lu/%p/%p tj=%p pj=%p\n",
+		(void *)local_sge.addr, (unsigned long)local_sge.len,
+		(void *)local_sge.tseg, (void *)local_sge.user_tseg,
+		(void *)remote_sge.addr, (unsigned long)remote_sge.len,
+		(void *)remote_sge.tseg, (void *)remote_sge.user_tseg,
+		(void *)wr.tjetty, (void *)uqpair->jetty);
+}
+// （urma_seg_t=48B、urma_jfs_wr_t=80B，P2-47 审计已确认布局）
+```
+```bash
+# 重编 lib/nvmf + nvmf_tgt（CCDK-ABI 配置），跑 -M npu 触发失败，
+# 带回 target stderr 的 NDS-PULL 行（1 条 WRITE 即可）
+# 跑完还原 urma.c（反向注入或备份回填，勿 git checkout）
+```
+
+**C. 对照侧**：p248 的 urma_read_remote 里同样加 wr/sge 原始 dump
+（源码在 A 项带回后外部自行比对；若测试 agent 顺手加打印更好——
+格式：`NDS-READ: wr80=… seg48=… lsg=… rsg=…`，字段同上）。
+
+**D. 还原**：照旧。
+
+**回传**：A 项两份 .cpp + B 项 NDS-PULL 行（+ C 项 NDS-READ 行若有），
+注明「批次 P2-49 完毕」。
 
 ### 指令 2026-10-09 #80：批次 P2-48（-M npu 数据面：import_flag 对齐实验 + SSD 回读数据检查）
 
