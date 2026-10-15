@@ -244,6 +244,33 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P249（批次 P2-49 回执，用户带回）—— WR/seg 字节解码无缺陷；系统性差异浮出：HBM 侧 RA 栈完整度
+
+**判定：B ✅ 失败 pull 的 WR/seg 原始字节抓到（8 事件，第 8 个 = NPU
+WRITE）。逐字段解码（对照本地 umdk 头 urma_jfs_wr_t/urma_seg_t）：
+opcode=0x10（READ）✓、complete_enable=1 ✓、tjetty=对端 ✓、
+src={HBM VA 0x120000018000, len, tseg} ✓、dst={iobuf, tseg} ✓、
+seg={eid=本轮 RA 会话 eid, uasid=0, va=HBM VA, len=64K,
+attr=NOC+R|W|A, token_id 在位} ✓——**WR/seg 构造无缺陷**。
+C ✅ 成功侧对照（p248 自建 jetty READ）同格式 3 行。urma.c 已还原。**
+
+- **系统性差异（外部综合 24 批数据）**：所有**远端读成功**的场景，
+  HBM 侧进程都跑 **libnds 完整 nds_init 栈**（p228/p248/p219 的 P1
+  皆然，含 nds_update_route_info / nds_alloc_device_token / tsd 等
+  完整序列）；唯一失败场景（urma_perf）的 HBM 侧是**我们的手搓五步
+  精简 RA 序列**（RaInit→CtxInit→Cq/Qp→lmem register，缺
+  nds_update_route_info / nds_alloc_device_token 等）。
+- **失败机理候选**：远端读 {eid, uasid=0, va=HBM} 到达 NPU 设备后
+  无法完成/无应答（ACK 超限）——精简序列缺了某个使 HBM 可被远端
+  访问的环节（route/token/其他 nds_init 副作用）。
+- **修法（二合一：判决+修复）**：provider 的 RA 初始化整体**切换到
+  libnds**（nds_init + nds_buf_register + nds_get_segment_info），
+  使 urma_perf 的 HBM 侧状态与已验证工作流完全一致。libnds NEEDs
+  系统 liburma——与 urma_perf 已加载的系统库同源，无冲突（P2-24 D
+  的 507033 风险针对 UMDK 库场景，此处不适用）。
+- **前置（#82）**：取 libnds API 头文件与探针的 nds_init/nds_buf_
+  register/nds_get_segment_info 调用原文（外部本地无此源码）。
+
 ### 回执导入 2026-10-09 #P248（批次 P2-48 回执，用户带回）—— TP 域假设证伪（决定性反转）：裸自建 jetty 对 RA HBM 的 READ 成功
 
 **判定：A ✅ 清零区回读 UNCHANGED → 失败 WRITE 未发生 DMA（与
@@ -1997,6 +2024,41 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #82：批次 P2-50（libnds API 取证——为 provider 切换 libnds 做准备）
+
+**背景**：P2-49 锁定系统性差异：远端读成功的场景 HBM 侧都是 libnds
+完整 nds_init 栈；urma_perf 的手搓精简 RA 序列是唯一失败场景。修法 =
+provider 切换 libnds（判决+修复二合一）。本批取 libnds 的 API 原文。
+
+**A. libnds 头文件（只读）**：
+```bash
+# p228/p248 探针 include 的 nds 头（探针源码 include 段可查）：
+find /home/tools/app/colleague_c_repo -name "*.h" | xargs grep -ln "nds_init\b" 2>/dev/null | head -3
+# 带回：nds_init / nds_buf_register / nds_buf_deregister /
+#       nds_get_segment_info / nds_prepare_init_device 的**声明原文**
+#       （函数签名 + 参数结构体定义，含 NdsInitCfg/nds_segment_info_t 等）
+```
+
+**B. 探针调用原文（只读）**：
+```bash
+grep -n -B3 -A15 "nds_init\b" /home/tools/app/p249_log/p219_probe.cpp | head -60
+grep -n -B2 -A10 "nds_buf_register\|nds_get_segment_info" /home/tools/app/p249_log/p219_probe.cpp | head -50
+# 带回：p219 探针里这三个调用的**实参构造原文**（照 p249_log 的副本或
+# p219_scratch 现存源码）
+```
+
+**C. libnds 运行确认（只读）**：
+```bash
+ls -la /home/tools/app/colleague_c_repo/output/libnds.so
+ldd /home/tools/app/colleague_c_repo/output/libnds.so | head
+# p219/p248 跑通时的 LD_LIBRARY_PATH 里 libnds 的加载路径
+```
+
+**D. 约束**：全部只读；无重编；无现场变更。
+
+**回传**：A 项声明原文 + B 项调用原文 + C 项路径，注明
+「批次 P2-50 完毕」。
 
 ### 指令 2026-10-09 #81：批次 P2-49（逐行对比素材——p248 源码带回 + SPDK post 路径原始字节 dump）
 
