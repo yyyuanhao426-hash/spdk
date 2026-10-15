@@ -244,6 +244,29 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P243（批次 P2-43 回执，用户带回）—— 🎯 value 级烟枪：cfg6 与 cfg15 两字段裸/SPDK 不同（1 vs 0）
+
+**判定：嵌套 deref kprobe 一次挂载成功，两场景各 1 条 imp 事件，
+cfg 全值（128B）+ udata（32B）+ uctx（128B）原样带回。**
+**cfg 全值 diff**：
+```
+一致：cfg0/cfg1（eid）、cfg3/cfg4、cfg5（token 0xACFE）、cfg7~cfg11、
+      cfg13、cfg14
+差异：cfg2/12 = 被 import 的 jetty id（0x1602=5634 vs 0x160c=5644，
+      属不同 jetty 实例，正常）
+★★ cfg6  = 0x1（裸）vs 0x0（SPDK）★★
+★★ cfg15 = 0x1（裸）vs 0x0（SPDK）★★
+uctx 128B：两侧仅指针类字段不同，内容形态一致
+```
+- **意义**：用户可见的 import 参数两侧完全一致（eid/id/token/trans_
+  mode/flag/type/tp_type 全同），但内核收到的 cfg 里 cfg6/cfg15 两
+  字段不同——**这就是 20 批以来"每进程类别"差异的实体**。k5（键
+  offset 40，1 vs 0）大概率就是 cfg6/cfg15 之一或其派生。
+- **字段语义待认**：结构体定义在 `<ub/urma/ubcore_types.h>`（内核树
+  头文件，不在本地快照）——133 的 kernel-devel 里有（P2-8 编
+  urma 驱动用过）。#76 让测试 agent 带回头文件定义，机械映射
+  cfg6/cfg15 → 字段名 → 找 uburma/ubcore 的填充代码 → 修法落地。
+
 ### 回执导入 2026-10-09 #P242（批次 P2-42 回执，用户带回）—— context 序号假设证伪；k5 确认为"进程类别"标志
 
 **判定：A ❌ context 序号假设证伪——裸侧 1/2/3 个 context 全部
@@ -1825,6 +1848,34 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #76：批次 P2-44（头文件取证——ubcore_tjetty_cfg 字段布局，认出 cfg6/cfg15）
+
+**背景**：P2-43 已把差异钉到内核 import cfg 的两个字段（cfg6/cfg15，
+裸=1 / SPDK=0）。本批纯只读取证：把结构定义带回来，外部完成字段
+映射与根因认定。
+
+**A. 找到并带回结构定义（只读）**：
+```bash
+find /usr/src/kernels -path "*ub/urma/ubcore_types.h" 2>/dev/null | head -2
+# 若 kernel-devel 无，试（P2-8 编 urma 驱动时的头文件来源）：
+find /usr/src/kernels /lib/modules/$(uname -r)/build -name "ubcore_types.h" 2>/dev/null | head -2
+# 带回（原样贴回）：
+grep -n -A45 "struct ubcore_tjetty_cfg {" <找到的文件>
+# 以及相关枚举：
+grep -n -B2 -A8 "enum ubcore_tp_type\b" <找到的文件>
+grep -n -B2 -A8 "enum ubcore_target_type\b" <找到的文件>
+grep -n -B2 -A10 "union ubcore_tjetty_flag\b\|struct ubcore_tjetty_flag" <找到的文件>
+```
+
+**B. 顺带（只读）**：同文件里 `struct ubcore_ucontext`（或含 uasid/
+eid_index 的 ucontext 结构）定义一并带回——若 cfg6/cfg15 是从
+ucontext 填充的，需要它做第二层映射。
+
+**C. 约束**：全部只读；无探针、无重编、无现场变更。
+
+**回传**：A/B 项头文件原文，注明「批次 P2-44 完毕」。
+（本批极轻量——纯 grep + 贴文本。）
 
 ### 指令 2026-10-09 #75：批次 P2-43（内核态对象全量 dump——import cfg 全值 + ucontext 内存逐字节对比）
 
