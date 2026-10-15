@@ -244,6 +244,33 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P237（批次 P2-37 回执，用户带回）—— 🎯 触发面收窄至 SPDK transport 的 import 路径（env/EAL/JFC 全排除）
+
+**判定：E-A 🎯 urma_perf（DPDK, SPDK transport）对**已知健康的裸
+p237** import **失败**（内核栈与 nvmf_tgt 回环完全相同：reuse →
+get_tp_list -2 → tpid_priv -28）；E-C ❗ 反转数据：**p232（裸+完整
+spdk_env_init，直调 liburma）对同一 p237 import 全部 OK**（三个 env
+组合，bind 失败属握手后环节与本判无关）；E-B ✅ 裸侧 jfc×2 也 OK。
+→ **触发面 = "使用 SPDK nvme_urma transport 做 import 的进程"**
+（nvmf_tgt 与 urma_perf 皆是）；裸进程直调 liburma（即便带完整
+DPDK env）全部成功。D ✅ 还原（孤儿 tpid 未触碰）。**
+
+- **三方对照定格**（同一对端 p237，只换导入方）：
+  | 导入方 | import |
+  |---|---|
+  | urma_perf（SPDK transport） | ❌ get_tp_list -2 → tpid_priv -28 |
+  | nvmf_tgt（SPDK transport） | ❌ 同（P2-31~37 一致） |
+  | p232/p228/p231（直调 liburma，含带 env） | ✅ 全 OK |
+- **E-C 侧注**：三组合 bind_jetty FAILED(status=1) 属握手后 bind
+  环节（p237 未实现 bind 对接），与 import 结论无关。
+- **缺失观测（下一步第一优先）**：p232 成功路径的内核日志未抓——
+  它是 **reuse 命中**还是做了一次**成功的 GET_TP_LIST**？前者 →
+  查找键含 per-process 内部量（SPDK transport 与裸直调的差异在
+  ucontext/udata 构造）；后者 → GET_TP_LIST 本可成功，失败请求的
+  PID/内容有差异 → 对比两请求即得根因。
+- **工具升级（#70 预备）**：ftrace function tracer（set_ftrace_filter
+  = ubcore_*）可拿到两场景的**符号级调用树**，直接看出分叉函数名。
+
 ### 回执导入 2026-10-09 #P236（批次 P2-36 回执，用户带回）—— 孤儿自连接 tpid 坐实；uasid API 废弃无法对照；DPDK 导入方仍是唯一未测格子
 
 **判定：A ✅ tpid 8388644 创建事件早于备份窗口（极老残留，本窗口内
@@ -1684,6 +1711,55 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #70：批次 P2-38（p232 成功路径取证 + ftrace 符号级调用树对比）
+
+**背景**：P2-37 定格：同一健康对端，SPDK transport 导入必败、裸直调
+liburma 导入必成（env/EAL/JFC 均排除）。**缺失的关键观测 = p232 成功
+路径的内核日志**（reuse 命中？还是 GET_TP_LIST 成功？）——它决定下一
+分叉方向。本批补齐，并用 ftrace 拿符号级调用树。
+
+**E-A · p232 成功路径取证（level 8）**：
+```bash
+echo 8 > /sys/module/ubcore/parameters/g_ubcore_log_level
+echo 8 > /sys/module/uburma/parameters/g_uburma_log_level
+dmesg -C    # 旧内容先备份
+# 起 /tmp/p237 4421（裸 target）
+# SPDK_ENV=1 /tmp/p232 <ip> 4421    （成功路径）
+dmesg > p238_log/p232_ok.txt        # 恢复 level 5
+# 带回判定：
+#   Q-A1: p232 的 import 走了哪条路——"tpid … active"（reuse 命中，
+#         8388644 或新值）还是 get_tp_list 成功？
+#   Q-A2: 若 reuse 命中——命中键里的 jetty id 是什么（p232 自建了
+#         jetty，peer 是 p237 的 jetty）？
+```
+
+**E-B · urma_perf 失败路径同窗对照**：
+```bash
+dmesg -C
+# urma_perf -M cpu → p237（失败路径）
+dmesg > p238_log/perf_fail.txt      # 恢复 level 5
+# 与 E-A 同窗格式，便于逐行 diff
+```
+
+**E-C · ftrace 符号级调用树（分叉函数名直读）**：
+```bash
+cd /sys/kernel/debug/tracing
+echo 0 > tracing_on
+echo function > current_tracer
+echo 'ubcore_*' > set_ftrace_filter
+echo 1 > tracing_on
+# 跑一次 p232 成功 import → echo 0 > tracing_on; cat trace > p238_log/ftrace_p232.txt
+echo 1 > tracing_on
+# 跑一次 urma_perf 失败 import → echo 0 > tracing_on; cat trace > p238_log/ftrace_perf.txt
+echo NOP > current_tracer    # 还原
+# 带回两份调用树——分叉的第一个函数名 = 根因所在函数
+```
+
+**E-D · 还原**：level 5、ftrace NOP、进程清理、5 文件照旧。
+
+**回传**：Q-A1/Q-A2 答案 + E-B 对照 + 两份 ftrace 调用树（至少分叉
+点前后各 20 行），注明「批次 P2-38 完毕」。
 
 ### 指令 2026-10-09 #69：批次 P2-37（最后一块拼图——DPDK 进程对"已知健康对端"做 import 的首次观测）
 
