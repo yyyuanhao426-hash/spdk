@@ -140,6 +140,8 @@ static int probe_open(struct probe_env *e, const char *tag)
 	return 0;
 }
 
+static urma_jfc_t *g_jfcs[8];
+
 static int create_resources(struct probe_env *e, const char *tag,
 			    int create_jfc, int create_jfr,
 			    urma_jfc_t **jfc_out, urma_jfr_t **jfr_out)
@@ -148,11 +150,16 @@ static int create_resources(struct probe_env *e, const char *tag,
 	uint32_t jfr_depth = env_u32("JFR_DEPTH", 2048);
 	uint32_t jfr_token = env_u32("JFR_TOKEN", 0xACFE);
 	uint32_t max_sge = env_u32("MAX_SGE", 5);
+	uint32_t jfc_cnt = env_u32("P2_JFC_CNT", 1);
 	urma_jfc_t *jfc = NULL;
 	urma_jfr_t *jfr = NULL;
+	uint32_t k;
 
 	*jfc_out = NULL;
 	*jfr_out = NULL;
+	if (jfc_cnt == 0 || jfc_cnt > 8) {
+		jfc_cnt = 1;
+	}
 	/* clamp to device cap (P2-28: uncapped defaults exceed max_jfr_sge) */
 	if (e->attr.dev_cap.max_jfc_depth != 0 && jfc_depth > e->attr.dev_cap.max_jfc_depth) {
 		jfc_depth = e->attr.dev_cap.max_jfc_depth;
@@ -167,12 +174,16 @@ static int create_resources(struct probe_env *e, const char *tag,
 		urma_jfc_cfg_t fc = {};
 
 		fc.depth = jfc_depth;
-		jfc = urma_create_jfc(e->ctx, &fc);
-		if (jfc == NULL) {
-			printf("[%s] create_jfc(depth %u) failed\n", tag, jfc_depth);
-			return -1;
+		for (k = 0; k < jfc_cnt; k++) {
+			g_jfcs[k] = urma_create_jfc(e->ctx, &fc);
+			if (g_jfcs[k] == NULL) {
+				printf("[%s] create_jfc %u (depth %u) failed\n",
+				       tag, k, jfc_depth);
+				return -1;
+			}
 		}
-		printf("[%s] jfc depth=%u ok\n", tag, jfc_depth);
+		jfc = g_jfcs[0];
+		printf("[%s] jfc depth=%u cnt=%u ok\n", tag, jfc_depth, jfc_cnt);
 	}
 	if (create_jfr) {
 		urma_jfr_cfg_t fr = {};

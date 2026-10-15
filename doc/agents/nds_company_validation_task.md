@@ -244,6 +244,31 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P236（批次 P2-36 回执，用户带回）—— 孤儿自连接 tpid 坐实；uasid API 废弃无法对照；DPDK 导入方仍是唯一未测格子
+
+**判定：A ✅ tpid 8388644 创建事件早于备份窗口（极老残留，本窗口内
+从未建立它，窗口内 vtpn 仅到 8388640/8388641）；B 🎯 urma_admin 具备
+tpid 表 dump：**8388644 = local_eid==peer_eid（df08:0b00 自连接）的
+CTP，ref_cnt=2 常驻孤儿**（creator 死后仍存活，D 项实测）；且
+`tpreuse` 表 10 设备全空——内核日志的 "try to get tpid reuse" 与
+urma_admin 的 tpreuse **不是同一张表**。C ⚠️ uasid 对照无法执行：
+urma_get_uasid 为废弃 API（provider op 置 NULL），四方恒 fail——
+uasid 假设暂时不可证实/证伪（dmesg 全缓冲 uasid 0 次）。D ✅ 残留
+条目独立于 creator（kill 后 import 仍 OK）。E ✅ 还原。**
+
+- **B 项细节**：urma_admin（/usr/bin/urma_admin, Sep 3）支持
+  `show dev <DEV> {tp|tpreuse|jfc|jfs|jfr|jetty|seg|rc}` 等；legacy
+  list_res 不支持 tp 查询。`show dev udmac0d1e2 tp 8388644` →
+  status=RESET, alloced=0, ref_cnt=3。
+- **矩阵现状**：裸导入方依赖孤儿自连接条目成功；DPDK 导入方失败。
+  **从未观测：DPDK 进程对一个已知健康的对端做 import**（回环中
+  target 先死，initiator 的 import 从未执行到）。
+- **下一步（外部采纳）**：① 写裸 target 探针（listen+accept+HELLO
+  应答），让 urma_perf（DPDK）对它发起连接——首次观测 DPDK import
+  对已知健康对端的结果；② 裸侧补 jfc×2 变体（nvmf_tgt 建 2 个
+  JFC，此前只测过 1 个）；③ **禁止删除孤儿条目**（共享设备，
+  ref_cnt>0，他租户可能在使用）。
+
 ### 回执导入 2026-10-09 #P235（批次 P2-35 回执，用户带回）—— reuse 表是历史残留；GET_TP_LIST 本机从未成功过
 
 **判定（Q1~Q5 全答）：① creator/initiator 的 create_jetty **都不走
@@ -1659,6 +1684,63 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #69：批次 P2-37（最后一块拼图——DPDK 进程对"已知健康对端"做 import 的首次观测）
+
+**背景**：P2-36 确认：① 孤儿 tpid 8388644 = self-connection CTP
+（urma_admin 可 dump，独立于 creator，**禁止删除**——共享设备
+ref_cnt>0）；② uasid 对照不可做（urma_get_uasid 为废弃 API 恒
+fail）；③ 矩阵从未观测过"**DPDK 进程对一个已知健康的对端做
+import**"——回环里 DPDK target 先死，initiator 的 import 从未执行。
+本批补上这块拼图：外部已备裸 target 探针 `p237_fake_tgt.c`。
+
+**A. 编译探针**：
+```bash
+gcc -O2 -o /tmp/p237 p237_fake_tgt.c \
+  -I/usr/include/ub/umdk/urma -L/usr/lib64 -l:liburma.so -lpthread
+```
+
+**E-A（核心）· urma_perf（DPDK）→ 裸 p237 target**：
+```bash
+# 终端 1：/tmp/p237 4421        （监听，等 urma_perf 连接）
+# 终端 2：
+SPDK_URMA_DEV_NAME=udmac0d1e2 \
+LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64:/usr/lib64 \
+  urma_perf -r 'trtype:URMA adrfam:IPv4 traddr:141.61.133.123 trsvcid:4421 subnqn:nqn.2026-01.io.spdk:p237' \
+  -M cpu -g 0 -t 5 -n 1 -l 0
+# （trid 格式照 P2-25 的合法写法；端口用 4421 避开他人 4420）
+# 观察 urma_perf 侧：attach 是否走过 import（level 8 dmesg 过滤该 PID：
+#   有无 "Active tp" / "tpid … active" / get_tp_list 失败行）
+# 判定：
+#   urma_perf 的 import OK → DPDK 导入方对健康对端没问题！矛盾指向
+#     nvmf_tgt 特有差异（jfc×2 / EAL 时序）→ 转 E-B
+#   urma_perf 的 import FAIL → 🎯 DPDK 导入方缺陷完全隔离复现
+#     （对端是健康的裸创建方）→ 转 E-C 二分
+# p237 侧同步记录：收到 HELLO 后是否 peer 断连
+```
+
+**E-B · 裸侧 jfc×2 变体（对齐 nvmf_tgt 的 JFC 数）**：
+```bash
+# p228 探针加 P2_JFC_CNT 旋钮（rev4，外部已 push；循环建 N 个 JFC，
+# jfr/jetty 用第 1 个）：
+P2_CREATE_JFC=1 P2_JFC_CNT=2 P2_CREATE_JFR=1 p228 p1 ...
+P2_CREATE_JFC=1 P2_JFC_CNT=2 P2_CREATE_JFR=1 p228 p2 <eid> <id> 0xACFE
+# 若 jfc×2 后裸 import 也失败 → 触发器=JFC 数量（好修：SPDK jfc_count=1）
+```
+
+**E-C ·（若 E-A 失败）DPDK 触发器二分**：
+```bash
+# p232（裸探针+spdk_env_init）作为发起方打 p237：
+SPDK_ENV=0  p232 <ip> 4421     # 裸对照
+SPDK_ENV=1  p232 <ip> 4421     # 带 env
+SPDK_ENV=1 ENV_ORDER_URMA_FIRST=1 p232 <ip> 4421
+# 哪个组合 import 失败 → DPDK 触发面定位到具体 env 行为
+```
+
+**D. 还原**（照旧；p237 记得 getchar 后退出/kill；禁删孤儿 tpid）。
+
+**回传**：E-A 双侧日志 + dmesg 关键行；E-B 结果；E-C 矩阵（若做），
+注明「批次 P2-37 完毕」。
 
 ### 指令 2026-10-09 #68：批次 P2-36（uasid 对照 + tpid 残留溯源——reuse 键不匹配的最终判定）
 
