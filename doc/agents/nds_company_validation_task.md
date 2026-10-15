@@ -244,6 +244,31 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P247（批次 P2-47 回执，用户带回）—— ABI 审计干净；失败精确定性 = pull WR 对 HBM 段 ACK 超时（status=9）
+
+**判定：A ✅ 数据路径 ABI 审计干净（CCDK vs ccdkcompat 除 seg_cfg
+尾部 is_gpu_seg 外全同；CCDK vs umdk 仅 3 处已知且已被 P2-45 全头
+切换消除）→ **无第二处 ABI 错位**；B 🎯 target 侧 W4→W10 全管线
+（import_seg 用户态成功 123 ticks、iobuf 注册、post WR、SSD 执行、
+回包）后 poll group 报 **completion error status=9, opcode=1（入向
+WRITE）**。D ✅ 还原（ccdkcompat 产物保留）。**
+
+- **status=9 语义（外部查 umdk 枚举 urma_cr_status_t）**：
+  **URMA_CR_ACK_TIMEOUT_ERR = 9**（重传超过最大次数）——target 的
+  pull WR（对 HBM 段的远端 READ）无应答，重传 11 次
+  （ubcore_max_retry_cnt=11）后放弃。**即"该 TP 对 HBM 段的远端访问
+  无应答"**，非 ABI、非参数校验错误。
+- **机制候选（两个，按成本排序）**：
+  ① **import_flag 不一致**（一行改动可验）：SPDK target 的
+     import_seg flag = {CACHEABLE, R|W}，而 P2-19 工作流实测值 =
+     {NON_CACHEABLE, R|W|A, SEG_NOMAP}——cacheable/access 与 RA 注册
+     属性不匹配可能导致远端读无应答。
+  ② **TP 域不匹配**（结构性）：P2-19 的数据面 READ 挂在 **import 的
+     RA jetty**（RA 域 TP）；SPDK 数据面挂在 target 自己的 jetty
+     （liburma 域 TP，reuse 的孤儿自连接 CTP）——RA/HCCP 注册的 HBM
+     段可能仅 RA 域 TP 可达。若坐实，修法 = Module C 全量（RA jetty
+     坐标交换 + 数据面改挂 RA jetty），改动较大但 P2-19 已证可行。
+
 ### 回执导入 2026-10-09 #P246（批次 P2-46 回执，用户带回）—— direct route 生效确认；失败点锁定 target 侧 import_seg 用户态失败
 
 **判定：A ✅ CCDK-ABI 重建固化成功（持久目录 /home/tools/app/ccdkcompat
@@ -1948,6 +1973,55 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #80：批次 P2-48（-M npu 数据面：import_flag 对齐实验 + SSD 回读数据检查）
+
+**背景**：P2-47 定性 status=9 = ACK_TIMEOUT（pull WR 对 HBM 段无应答）。
+两个候选修法按成本排序：① import_flag 对齐（一行）；② TP 域不匹配
+（需 Module C 全量）。本批先验 ①，并顺带用 SSD 回读判断 DMA 是否
+发生过。
+
+**A. SSD 回读数据检查（先做，判断 DMA 是否发生）**：
+```bash
+# -M npu 失败跑完后（Verification WRITE 失败即停）：
+# 1. 记下本次 HBM pattern（urma_perf 写入 HBM 的 pattern/seed）
+# 2. dd 读 loop.img 对应 LBA 区域（与 WRITE 的 offset 对应）：
+dd if=loop.img bs=512 skip=<起始LBA> count=<写入LBA数> | md5sum
+#    并与 HBM pattern 的预期 md5 对照
+# 判定：
+#   读回 = pattern   → DMA 实际成功了！status=9 另有蹊跷（外部重审）
+#   读回 = 0/垃圾     → pull WR 未真正读到 HBM（与 ACK_TIMEOUT 一致）
+```
+
+**B. import_flag 对齐实验（一行改动，核心）**：
+```bash
+# lib/nvmf/urma.c nvmf_urma_post_data 内（约 L938）：
+#   import_flag.bs.cacheable = URMA_CACHEABLE  → 改 URMA_NON_CACHEABLE
+#   import_flag.bs.access    = R|W             → 改 R|W|ATOMIC（加 URMA_ACCESS_ATOMIC）
+#   （mapping=SEG_NOMAP 不动——对齐 P2-19 实测值
+#     {NON_CACHEABLE, R|W|A, SEG_NOMAP}，nds_urma_import_remote_seg 同款）
+# 重编 lib/nvmf + nvmf_tgt（CCDK-ABI 配置照 #78 A）→ -M npu 重跑：
+#   数据面通过 → 🎯 就地 V2！
+#   仍 status=9/-71 → ① 证伪，转 C
+# 注：先在 -M cpu 回归一遍（改 flag 对 host 路径的影响需排除）
+```
+
+**C.（若 B 证伪）TP 域机制探针（p219 变体）**：
+```bash
+# /home/tools/app/p219_scratch/p219_probe 有完整数据面实现（import seg
+# + import RA jetty + post READ）。
+# 变体实验：把数据面 READ 的发起 jetty 从"import 的 RA jetty"改为
+# "自己新建的 jetty（bound 对，SPDK 同款）"——其余不动：
+#   自建 jetty 路径 → 复现 status=9 = TP 域假设坐实 🎯
+#   仍成功 → TP 域假设也证伪，回到 SPDK 代码逐行对比（外部做）
+# （p219 源码在 /home/tools/app/p219_scratch/；改动最小化，留 diff）
+```
+
+**D. 还原**：照旧（level 5、进程清、5 文件照旧；B 的源码改动若无效
+则还原并留 diff；ccdkcompat 产物保留）。
+
+**回传**：A 项回读 md5 对照 + B 项结果（-M cpu 回归 + -M npu）+
+C 项（若做），注明「批次 P2-48 完毕」。
 
 ### 指令 2026-10-09 #79：批次 P2-47（数据路径 ABI 全类型审计 + target 侧 stderr 取证）
 
