@@ -244,6 +244,35 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P246（批次 P2-46 回执，用户带回）—— direct route 生效确认；失败点锁定 target 侧 import_seg 用户态失败
+
+**判定：A ✅ CCDK-ABI 重建固化成功（持久目录 /home/tools/app/ccdkcompat
++ 重编脚本 + offsetof 校验 + -M cpu 回归 6059/0 全通；产物保留未回滚，
+原 umdk 版备份 p246_log/bak/）；B 🎯 -M npu 取证：**
+- **direct route 生效**：stderr 无任何 fallback 文案；RA jetty ready
+  (uasid=0 jetty_id=9484) + RA/HCCP context ready。
+- **双方 jetty import 全部 reuse 命中**（tpid 8388644，target 3 次 +
+  initiator 侧 3 次，内核零错误）。
+- **失败点锁定**：initiator 数据面 Verification WRITE →
+  `no matching ureq for cid=0` → `CQ transport error -71 (Protocol
+  error)`；**内核窗口内本设备无任何 ubcore_import_seg**（唯一 1 条在
+  他设备 udmac1d1e2，属他租户）→ **target 的 urma_import_seg 未到达
+  内核 ioctl——在 liburma 用户态即失败**，随后错误完成引发 initiator
+  -71。D ✅ 还原（本批产物保留未回滚）。**
+
+- **头号嫌疑（外部判定）**：**同类 ABI 错位的第二处**——P2-45 只审计
+  并修复了 import_jetty_flag；数据路径上还有 `urma_seg_t`、
+  `urma_import_seg_flag_t`、`urma_sge_t`、`urma_jfs_wr_t` 等类型，
+  UMDK 头与 CCDK 头可能仍有布局差异（如 import_seg_flag 是否也带
+  user_tag 扩展）→ target 的 urma_import_seg 按错位布局解析/构造 →
+  liburma 客户端校验即拒。
+- **次要候选**：nvmf_urma_post_data 的 import_flag 取值与 P2-19 工作
+  流不一致（SPDK：CACHEABLE + R|W；P2-19：NON_CACHEABLE + R|W|A）
+  ——待 ABI 审计排除后再对比。
+- **下一步（#79）**：① 双头文件 ABI 全类型审计（offsetof 矩阵）；
+  ② 抓 target 侧 stderr（nvmf_tgt 控制台）——W5 import_seg 的调用
+  与返回；③ 依审计结果修 compat 头或对齐 flag。
+
 ### 回执导入 2026-10-09 #P245（批次 P2-45 回执，用户带回）—— 🎯🎯 import 根因坐实并修复验证：编译头/运行库 ABI 错位；-M cpu 回环全通！
 
 **判定：A ❌ 枚举顺序假设证伪（5 处 urma_types.h 枚举完全相同）；
@@ -1919,6 +1948,52 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #79：批次 P2-47（数据路径 ABI 全类型审计 + target 侧 stderr 取证）
+
+**背景**：P2-46 锁定：direct route 生效、jetty import 全通，但 target
+的 urma_import_seg 在用户态失败（未到内核）→ initiator -71。头号嫌疑
+= **同类 ABI 错位第二处**（import_jetty_flag 修了，数据路径其他类型
+未审计）。
+
+**A. ABI 全类型审计（编译期 offsetof 矩阵，核心）**：
+```bash
+# 写一个 offsetof 探针程序（如 /tmp/abi_audit.c），分别用两套头编译：
+#   -I/usr/include/ub/umdk/urma      （CCDK ABI 基准）
+#   -I/home/tools/app/ccdkcompat/include/ub/umdk/urma  （当前 SPDK 用）
+# 对以下类型各输出 sizeof + 全字段 offsetof（照 P2-45 的审计程序扩容）：
+#   urma_seg_t（ubva/len/attr/token_id 全字段）
+#   urma_ubva_t
+#   urma_import_seg_flag_t
+#   urma_import_jetty_flag_t（回归项，应已一致）
+#   urma_sge_t
+#   urma_jfs_wr_t / urma_jfr_wr_t（如存在）
+#   urma_jfs_cfg_t / urma_jfr_cfg_t / urma_jfc_cfg_t
+#   urma_seg_cfg_t（回归项：is_gpu_seg 尾部追加应只差该字段）
+#   urma_eid_t / urma_token_t / urma_device_attr_t
+# 判定：除 seg_cfg 尾部 is_gpu_seg 外，任何字段 offset/size 差异 = 嫌疑
+```
+
+**B. target 侧 stderr 取证（同 -M npu 窗口）**：
+```bash
+# nvmf_tgt 前台起（stderr 重定向到文件），跑 urma_perf -M npu：
+#   nvmf_tgt ... 2> p247_log/tgt_stderr.txt
+# 带回：WRITE capsule 到达后 target 侧的全部输出——
+#   W4/W5 阶段日志、import_seg 调用与返回（若 liburma/SPDK 有错误打印）
+# 同时 initiator stderr 照 P2-46 b 项留存
+```
+
+**C.（若 A 发现 import_seg_flag/urma_seg_t 差异）修 compat 头**：
+```bash
+# 按差异修 /home/tools/app/ccdkcompat 头副本（如 import_seg_flag 的
+# user_tag 剥离），offsetof 复验 → 重编 → -M npu 重跑：
+#   数据面通过 → 就地 V2 🎯
+```
+
+**D. 还原**：照旧（level 5、进程清、5 文件照旧；ccdkcompat 产物保留）。
+
+**回传**：A 项审计矩阵（两列 offset 对照）+ B 项 target stderr 原文
++ C 项结果（若做），注明「批次 P2-47 完毕」。
 
 ### 指令 2026-10-09 #78：批次 P2-46（重建 CCDK-ABI 二进制 + -M npu 数据面 -71 取证）
 
