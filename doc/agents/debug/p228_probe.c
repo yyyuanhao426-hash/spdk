@@ -123,6 +123,15 @@ static int probe_open(struct probe_env *e, const char *tag)
 		printf("[%s] create_context failed\n", tag);
 		return -1;
 	}
+	{
+		uint32_t uasid = 0xFFFFFFFF;
+
+		if (urma_get_uasid(&uasid) == URMA_SUCCESS) {
+			printf("[%s] uasid=%u (0x%x)\n", tag, uasid, uasid);
+		} else {
+			printf("[%s] urma_get_uasid failed\n", tag);
+		}
+	}
 	if (urma_query_device(e->dev, &e->attr) != URMA_SUCCESS) {
 		printf("[%s] query_device failed (cap clamp disabled)\n", tag);
 		memset(&e->attr, 0, sizeof(e->attr));

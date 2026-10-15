@@ -197,6 +197,15 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	{
+		uint32_t uasid = 0xFFFFFFFF;
+
+		if (urma_get_uasid(&uasid) == URMA_SUCCESS) {
+			printf("[p231] uasid=%u (0x%x)\n", uasid, uasid);
+		} else {
+			printf("[p231] urma_get_uasid failed\n");
+		}
+	}
+	{
 		urma_device_attr_t dev_attr;
 
 		memset(&dev_attr, 0, sizeof(dev_attr));

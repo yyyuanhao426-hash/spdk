@@ -244,6 +244,36 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P235（批次 P2-35 回执，用户带回）—— reuse 表是历史残留；GET_TP_LIST 本机从未成功过
+
+**判定（Q1~Q5 全答）：① creator/initiator 的 create_jetty **都不走
+compat、不建 tpid**（Q1=Q3=否）——P2-34 的"建 jetty 路径差异"假设再
+证伪；② 被复用的 tpid 8388644 **不是本窗口所建，是更早的历史残留**
+（跨批次稳定复用：P2-34 d4 与本批两次同键命中，而两次的 jetty id 全
+新随机 61038/65356）；③ **GET_TP_LIST 在本机从未成功过**——只有两种
+形态：复用命中（不查询）或查询恒 -2。**
+
+- **推论链**：reuse 键不含 jetty id（新随机 id 每次都能命中同一残留
+  条目）→ 键只剩 {local_eid, peer_eid, trans_type} 量级 → 与
+  nvmf_tgt 的 import 键完全相同 → **键同而命中不同 = 查找还用了
+  per-process 的内核内部量**。头号候选：**uasid**（urma_init 时分配；
+  本地快照 tpid_key={local_eid,peer_eid,tag,local_jetty_id,
+  peer_jetty_id}，但运行内核是带"tpid reuse"的新版本，键定义可能
+  不同——若含 uasid/PID，且裸进程与 DPDK 进程取值不同，全部现象
+  一次解释：残留条目属于旧的 uasid → 裸进程恰好同值命中 →
+  nvmf_tgt 异值未命中 → 落入从未成功过的 GET_TP_LIST）。
+- **另注意**：本批 level=8+dmesg -C 记录了全机日志（133 有其他租户
+  高频 URMA 活动，单 PID 单窗口 367 行 create_tpid_priv）——结论均
+  按 PID 过滤；dmesg 旧内容已备份 dmesg_before.txt。
+- **E-C 建议（测试 agent）**：核对 8388644 是否为跨进程/跨轮次持久
+  残留——若是，"裸成功"依赖残留态，干净环境下裸 import 亦可能失败
+  （与 target 同因）。
+- **下一步（外部采纳）**：三个低成本决定性实验：① 在备份的
+  dmesg_before.txt 里找 8388644 的**创建事件**（哪个进程/何时/何
+  操作）；② urma_admin 是否有 TP/tpid 表 dump 能力；③ **各进程
+  urma_get_uasid() 取值对照**（裸 p1/p2、p231、nvmf_tgt 注入打印）
+  ——若裸=0 且 DPDK≠0，根因即坐实。
+
 ### 回执导入 2026-10-09 #P234（批次 P2-34 回执，用户带回）—— 🎯 决定性分叉点：tpid reuse 命中 vs 未命中
 
 **判定：A ❌ "importer 先建本地 jetty"假设证伪（裸侧先建 jetty 后
@@ -1629,6 +1659,58 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #68：批次 P2-36（uasid 对照 + tpid 残留溯源——reuse 键不匹配的最终判定）
+
+**背景**：P2-35 锁定矛盾——reuse 键（协议层）完全相同，裸进程命中
+历史残留 tpid 8388644（跨批次稳定，两次运行的 jetty id 全新随机仍
+命中 → 键不含 jetty id），DPDK 进程不命中；且 GET_TP_LIST 本机从未
+成功。**键同结果不同 = 查找用了 per-process 内部量，头号候选
+uasid**。本批三个实验判定。
+
+**A. 历史残留溯源（只读）**：
+```bash
+grep -n "8388644" p235_log/dmesg_before.txt p235_log/*.txt | head -20
+# 找 8388644 的创建/激活事件（哪个 PID、什么操作、什么时间）
+# 若 dmesg_before 里也无创建行 → 条目早于备份窗口（极老残留）
+```
+
+**B. urma_admin 表 dump 能力（只读）**：
+```bash
+urma_admin --help 2>&1 | head -40
+# 找有无 tp/tpid/连接表 dump 子命令；有则 dump 并 grep 8388644
+```
+
+**C. uasid 对照（决定性）**：
+```bash
+# p228/p231 探针已升级（context 创建后打印 uasid=…），重编后：
+# 1) p228 p1 → 记录 uasid
+# 2) p228 p2（import 成功路径）→ 记录 uasid
+# 3) p231 → 记录 uasid
+# 4) nvmf_tgt：用既有脚本注入方式，在 spdk_urma_device_open 成功后加：
+#    { uint32_t u=0xFFFFFFFF; urma_get_uasid(&u);
+#      fprintf(stderr, "NDS-DBG: tgt uasid=%u\n", u); }
+#    （urma_get_uasid 是 liburma 公开 API，urma_api.h）
+# 判定：
+#   裸侧 uasid 相同且 nvmf_tgt 不同 → 🎯 根因坐实（reuse 键含 uasid，
+#     两类进程 uasid 不同）→ 下一步查"uasid 为何不同"（urma_init 分配
+#     逻辑/管理面分配路径），修复方向随之确定
+#   全部相同 → uasid 排除，转 D
+```
+
+**D.（若 C 全同）残留依赖实验**：
+```bash
+# p1 建资源后 kill 掉（jetty 销毁），再起 p2 import：
+#   仍 OK → 残留条目独立于 creator 存活（泄漏/orphan），键与 creator
+#     无关 → 与 nvmf_tgt 的差异只剩"DPDK 进程"本身（回到 env 链，
+#     但此时已知 TLV/uasid 均同，需 ftrace kprobe 抓 reuse 查找键）
+#   变 FAIL → 条目生命周期绑定 creator → 重新审视时序
+```
+
+**E. 还原**（照旧；nvmf_tgt 注入用反向操作清除）。
+
+**回传**：A 项溯源结果 + B 项能力清单 + C 项四方 uasid 值 + D 项
+（若做），注明「批次 P2-36 完毕」。
 
 ### 指令 2026-10-09 #67：批次 P2-35（tpid reuse 溯源——level 8 全程对比两场景的 jetty 创建/激活路径）
 
