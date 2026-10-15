@@ -244,6 +244,23 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P242（批次 P2-42 回执，用户带回）—— context 序号假设证伪；k5 确认为"进程类别"标志
+
+**判定：A ❌ context 序号假设证伪——裸侧 1/2/3 个 context 全部
+import 成功且均 reuse 命中（k5 恒 1，hash 恒 0x4bc2c482）；urma_perf
+对照恒 k5=0（hash 0x6cdaa8cd）。B 跳过（未坐实）；C ✅ 键重抓确认；
+D ✅ 还原。**
+
+- **累积结论（P2-42 增量）**：k5（键 offset 40）是"每进程类别"标志：
+  裸进程类（p228/p232/p231，任意 context 数/JFC 数/env）恒 1；
+  SPDK transport 进程（nvmf_tgt/urma_perf）恒 0。已排除的决定因素：
+  JFC 数量、context 序号/数量、env/EAL、创建时序、全部创建参数、
+  对端健康度。
+- **静态推理已到极限**：剩余差异只能在内核态对象里（ucontext 字段
+  /import cfg 全值）——下一批用嵌套 deref kprobe 把
+  ubcore_import_jetty(dev, cfg, udata) 的三块内存全量 dump，两场景
+  逐字节对比。
+
 ### 回执导入 2026-10-09 #P241（批次 P2-41 回执，用户带回）—— JFC 数量假设证伪；k5 与进程类别绑定的规律更干净
 
 **判定：A ❌ SPDK_URMA_JFC_COUNT=1 生效确认（内核 create_jfc 仅 1 次）
@@ -1808,6 +1825,45 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #75：批次 P2-43（内核态对象全量 dump——import cfg 全值 + ucontext 内存逐字节对比）
+
+**背景**：k5（键 offset 40）已确认为"进程类别"标志（裸恒 1 / SPDK
+恒 0），与一切用户态可控量无关。剩余差异只能在内核态：import 的
+cfg 全值或调用者 ucontext 的内容。本批用嵌套 deref kprobe 全量抓取。
+
+**A. kprobe 挂载（root，debugfs）**：
+```bash
+cd /sys/kernel/debug/tracing
+# ubcore_import_jetty(dev=x0, cfg=x1, udata=x2)——本地快照签名，运行内核
+# 已在 ftrace 确认存在。dump：cfg 128B + udata 32B + uctx（经 udata+0 解引用）128B：
+echo 'p:imp ubcore_import_jetty cfg0=+0(%x1):x64 cfg1=+8(%x1):x64 cfg2=+16(%x1):x64 cfg3=+24(%x1):x64 cfg4=+32(%x1):x64 cfg5=+40(%x1):x64 cfg6=+48(%x1):x64 cfg7=+56(%x1):x64 cfg8=+64(%x1):x64 cfg9=+72(%x1):x64 cfg10=+80(%x1):x64 cfg11=+88(%x1):x64 cfg12=+96(%x1):x64 cfg13=+104(%x1):x64 cfg14=+112(%x1):x64 cfg15=+120(%x1):x64 ud0=+0(%x2):x64 ud1=+8(%x2):x64 ud2=+16(%x2):x64 ud3=+24(%x2):x64 uc0=+0(+0(%x2)):x64 uc1=+8(+0(%x2)):x64 uc2=+16(+0(%x2)):x64 uc3=+24(+0(%x2)):x64 uc4=+32(+0(%x2)):x64 uc5=+40(+0(%x2)):x64 uc6=+48(+0(%x2)):x64 uc7=+56(+0(%x2)):x64 uc8=+64(+0(%x2)):x64 uc9=+72(+0(%x2)):x64 uc10=+80(+0(%x2)):x64 uc11=+88(+0(%x2)):x64 uc12=+96(+0(%x2)):x64 uc13=+104(+0(%x2)):x64 uc14=+112(+0(%x2)):x64 uc15=+120(+0(%x2)):x64' > kprobe_events
+echo 1 > events/kprobes/imp/enable
+# 若嵌套 deref 报错：去掉 uc* 组先抓 cfg+udata，ucx 改用两步法
+#（先记 ud0 的 uctx 指针，再挂第二探针到 ubcore_import_jetty_ex 对
+#  同对象补抓）
+```
+
+**B. 两场景各抓一次**：
+```bash
+echo 1 > tracing_on
+# 1) 裸成功：p228 p1 → p232（或 p228 p2）
+echo 0 > tracing_on; cp trace p243_log/bare.txt
+echo 1 > tracing_on
+# 2) SPDK 失败：urma_perf -M cpu → p237
+echo 0 > tracing_on; cp trace p243_log/spdk.txt
+```
+
+**C. 带回**：两份 trace 原文（import 行及前后各数行）。**字节原样，
+不做语义解读**。外部将：
+- 先 diff cfg 全值（验证 eid/id/token/flag/tp_type 等 value 级一致性
+  ——P2-33 只对比过 tag/len 结构，value 级未验过！）
+- 再 diff uctx 128B——任何 per-class 字段（uasid/uid/flags）直接显形
+
+**D. 还原**：kprobe 清（echo -:imp）、tracer=nop、level 5、进程清、
+5 文件照旧。
+
+**回传**：两份 trace，注明「批次 P2-43 完毕」。
 
 ### 指令 2026-10-09 #74：批次 P2-42（context 序号假设判决——裸进程双 context 后 import）
 
