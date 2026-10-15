@@ -244,6 +244,34 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P240（批次 P2-40 回执，用户带回）—— 🎯 源结构全字段到手，锁认数值特征：1 个 JFC vs 2 个 JFC
+
+**判定：三场景 128B 源结构 + 72B 查找键原样带回。**
+**源结构（set_tpid_list_key a0）布局认定**：
+```
++0:  0x1_00000001（p232 成功 / p228 成功）vs 0x1_00000002（urma_perf 失败）
+     → 两个 u32：高 32 位恒 1；低 32 位 = 1 vs 2
++8:  local_eid（16B）…df08:0b00
++24: peer_eid（16B）同上（自连接）
++40: 0 …（后续全 0；s08 起为栈 canary 噪音）
+```
+**查找键（tpid_list ht=…4da0）**：k0..k3=eid 对（一致）、k4@32=0x1
+（一致）、**k5@40 = 1（成功）/ 0（失败）**——与源结构低 32 位
+（1 vs 2）强相关。**数值特征与 JFC 数量精确吻合**：裸成功侧与
+p232 均建 **1 个 JFC**；urma_perf/nvmf_tgt 均建 **2 个 JFC**
+（SPDK 默认 SPDK_URMA_JFC_COUNT=2）。D ✅ 还原。**
+
+- **已排除的候选**：jetty id（P2-34 A 自带 jetty 仍命中）；s0 低
+  32 位 ≠ "必然失败的标记"——P2-37 E-B 裸侧 jfc×2 import 成功，
+  说明 jfc×2 的裸进程**要么 reuse 命中、要么 GET_TP_LIST 成功**，
+  该路径未在 level 8 下取证过（本批前的推断缺口）。
+- **决定性速验（外部采纳，#73 核心）**：SPDK 的 JFC 数量有环境变量
+  `SPDK_URMA_JFC_COUNT`（默认 2）——**把 nvmf_tgt/urma_perf 调成 1
+  重跑失败回环**：若握手通过 = 根因坐实（SPDK 双 JFC 触发），就地
+  跑 V2；若仍败 = 假设证伪，转 kprobe 深挖。
+- **附带待验证**：裸侧 jfc×2（P2-37 E-B）成功的内核路径从未取证
+  （reuse 命中还是 GET_TP_LIST 成功？）——它决定机制解释的完整性。
+
 ### 回执导入 2026-10-09 #P239（批次 P2-39 回执，用户带回）—— 🎯 键字段 diff 到手：offset 40 = 1 vs 0（唯一差异字段）
 
 **判定：kprobe 成功挂 5 个探针（含 set_tpid_list_key.constprop.0），
@@ -1760,6 +1788,52 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #73：批次 P2-41（JFC 数量判决——SPDK_URMA_JFC_COUNT=1 重跑失败回环，通过则就地 V2）
+
+**背景**：P2-40 源结构数值特征与 JFC 数量精确吻合（裸/p232=1 个 JFC
+→ 键 offset40=1 命中；SPDK=2 个 JFC → offset40=0 未命中）。SPDK 的
+JFC 数量有环境变量 **SPDK_URMA_JFC_COUNT**（默认 2，
+nvme_urma_common.c:opts->jfc_count）。本批一个实验直接判决。
+
+**A. 决定性速验（核心，先做）**：
+```bash
+# target 与 initiator 两侧都设 JFC_COUNT=1，重跑 -M cpu 失败回环：
+#   nvmf_tgt 侧：nvmf_create_transport -t URMA 前加
+#     export SPDK_URMA_JFC_COUNT=1
+#   initiator 侧：export SPDK_URMA_JFC_COUNT=1
+# 判定：
+#   握手通过（无 rc=-5）→ 🎯 根因坐实（SPDK 双 JFC 触发），就地跑 V2！
+#   仍 rc=-5 → 假设证伪，转 C
+```
+
+**A'. 若 A 通过 → 就地 V2 数据判决**：
+```bash
+# 保持 JFC_COUNT=1，完整部署（loop.img + bdev_aio + URMA transport +
+# listener 4420），initiator urma_perf -M npu 短跑 30s：
+# 判定：completed errors=0 + 数据一致 + stderr 无 "falling back to
+#   urma_register_seg" = V2 通过 🎯🎯
+```
+
+**B. 机制取证（level 8，A 通过后做，解释机制用）**：
+```bash
+# level 8 下跑一次 JFC_COUNT=1 的成功回环，抓 dmesg：
+#   确认 target import 走 reuse 命中（offset40=1 的键）——
+#   与源结构低 32 位=1 的对应关系
+```
+
+**C.（若 A 仍败）裸 jfc×2 路径取证**：
+```bash
+# level 8 + kprobe rkp（P2-40 同款）下重跑 P2-37 E-B（裸 jfc×2 import）：
+#   带回：该成功是 reuse 命中（k5=?）还是 GET_TP_LIST 成功（ret=0）？
+#   ——决定机制解释与下一轮方向
+```
+
+**D. 还原**：JFC_COUNT env 不残留；level 5；kprobe 清；进程/大页/
+5 文件照旧。
+
+**回传**：A 项结果 + A' V2 判决（若跑）+ B/C 项日志关键段，注明
+「批次 P2-41 完毕」。
 
 ### 指令 2026-10-09 #72：批次 P2-40（源结构全字段 dump——认出 offset40/1vs2 的字段语义）
 
