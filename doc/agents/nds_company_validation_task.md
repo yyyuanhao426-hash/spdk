@@ -244,6 +244,42 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P234（批次 P2-34 回执，用户带回）—— 🎯 决定性分叉点：tpid reuse 命中 vs 未命中
+
+**判定：A ❌ "importer 先建本地 jetty"假设证伪（裸侧先建 jetty 后
+import 照样 OK，id=54239→import 54238 ✅）→ 该差异与触发无关；
+D.4 🎯 内核栈对比拿到决定性分叉：同一 compat 路径、同样先
+"try to get tpid reuse"——成功侧 **reuse 命中**（tpid 8388644 active，
+直接 import 不触发设备查询）；失败侧 **reuse 未命中** → 被迫走
+GET_TP_LIST → 管理侧拒（ret=-2）→ create_tpid -28 → import 失败。
+运行内核确认存在 ubcore_create_tpid_priv（本地快照缺失，版本差已知）。**
+
+- **A 项**：P2_CREATE_JETTY=1（own jetty id=54239）+ import OK；
+  无预建对照也 OK。"先建本地 jetty"排除。
+- **D.0 重大操作发现**：`pkill -x nvmf_tgt` 杀不掉（SPDK 主线程 comm
+  改为 reactor_0）→ 10:57 起的残留 target 独占 core0 锁与 4420，
+  使后续"新起"的 target 静默退出。**P2-30~33 部分回环失败实验由
+  残留 target 服务（数据仍有效但归属未澄清）**；已改
+  `pkill -9 -f 'build/bin/nvmf_tgt'`；**D.3 用干净唯一 target 复现
+  失败（PID 2475459）→ 失败结论在干净条件下成立**。
+- **D.2**：ftrace 仅有 ub_memory/ubase 事件（无 ubcore/uburma
+  tracepoint）。
+- **D.4 成功/失败内核栈对照**（level 8 取证）：
+  ```
+  成功侧（裸 p2）:  import_jetty → _compat "try to get tpid reuse"
+                    → import_jetty_ex "tpid 8388644 active"（reuse 命中，
+                      不触发设备查询）→ Import JETTY Ex id:61038 ✅
+  失败侧（nvmf_tgt）: 同一 compat "try to get tpid reuse"
+                    → 未命中 → get_tp_list_from_ops ret=-2
+                    → create_tpid_priv -28 → import fail ❌
+  ```
+- **下一步焦点（外部接手）**：那个可复用的活跃 tpid 由谁/在哪一步
+  建立（成功场景中 create_jetty 的 compat 路径？），以及失败场景中
+  initiator 的 create_jetty 是否走了同样的路径——level 8 对比两个
+  场景的 create_jetty 阶段即可回答（#67）。
+- **操作规范沉淀**：kill SPDK 进程用 `pkill -9 -f 'build/bin/nvmf_tgt'`；
+  大页残留 map 文件检查；4420 端口冲突先查监听者。
+
 ### 回执导入 2026-10-09 #P233（批次 P2-33 回执，用户带回）—— 发往内核的内容逐字节一致；换库路线证伪；球进入内核源码层
 
 **判定：A 🎯 strace 证明裸成功侧与 nvmf_tgt 失败侧的 IMPORT_JETTY_EX
@@ -1593,6 +1629,56 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #67：批次 P2-35（tpid reuse 溯源——level 8 全程对比两场景的 jetty 创建/激活路径）
+
+**背景**：P2-34 锁定分叉点 = **tpid reuse 命中 vs 未命中**。核心未解
+问题：那个可复用的活跃 tpid（成功侧日志 tpid 8388644 active）是**谁、
+在哪一步**建立的？候选：① creator/initiator 的 create_jetty 顺带建立
+（compat 路径里 get_tp_list+exchange+import_ex 产生活跃 TP）；
+② 更早的历史连接残留；③ 其他。本批用 level 8 全程对比回答。
+
+**E-A · 裸成功场景全程取证（level 8）**：
+```bash
+echo 8 > /sys/module/ubcore/parameters/g_ubcore_log_level
+echo 8 > /sys/module/uburma/parameters/g_uburma_log_level
+dmesg -C   # 清 ring（记录前确认已备份旧内容：dmesg > p235_log/dmesg_before.txt）
+# 1) p228 p1 建资源（建 jetty 阶段全量日志留证）
+# 2) p228 p2 import（reuse 命中过程留证）
+dmesg > p235_log/bare_full.txt    # 恢复 level 5
+# 带回关键问题答案：
+#   Q1: p1 的 create_jetty 是否走 compat（有无 get_tp_list/exchange 日志）？
+#   Q2: tpid 8388644（或当次的活跃 tpid）在哪一行被创建/激活？
+#       是 create_jetty 期间还是 p2 的 import 期间？
+```
+
+**E-B · 失败场景全程取证（level 8，干净环境）**：
+```bash
+pkill -9 -f 'build/bin/nvmf_tgt'   # 先彻底清残留（D.0 教训）
+dmesg -C
+# 1) nvmf_tgt（dump 版）起，transport/listener 就绪
+# 2) urma_perf -M cpu 连接（触发失败）
+dmesg > p235_log/tgt_full.txt      # 恢复 level 5
+# 带回关键问题答案：
+#   Q3: initiator（urma_perf）的 create_jetty 是否走 compat？
+#       有没有建立活跃 tpid（对照 Q2）？
+#   Q4: target 的 import 前后，reuse 查找的键/结果有无日志？
+#   Q5: 全程有无任何 GET_TP_LIST 成功的例子（对比成功/失败请求差异）？
+```
+
+**E-C · 交叉判定（带回数据后外部定位）**：
+- 若 Q2=「create_jetty 期间建立」且 Q3=「initiator create_jetty 未建」
+  → 根因 = **initiator 的 jetty 创建路径与裸 creator 不同**（下一步查
+  两者 create_jetty 参数差异，我本地读码）
+- 若 Q2/Q3 同为建立/未建立 → 看 Q5：GET_TP_LIST 的成败是否取决于
+  请求者 PID 或 TP 表状态（设备侧 per-PID 表）
+- 若有更早历史连接的 tpid 残留被 reuse 命中 → 换干净对照重跑
+
+**D. 还原**：level 恢复 5（前后核对）、进程清理（pkill -9 -f）、
+大页/临时文件照旧；日志存 p235_log/ 留证。
+
+**回传**：E-A/E-B 两份 dmesg 关键段（jetty 创建→import 全链）+
+Q1~Q5 答案，注明「批次 P2-35 完毕」。
 
 ### 指令 2026-10-09 #66：批次 P2-34（导入方隔离终判——"importer 先建了自己的本地 jetty"）
 
