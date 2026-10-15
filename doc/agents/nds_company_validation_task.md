@@ -244,6 +244,39 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P244（批次 P2-44 回执，用户带回）—— 🎯🎯 字段映射完成：cfg6 = tp_type，SPDK import 到达内核时是 RTP(0)！
+
+**判定：头文件（kernel-devel 6.6.0-159，与运行内核同版）结构布局
+映射完成——**
+```
+struct ubcore_tjetty_cfg 布局（aarch64）：
+  +0   id.eid（16B）        → cfg0/cfg1 ✓ 两侧一致
+  +16  id.id（u32）         → cfg2.lo（0x1602/0x160c = 各自 jetty id ✓）
+  +24  flag（u32）          → cfg3.lo = 0x10（order_type 自动配置，两侧一致）
+  +28  trans_mode（u32）    → cfg3.hi = 0x1（RM）✓ 两侧一致
+  +32  eid_index（u32）     → cfg4.lo = 0 ✓
+  +36  type（u32）          → cfg4.hi = 1（JETTY）✓
+  +40  policy（u32）        → cfg5.lo = 0 ✓
+  +44  token（u32）         → cfg5.hi = 0xACFE ✓
+  +48  tp_type（u32）       → cfg6.lo = ★1（裸=CTP）vs 0（SPDK=RTP）★
+```
+**全部字段中唯一的实质差异 = tp_type：裸 import 到达内核时是
+CTP(1)，SPDK import 到达内核时是 RTP(0)。** 键 offset 40（k5）的
+1/0 即 CTP/RTP——孤儿条目是 CTP → CTP import reuse 命中、RTP import
+未命中落入 GET_TP_LIST（管理侧恒拒）→ 失败。**20 批全部现象闭环。**
+
+- **矛盾点与指向**：SPDK 代码写死 `rjetty.tp_type = URMA_CTP`，且
+  P2-29 注入打印证实 nvmf_tgt 发出前 tp=1——但内核收到 0。两者用
+  同一份系统 liburma……唯一能改变的环节 = **编译期头文件的枚举值**：
+  SPDK 构建用的 urma_types.h 若与 CCDK 头（/usr/include/ub/umdk/
+  urma）的 `enum urma_tp_type` 顺序不同（如 {CTP, RTP, …} →
+  URMA_CTP=0），则 SPDK 二进制发出的 tp_type=0。**P2-24 F6 早已
+  告诫"编译必须与 CCDK 对齐，头布局不一致会 EPERM"——正是此因。**
+- **裸探针为何幸免**：始终用 `-I/usr/include/ub/umdk/urma` 编译。
+- **验证/修复（#77）**：① 全盘搜 urma_types.h 对照枚举顺序；
+  ② 确认 SPDK 构建的实际 include 路径；③ 用 CCDK 头重编
+  urma_perf/nvmf_tgt 重跑回环——通过则就地 V2。
+
 ### 回执导入 2026-10-09 #P243（批次 P2-43 回执，用户带回）—— 🎯 value 级烟枪：cfg6 与 cfg15 两字段裸/SPDK 不同（1 vs 0）
 
 **判定：嵌套 deref kprobe 一次挂载成功，两场景各 1 条 imp 事件，
@@ -1848,6 +1881,53 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #77：批次 P2-45（枚举值对照 + 头文件对齐重编——通过则就地 V2）
+
+**背景**：P2-44 映射完成：内核收到的 SPDK import cfg 里
+**tp_type = RTP(0)**（裸 = CTP(1)）——键 k5 的 1/0 即 CTP/RTP，全部
+现象闭环。SPDK 源码写死 URMA_CTP，怀疑 **SPDK 构建使用的 urma 头
+文件枚举顺序与 CCDK 头不同**（P2-24 F6 已知告诫）。
+
+**A. 枚举顺序普查（只读）**：
+```bash
+find / -name "urma_types.h" 2>/dev/null | grep -v p24
+# 对每个候选头文件：
+grep -n -A5 "enum urma_tp_type" <各文件>
+# 重点对照：
+#   /usr/include/ub/umdk/urma/urma_types.h   （CCDK 头，探针用的）
+#   与 SPDK 构建实际用的那份（见 B）
+```
+
+**B. 确认 SPDK 构建的 include 路径（只读）**：
+```bash
+cd /home/tools/app/spdk
+grep -rn "urma" build/build.ninja | grep -i "\-I\|include" | head -5
+# 或：grep -rn "urma_types.h" build/compile_commands.json 2>/dev/null | head -3
+# 带回：nvme_urma.o / urma_perf 编译命令里的 -I 顺序
+```
+
+**C. 对齐重编 + 回环重试（核心）**：
+```bash
+# 用 CCDK 头重编（确保 -I/usr/include/ub/umdk/urma 排在最前）：
+#   具体方式按 B 项查得的构建配置调整（改 build.ninja 的 -I 顺序，
+#   或 make clean 后 CFLAGS 指定；重编 lib/nvme + examples/nvme/urma_perf
+#   + lib/nvmf + app/nvmf_tgt）
+# 重跑 -M cpu 回环（JFC_COUNT 不设，默认即可）：
+#   握手通过 → 🎯 根因最终坐实（头文件枚举错位），就地 V2！
+#   仍败 → 带回重编后的编译命令原文 + level 8 dmesg
+```
+
+**D. 若 C 通过 → V2 数据判决**：
+```bash
+# 照 P2-26 C 项完整部署，urma_perf -M npu 短跑 30s：
+# completed errors=0 + 数据一致 + 无 fallback stderr = V2 通过 🎯🎯
+```
+
+**E. 还原**：照旧（build 配置的改动记录下来，固化由外部出 patch）。
+
+**回传**：A 项枚举对照表 + B 项 include 路径 + C/D 项结果，注明
+「批次 P2-45 完毕」。
 
 ### 指令 2026-10-09 #76：批次 P2-44（头文件取证——ubcore_tjetty_cfg 字段布局，认出 cfg6/cfg15）
 
