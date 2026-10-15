@@ -351,6 +351,31 @@ typedef int (*ra_get_eid_list_fn)(struct ra_info info,
 typedef int (*rt_open_net_service_fn)(struct rt_net_service_open_args *args);
 typedef int (*aclrt_get_phy_dev_id_fn)(int32_t device_id, uint32_t *phy_id);
 
+/* ===== libnds (colleague_c CCDK) — full NDS stack as a library =====
+ * nds_init() runs the complete nds.c chain (CANN device, tsd, RA infra,
+ * route info, device token) — the form every successful remote HBM
+ * access was verified against (P2-48/P2-49: our reduced hand-rolled RA
+ * sequence → remote reads ACK-timeout). libnds links /usr/lib64/
+ * liburma.so.0 (CCDK ABI) — same as the SPDK transport after the
+ * P2-45 header fix. */
+typedef int (*nds_init_fn)(void);
+typedef void (*nds_deinit_fn)(void);
+typedef int (*nds_buf_register_fn)(void *buf, size_t len);
+typedef int (*nds_buf_deregister_fn)(void *buf);
+typedef int (*nds_get_segment_info_fn)(void *buf, void *infos_out);
+
+struct nds_segment_info {
+	uint8_t eid[16];
+	uint32_t uasid;
+	uint32_t jetty_id;
+	uint32_t token_id;
+};
+
+struct nds_segment_infos {
+	struct nds_segment_info h2d;
+	struct nds_segment_info rh2d;
+};
+
 /* Segment descriptor exposed to the remote endpoint: the remote does
  * urma_import_seg(ubva{eid, uasid, va}) + urma_import_jetty(CTP) and its
  * jetty READ/WRITE ops reach this HBM segment directly (P2-19 flow). */
@@ -386,6 +411,14 @@ struct npu_driver {
 	void *ra_qp_handle;
 	rt_open_net_service_fn rt_open_net_service;
 	aclrt_get_phy_dev_id_fn get_phy_dev_id;
+	/* libnds full-stack path (preferred over the hand-rolled sequence) */
+	void *nds_library;
+	nds_init_fn nds_init_cb;
+	nds_deinit_fn nds_deinit_cb;
+	nds_buf_register_fn nds_buf_register_cb;
+	nds_buf_deregister_fn nds_buf_deregister_cb;
+	nds_get_segment_info_fn nds_get_segment_info_cb;
+	bool nds_ready;
 	/* RA jetty coordinates, parsed from QpCreateInfo.key.value
 	 * (nds_parse_jetty_info semantics): the authoritative source for the
 	 * direct-route segment descriptor (P2-23 B / P2-24 A). */
@@ -430,6 +463,8 @@ struct npu_pin_handle {
 	/* RA/HCCP registration output (libra path); non-NULL when the RA
 	 * context was ready at pin time. */
 	void *lmem_handle;
+	/* libnds path: buffer registered via nds_buf_register */
+	bool nds_registered;
 	/* RaCtxLmemRegister output: token_id from lmem.out.ub — the peer
 	 * needs it in the imported urma_seg_t (P2-23 B). */
 	uint32_t token_id;
@@ -460,6 +495,55 @@ npu_load_symbol(const char *name)
 			goto fail; \
 		} \
 	} while (0)
+
+/* libnds full-stack init: dlopen libnds.so + nds_init(). Returns 0 and
+ * sets nds_ready on success; the hand-rolled libra sequence is then
+ * skipped entirely (nds_init internally performs the complete chain —
+ * CANN device, tsd, RA infra, route info, device token — that remote
+ * HBM access requires). */
+static int
+npu_nds_init(void)
+{
+	const char *lib;
+
+	lib = getenv("URMA_PERF_NDS_LIB");
+	if (lib == NULL || lib[0] == '\0') {
+		lib = "libnds.so";
+	}
+	g_npu.nds_library = dlopen(lib, RTLD_NOW | RTLD_GLOBAL);
+	if (g_npu.nds_library == NULL) {
+		g_npu.nds_library = dlopen("/home/tools/app/colleague_c_repo/output/libnds.so",
+					   RTLD_NOW | RTLD_GLOBAL);
+	}
+	if (g_npu.nds_library == NULL) {
+		fprintf(stderr, "libnds unavailable (%s)\n", dlerror());
+		return -1;
+	}
+	g_npu.nds_init_cb = (nds_init_fn)dlsym(g_npu.nds_library, "nds_init");
+	g_npu.nds_deinit_cb = (nds_deinit_fn)dlsym(g_npu.nds_library, "nds_deinit");
+	g_npu.nds_buf_register_cb = (nds_buf_register_fn)dlsym(g_npu.nds_library,
+							       "nds_buf_register");
+	g_npu.nds_buf_deregister_cb = (nds_buf_deregister_fn)dlsym(g_npu.nds_library,
+								   "nds_buf_deregister");
+	g_npu.nds_get_segment_info_cb = (nds_get_segment_info_fn)dlsym(g_npu.nds_library,
+								       "nds_get_segment_info");
+	if (g_npu.nds_init_cb == NULL || g_npu.nds_buf_register_cb == NULL ||
+	    g_npu.nds_get_segment_info_cb == NULL) {
+		fprintf(stderr, "libnds symbols missing\n");
+		dlclose(g_npu.nds_library);
+		g_npu.nds_library = NULL;
+		return -1;
+	}
+	if (g_npu.nds_init_cb() != 0) {
+		fprintf(stderr, "nds_init failed\n");
+		dlclose(g_npu.nds_library);
+		g_npu.nds_library = NULL;
+		return -1;
+	}
+	g_npu.nds_ready = true;
+	printf("NDS (libnds full stack) ready\n");
+	return 0;
+}
 
 /* RA/HCCP init sequence, mirrors colleague_c nds/src/nds.c nds_init
  * (P2-21 verified on 133): rtOpenNetService("--hdcType=18") →
@@ -714,6 +798,15 @@ npu_driver_init(int32_t device_id)
 		goto fail;
 	}
 
+	/* NDS full-stack path (preferred): libnds nds_init runs the complete
+	 * colleague_c init chain — verified form for remote HBM access
+	 * (P2-48/P2-49: the reduced hand-rolled sequence below ACK-times-out
+	 * on remote reads). On success the hand-rolled libra path is skipped
+	 * entirely; on failure the libra path remains as fallback. */
+	if (npu_nds_init() == 0) {
+		return 0;
+	}
+
 	/* RA/HCCP init (optional): libra.so enables the third official HBM
 	 * registration path (RaCtxLmemRegister nonPin). Absent libra -> RA
 	 * path disabled with a warning; the provider keeps working for the
@@ -740,6 +833,14 @@ fail:
 void
 npu_driver_fini(void)
 {
+	if (g_npu.nds_ready && g_npu.nds_deinit_cb != NULL) {
+		g_npu.nds_deinit_cb();
+	}
+	g_npu.nds_ready = false;
+	if (g_npu.nds_library != NULL) {
+		dlclose(g_npu.nds_library);
+		g_npu.nds_library = NULL;
+	}
 	if (g_npu.ra_qp_handle != NULL && g_npu.ra_qp_destroy != NULL) {
 		g_npu.ra_qp_destroy(g_npu.ra_qp_handle);
 		g_npu.ra_qp_handle = NULL;
@@ -946,7 +1047,21 @@ npu_provider_pin(void *provider_ctx, void *addr, size_t length, void **pin_handl
 	handle->entry = entry;
 	handle->offset = (uintptr_t)addr - (uintptr_t)entry->addr;
 
-	/* RA/HCCP registration (third official path): RaCtxLmemRegister with
+	/* libnds full-stack path (preferred): nds_buf_register runs the
+	 * complete HBM registration inside the colleague_c stack. */
+	if (g_npu.nds_ready) {
+		ret = g_npu.nds_buf_register_cb(addr, length);
+		if (ret != 0) {
+			fprintf(stderr, "nds_buf_register failed: ret %d\n", ret);
+			free(handle);
+			return -EIO;
+		}
+		handle->nds_registered = true;
+		*pin_handle = handle;
+		return 0;
+	}
+
+	/* RA/HCCP registration (libra fallback path): RaCtxLmemRegister with
 	 * nonPin=ENABLE makes the HBM segment remotely DMA-able via URMA
 	 * jetty ops — bypasses the kernel gpu_p2p framework that 133's
 	 * udma.ko lacks (P2-8/P2-19). Only possible when the RA context was
@@ -986,6 +1101,25 @@ npu_provider_get_segment_info(void *provider_ctx, void *pin_handle,
 	struct npu_pin_handle *handle = pin_handle;
 
 	(void)provider_ctx;
+	if (g_npu.nds_ready) {
+		struct nds_segment_infos infos;
+
+		if (handle == NULL || !handle->nds_registered) {
+			return -ENODEV;
+		}
+		memset(&infos, 0, sizeof(infos));
+		if (g_npu.nds_get_segment_info_cb(handle->entry->addr, &infos) != 0) {
+			fprintf(stderr, "nds_get_segment_info failed\n");
+			return -EIO;
+		}
+		memset(info, 0, sizeof(*info));
+		memcpy(info->eid, infos.h2d.eid, sizeof(info->eid));
+		info->uasid = infos.h2d.uasid;
+		info->va = (uint64_t)(uintptr_t)handle->entry->addr;
+		info->token_id = infos.h2d.token_id;
+		info->len = handle->entry->size;
+		return 0;
+	}
 	if (g_npu.library == NULL || !g_npu.ra_ready || handle == NULL) {
 		return -ENODEV;
 	}
@@ -1008,6 +1142,11 @@ npu_provider_unpin(void *provider_ctx, void *pin_handle)
 
 	(void)provider_ctx;
 	if (handle == NULL) {
+		return;
+	}
+	if (handle->nds_registered && g_npu.nds_buf_deregister_cb != NULL) {
+		g_npu.nds_buf_deregister_cb(handle->entry->addr);
+		free(handle);
 		return;
 	}
 	if (g_npu.ra_ready && handle->lmem_handle != NULL) {

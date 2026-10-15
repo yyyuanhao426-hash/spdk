@@ -244,6 +244,30 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P250（批次 P2-50 回执，用户带回）—— libnds API 极简确认；切换条件齐备
+
+**判定：libnds 对外 API 极简且正合需求——nds_init(void)（内部完整
+nds.c 链：CANN 设备→tsd→RA infra→route→device token，我们精简序列
+缺的环节全在内部）、nds_buf_register(void*,size_t)、
+nds_buf_deregister(void*)、nds_get_segment_info(void*,out)（返回
+{eid[16],uasid,jetty_id,token_id} × h2d/rh2d 两方向）、nds_deinit。
+无 cfg 结构体。nds_prepare_init_device 为 static 内部函数（用
+g_aclrtGetDevice 取当前设备——urma_perf 已 aclrtSetDevice，语义
+吻合）。libnds 链接 /usr/lib64/liburma（CCDK ABI）——与修复后的
+SPDK 同源，无 ABI 冲突；p219 的 LD_LIBRARY_PATH 先加
+colleague_c_repo/output。**
+
+- **p219 调用序（role_p1）**：aclInit → aclrtSetDevice(0) →
+  aclrtMalloc(HBM 64K HUGE_FIRST) → **nds_init() → nds_buf_register
+  (hbm, 65536) → nds_get_segment_info(hbm, &si)** → 导出
+  si.h2d_segment_info {eid,uasid,jetty_id,token_id} → … →
+  nds_buf_deregister + nds_deinit + aclrtFree。
+- **provider 切换设计（外部已完成编码，#83 下发）**：libnds 为主路径
+  （dlopen libnds.so，env URMA_PERF_NDS_LIB 可覆盖）——nds_init 替代
+  手搓五步+Cq/Qp、nds_buf_register 替代 RaCtxLmemRegister、
+  nds_get_segment_info 替代手拼四元组；手搓 libra 序列降级为后备
+  （libnds 不可用时）。pin/unpin/get_segment_info/fini 四路对称。
+
 ### 回执导入 2026-10-09 #P249（批次 P2-49 回执，用户带回）—— WR/seg 字节解码无缺陷；系统性差异浮出：HBM 侧 RA 栈完整度
 
 **判定：B ✅ 失败 pull 的 WR/seg 原始字节抓到（8 事件，第 8 个 = NPU
@@ -2024,6 +2048,55 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #83：批次 P2-51（provider 切换 libnds 全栈——判决兼修复，数据面通过就地 V2）
+
+**背景**：P2-49/50 锁定系统性差异（远端读成功的场景 HBM 侧都是
+libnds 完整 nds_init 栈；urma_perf 的手搓精简序列是唯一失败场景）。
+外部已完成 provider 切换编码（urma_perf_npu.c，HEAD 为本批前置
+commit）：**libnds 为主路径**（dlopen libnds.so，env
+URMA_PERF_NDS_LIB 可覆盖；nds_init 替代手搓序列、nds_buf_register
+替代 RaCtxLmemRegister、nds_get_segment_info 供给 direct route 四元
+组），手搓 libra 序列降级为后备。本批判决 + V2。
+
+**A. 同步 + 重编（CCDK-ABI 配置不变）**：
+```bash
+git pull --ff-only    # 取 provider 切换 commit
+# ccdkcompat 头在位（/home/tools/app/ccdkcompat，P2-46 已固化）
+make -C examples/nvme/urma_perf   # （CONFIG_URMA_DIR 照 P2-46）
+# 校验：新 urma_perf 含 "NDS (libnds full stack) ready" 字符串
+```
+
+**B. -M cpu 回归（先确认无破坏）**：
+```bash
+# 照 P2-46 A.4 同款回环：
+#   期望 handshake OK + completed errors=0
+#   + stdout 出现 "NDS (libnds full stack) ready"
+#   （注意：-M cpu 不触发 NPU 路径，此回归只验二进制无破坏）
+```
+
+**C. -M npu 判决（核心）**：
+```bash
+# 照 P2-46 B 完整部署（level 8 + stderr 双侧留存）：
+#   urma_perf stdout 期望：NDS (libnds full stack) ready +
+#     RA/HCCP 相关日志不再出现（libra 路径被跳过）
+#   stderr：无 "falling back to urma_register_seg"
+#   数据面：Verification WRITE/READ …
+# 判定：
+#   数据面通过（errors=0 + 数据一致）→ 🎯🎯 根因最终坐实
+#     （HBM 侧 RA 栈完整度），就地 V2 完成！
+#   仍失败 → 带回 stderr/dmesg/urma_admin seg 快照（新增错误行）
+```
+
+**D. V2 判据（C 通过时）**：
+```bash
+# completed errors=0 + WRITE/READ 数据一致（urma_perf 自校验）
+# + initiator stderr 无 fallback + target 无错误行
+```
+
+**E. 还原**：照旧（level 5、进程清、5 文件照旧；ccdkcompat 与新二进制保留）。
+
+**回传**：A 重编 + B 回归 + C/D 项完整输出，注明「批次 P2-51 完毕」。
 
 ### 指令 2026-10-09 #82：批次 P2-50（libnds API 取证——为 provider 切换 libnds 做准备）
 
