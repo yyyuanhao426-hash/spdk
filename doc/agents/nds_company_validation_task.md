@@ -244,6 +244,44 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P245（批次 P2-45 回执，用户带回）—— 🎯🎯 import 根因坐实并修复验证：编译头/运行库 ABI 错位；-M cpu 回环全通！
+
+**判定：A ❌ 枚举顺序假设证伪（5 处 urma_types.h 枚举完全相同）；
+真因 = **结构体 ABI 错位**——`urma_import_jetty_flag_t`（union）
+CCDK 版 4B / UMDK 版 24B（多 user_tag{stag,dtag}）→
+`urma_rjetty_t.tp_type` 偏移 40 vs 64。SPDK 按 UMDK 头编译
+（CONFIG_URMA_DIR=/home/tools/app/umdk）、按 CCDK ABI 的
+/usr/lib64/liburma 运行 → 库在偏移 40 读 tp_type 读到 flag 低位
+（=0）→ 内核收 RTP(0)。C-2 兼容头（CCDK 头 + 尾部追加 app-only
+is_gpu_seg）重编后 **-M cpu 回环全通：handshake OK、
+completed=6052 errors=0、内核日志 "tpid reuse get. reuse tpid."
+（reuse 命中）**→ 根因最终坐实并验证修复。**
+
+- **C-1 发现真实冲突**：直接全量换 CCDK 头编译失败——
+  nvme_urma_common.c:399 用了 umdk 扩展字段 `is_gpu_seg`（CCDK 头
+  无）。C-2 解法 = 兼容头：CCDK 头副本尾部追加 app-only
+  `uint32_t is_gpu_seg`（liburma 只读前 7 字段忽略它，不影响
+  ABI），CONFIG_URMA_DIR=/tmp/ccdkcompat 重编全成功。
+- **ABI 对照表（编译期 offsetof 实测）**：
+  | 头 | sizeof(rjetty) | tp_type 偏移 | flag 大小 | seg_cfg |
+  |---|---|---|---|---|
+  | CCDK（=/usr/lib64/liburma ABI） | 48 | 40 | 4 | 48 |
+  | umdk 源（SPDK 曾用） | 72 | 64 | 24 | 56（含 is_gpu_seg） |
+- **E' 反证**：全栈换 umdk 运行库不可行（nvmf_tgt listener 起不来
+  + aclrtSetDevice 507033 + TLV cmd=48 ret=-1）→ **运行时库必须是
+  /usr/lib64（CCDK ABI），SPDK 必须按 CCDK 头编译**。
+- **D · V2（-M npu 30s）**：握手通过（RA jetty ready ✅），但数据面
+  失败：`no matching ureq for cid=0` + `CQ transport error -71
+  (Protocol error)` + Verification WRITE failed。测试 agent 推断：
+  is_gpu_seg（NPU peer-mem 注册）只被 umdk 版 liburma 识别，CCDK 版
+  忽略 → HBM 被当普通 host seg → 远端 DMA 协议错。**遗留为独立于
+  import 根因的 NPU 数据面问题**。
+- **对照**：同 CCDK-ABI 重编下 -M cpu 完全通过 → import 修复与
+  NPU 数据面问题解耦。
+- **E ✅ 还原**：二进制回滚到备份原值（修复产物未保留——重编步骤
+  需固化）、/tmp/ccdkcompat 已清（重建步骤需固化）、孤儿 tpid 未触
+  碰、5 文件 M 照旧。
+
 ### 回执导入 2026-10-09 #P244（批次 P2-44 回执，用户带回）—— 🎯🎯 字段映射完成：cfg6 = tp_type，SPDK import 到达内核时是 RTP(0)！
 
 **判定：头文件（kernel-devel 6.6.0-159，与运行内核同版）结构布局
@@ -1881,6 +1919,56 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #78：批次 P2-46（重建 CCDK-ABI 二进制 + -M npu 数据面 -71 取证）
+
+**背景**：P2-45 坐实 import 根因（ABI 错位）并以兼容头重编验证
+（-M cpu 全通 6052/0），但修复产物已回滚、/tmp/ccdkcompat 已清。
+-M npu 剩余数据面失败（-71 Protocol error）需在**修复版二进制**上
+取证。本批两步：重建 + 取证。
+
+**A. 固化重建（把 P2-45 C-2 步骤重做并留脚本）**：
+```bash
+# 1) 重建兼容头目录 /home/tools/app/ccdkcompat/（勿用 /tmp，防再清）：
+mkdir -p /home/tools/app/ccdkcompat
+cp -r /usr/include/ub/umdk/urma /home/tools/app/ccdkcompat/include_ub_umdk_urma
+#    在副本 urma_types.h 的 urma_seg_cfg_t 结构末尾追加：
+#      uint32_t is_gpu_seg;   /* app-only: liburma 忽略，仅为 SPDK 源码可编译 */
+#    （照 P2-45 C-2 的做法；注意保持其余字节与 CCDK 完全一致）
+# 2) 按 P2-45 C-2 的编译命令重编：
+#    CONFIG_URMA_DIR=/home/tools/app/ccdkcompat make -C lib/nvme
+#    make -C lib/nvmf && make -C app/nvmf_tgt && make -C examples/nvme/urma_perf
+#    （编译命令 -I 顺序照 P2-45 回执原文：ccdkcompat/include/ub/umdk/urma 置最前）
+# 3) 校验：offsetof(urma_rjetty_t.tp_type)==40、sizeof(flag)==4
+# 4) -M cpu 回环回归：应仍全通（completed errors=0）
+# 5) 将步骤 1) 的头文件副本与重编脚本存入 p246_log/ 留证
+```
+
+**B. -M npu 失败取证（在修复版二进制上）**：
+```bash
+# 1) level 8（ubcore/uburma=8）+ dmesg 清环备份
+# 2) 起 target（nvmf_tgt + loop.img + URMA transport + 4420），
+#    urma_perf -M npu 短跑，全程抓：
+#    a) urma_perf stderr 全文——有无 "falling back to urma_register_seg"
+#       （判定 direct route 是否生效；fallback=0/1 是关键判据）
+#    b) dmesg：target 侧 import seg 的日志（Import SEG / reuse / 错误行）
+#       + initiator 侧 -71 前后的内核行
+#    c) urma_admin show dev udmac0d1e2 seg（import 后的段表快照）
+# 3) 恢复 level 5、现场清理
+```
+
+**C. 带回判定材料**：
+- a 项：direct route 生效与否（这决定修法方向——若 fallback 发生，
+  说明 get_segment_info 链路在 CCDK-ABI 下未生效，查 RA jetty ready
+  日志；若 direct 生效仍 -71，则问题在"合成段 {eid,uasid,va,token}
+  的远端 DMA 协议"，对照 P2-19 工作流差异——P2-19 的 READ 走的是
+  import 的 RA jetty，而 SPDK 的数据面走 target 自己的 jetty）
+- b 项：内核侧 import/dma 日志原文
+- c 项：段表快照
+
+**D. 还原**：照旧（level 5、进程清、5 文件照旧、大页基线）。
+
+**回传**：A 项重建+回归结果 + B 项三份材料，注明「批次 P2-46 完毕」。
 
 ### 指令 2026-10-09 #77：批次 P2-45（枚举值对照 + 头文件对齐重编——通过则就地 V2）
 
