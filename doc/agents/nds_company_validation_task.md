@@ -244,6 +244,30 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P239（批次 P2-39 回执，用户带回）—— 🎯 键字段 diff 到手：offset 40 = 1 vs 0（唯一差异字段）
+
+**判定：kprobe 成功挂 5 个探针（含 set_tpid_list_key.constprop.0），
+两场景键抓取成功。**同一查找函数、同一哈希表（tpid_list ht=…4da0），
+键前 40 字节（local_eid+peer_eid 重复两遍+tag）完全一致，唯一差异
+= **offset 40 字段：成功侧 0x1 vs 失败侧 0x0**（hash 随之不同：
+0x4bc2c482 vs 0x6cdaa8cd）；tpid_reuse 表（ht=…4e40）同样仅此字段
+差异。键构造入口 set_tpid_list_key 的**源结构（a0）首 8 字节**：
+成功 0x1_00000001 vs 失败 0x1_00000002（低 32 位 1 vs 2）。**
+分叉函数 find_get_tp_id_state_entry 仅成功侧出现（a1=0x800024 =
+孤儿 tp_handle，与 urma_admin dump 一致）。E ✅ 还原。**
+
+- **键布局比对（本地快照 tpid_key={local_eid@0, peer_eid@16, tag@32,
+  local_jetty_id@40, peer_jetty_id@44}）**：offset 40 恰是
+  local_jetty_id 的位置——但运行内核是带 tpid reuse 的新版实现，
+  该位置的语义未知；且已排除"jetty id"解释（P2-34 A 裸侧自带
+  jetty 54239 时 import 仍命中成功）。
+- **已排除**：s0 低 32 位（1 vs 2）≠ JFC 数量（P2-37 E-B 裸侧
+  jfc×2 import 成功与该解释矛盾）。
+- **下一步（外部采纳）**：扩展 kprobe dump——set_tpid_list_key 的
+  a0 源结构**全字段**（128B，本次仅抓了首 8B）+ 查找键扩展到
+  offset 72——用源码布局认出"1 vs 0 / 1 vs 2"的字段语义，即得
+  根因与修法。
+
 ### 回执导入 2026-10-09 #P238（批次 P2-38 回执，用户带回）—— 🎯 分叉函数名到手：ubcore_find_get_tp_id_state_entry
 
 **判定：E-A 🎯 p232 成功路径 = **reuse 命中同一个孤儿 8388644**
@@ -1736,6 +1760,38 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #72：批次 P2-40（源结构全字段 dump——认出 offset40/1vs2 的字段语义）
+
+**背景**：P2-39 已把差异钉到一个键字段（offset 40：成功 1 / 失败 0）
+与源结构首字段（低 32 位：1 / 2）。本批把 kprobe dump 扩展到全字段，
+拿回结构字节后由外部对照源码布局认语义。
+
+**A. kprobe 扩展挂载**：
+```bash
+cd /sys/kernel/debug/tracing
+# 1) set_tpid_list_key：a0 源结构 dump 128B（16 个 x64）+ a1 键缓冲 64B：
+echo 'p:skp ubcore_set_tpid_list_key.constprop.0 a0=%x0 a1=%x1 a2=%x2 s00=+0(%x0):x64 s01=+8(%x0):x64 s02=+16(%x0):x64 s03=+24(%x0):x64 s04=+32(%x0):x64 s05=+40(%x0):x64 s06=+48(%x0):x64 s07=+56(%x0):x64 s08=+64(%x0):x64 s09=+72(%x0):x64 s10=+80(%x0):x64 s11=+88(%x0):x64 s12=+96(%x0):x64 s13=+104(%x0):x64 s14=+112(%x0):x64 s15=+120(%x0):x64' > kprobe_events
+# 2) 查找键扩展到 72B：
+echo 'p:rkp ubcore_hash_table_lookup_nolock ht=%x0 hash=%x1 k0=+0(%x2):x64 k1=+8(%x2):x64 k2=+16(%x2):x64 k3=+24(%x2):x64 k4=+32(%x2):x64 k5=+40(%x2):x64 k6=+48(%x2):x64 k7=+56(%x2):x64 k8=+64(%x2):x64' > kprobe_events
+# （两条都挂；若第二条与第一条同名冲突，用不同组名 rkp2）
+```
+
+**B. 三场景各抓一次**：
+```bash
+# 1) p232（SPDK_ENV=1）对 p237 —— 成功侧
+# 2) urma_perf -M cpu 对 p237 —— 失败侧
+# 3) p228 p2（裸，无 env）对 p1 —— 成功侧三角验证
+# 每场景：echo 1 > tracing_on → 跑 → echo 0 → cp trace p240_log/<name>.txt
+```
+
+**C. 带回**：三份 trace 原文（import 邻近段即可）。**不要自行解读
+字段语义**——字节原样带回，由外部对照源码布局统一认定。
+
+**D. 还原**：kprobe 清空（echo -:skp / -:rkp）、tracer=nop、
+level 5、进程清理、5 文件照旧。
+
+**回传**：三份 trace，注明「批次 P2-40 完毕」。
 
 ### 指令 2026-10-09 #71：批次 P2-39（kprobe 抓查找键实参——两场景键字节 diff，定位"每进程不同"的字段）
 
