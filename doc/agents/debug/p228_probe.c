@@ -123,6 +123,26 @@ static int probe_open(struct probe_env *e, const char *tag)
 		printf("[%s] create_context failed\n", tag);
 		return -1;
 	}
+	/* P2-42: create N contexts, import via the LAST one — tests the
+	 * "context ordinal in reuse key" hypothesis (SPDK processes import
+	 * from a second context) */
+	{
+		uint32_t ctx_cnt = env_u32("P2_CTX_CNT", 1);
+		uint32_t ci;
+
+		for (ci = 1; ci < ctx_cnt; ci++) {
+			urma_context_t *nc = urma_create_context(e->dev, e->eid_index);
+
+			if (nc == NULL) {
+				printf("[%s] create_context #%u failed\n", tag, ci + 1);
+				return -1;
+			}
+			e->ctx = nc;
+		}
+		if (ctx_cnt > 1) {
+			printf("[%s] created %u contexts, using the last\n", tag, ctx_cnt);
+		}
+	}
 	{
 		uint32_t uasid = 0xFFFFFFFF;
 

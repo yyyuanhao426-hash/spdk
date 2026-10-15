@@ -244,6 +244,26 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P241（批次 P2-41 回执，用户带回）—— JFC 数量假设证伪；k5 与进程类别绑定的规律更干净
+
+**判定：A ❌ SPDK_URMA_JFC_COUNT=1 生效确认（内核 create_jfc 仅 1 次）
+但 import 仍败（同栈）→ JFC 数量假设证伪；C 🎯 裸 jfc×2 的成功也是
+**reuse 命中（k5=1，无 get_tp_list）**→ **k5 与 JFC 数量无关**：
+裸进程（1/2 个 JFC）恒 k5=1，SPDK 进程恒 k5=0。D ✅ 还原（另见
+8388648 新条目生成，未触碰）。**
+
+- **规律重述**：k5（键 offset 40）与 s0 低 32 位是**按进程类别稳定**
+  的值：裸（任意 JFC 数/env）= 1；SPDK transport 进程 = 0/2。
+- **外部新假设（全数据统一解释）**：该字段 = **进程内 context 序号**
+  （第 1 个=1、第 2 个=2）。裸进程 import 都发生在第一个 context
+  （命中孤儿——它也是远古进程的第一个 context 所建）；**SPDK 进程的
+  import 发生在第二个 context**：nvmf_tgt accept 路径每条连接重新
+  device_open（lib/nvmf/urma.c:573），urma_perf 疑似同样二次打开。
+  若坐实 → 修复 = SPDK accept/initiator 路径**复用已有 context**，
+  不再新开（改动极小）。
+- **验证（#74）**：p228 探针加 P2_CTX_CNT 旋钮（建 N 个 context、
+  用最后一个 import）——裸进程两 context 后 import 若失败 = 坐实。
+
 ### 回执导入 2026-10-09 #P240（批次 P2-40 回执，用户带回）—— 🎯 源结构全字段到手，锁认数值特征：1 个 JFC vs 2 个 JFC
 
 **判定：三场景 128B 源结构 + 72B 查找键原样带回。**
@@ -1788,6 +1808,44 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #74：批次 P2-42（context 序号假设判决——裸进程双 context 后 import）
+
+**背景**：P2-41 证伪 JFC 假设后，外部提出"**context 序号**"假设：
+键字段（k5/s0.lo）= 进程内 context 序号；裸进程 import 在第一个
+context（命中孤儿），SPDK 进程（nvmf_tgt accept 每连接重新
+device_open / urma_perf 二次打开）在第二个 context（未命中）。探针
+已升级（p228 rev5：P2_CTX_CNT 旋钮，建 N 个 context 用最后一个）。
+
+**A. 决定性实验（裸进程即可判）**：
+```bash
+# p228 rev5 重编（doc/agents/debug/p228_probe.c，git pull 或文件同步）
+# 终端 1：p228 p1 建资源（P2_CTX_CNT=1），记 EID/JETTY
+# 终端 2（三连）：
+P2_CTX_CNT=1 p228 p2 <eid> <id> 0xACFE     # 对照：应 OK（k5=1）
+P2_CTX_CNT=2 p228 p2 <eid> <id> 0xACFE     # 判定：第二 context import
+P2_CTX_CNT=3 p228 p2 <eid> <id> 0xACFE     # 加深：第三 context
+# 判定：
+#   CTX_CNT=2/3 失败、=1 成功 → 🎯 context 序号假设坐实！
+#   全部成功 → 假设证伪（转 C，此时外部将重新审视 ftrace 键构造）
+```
+
+**B.（若 A 坐实）SPDK 侧交叉验证**：
+```bash
+# kprobe CREATE_CTX（cmd=1）按进程计数：
+#   nvmf_tgt 一次失败回环内 create_context 次数（应为 ≥2）
+#   urma_perf 一次失败 attach 内次数（≥2？）
+# 带回每进程的 context 计数——与键序号对应
+```
+
+**C.（若 A 证伪）level 8 + kprobe rkp 重抓三场景键**：
+```bash
+# P2_CTX_CNT=2/3 的键 k5 值 + urma_perf 键，带回原始行
+```
+
+**D. 还原**（照旧：kprobe 清、level 5、进程清、5 文件照旧）。
+
+**回传**：A 项三连结果 + B/C 项数据，注明「批次 P2-42 完毕」。
 
 ### 指令 2026-10-09 #73：批次 P2-41（JFC 数量判决——SPDK_URMA_JFC_COUNT=1 重跑失败回环，通过则就地 V2）
 
