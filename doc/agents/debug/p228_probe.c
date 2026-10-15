@@ -286,6 +286,30 @@ int main(int argc, char **argv)
 				return 1;
 			}
 		}
+		/* P2-34: importer with its OWN local jetty (SPDK target creates
+		 * its jetty before importing the peer's — the one structural
+		 * difference never tested in bare processes) */
+		if (env_u32("P2_CREATE_JETTY", 0)) {
+			urma_jetty_cfg_t jcfg = {};
+			urma_jetty_t *my;
+
+			jcfg.jfs_cfg.depth = env_u32("JETTY_DEPTH", 2048);
+			jcfg.jfs_cfg.trans_mode = env_mode();
+			jcfg.jfs_cfg.priority = (uint8_t)env_u32("JETTY_PRIORITY", 15);
+			jcfg.jfs_cfg.max_sge = (uint8_t)env_u32("MAX_SGE", 5);
+			jcfg.jfs_cfg.rnr_retry = (uint8_t)env_u32("RNR_RETRY", 7);
+			jcfg.jfs_cfg.err_timeout = (uint8_t)env_u32("ERR_TIMEOUT", 17);
+			jcfg.jfs_cfg.jfc = jfc;
+			jcfg.flag.bs.share_jfr = 1;
+			jcfg.shared.jfr = jfr;
+			jcfg.shared.jfc = jfc;
+			my = urma_create_jetty(e.ctx, &jcfg);
+			if (my == NULL) {
+				printf("[p2] own create_jetty failed\n");
+				return 1;
+			}
+			printf("[p2] own jetty ok (id=%u)\n", my->jetty_id.id);
+		}
 		memcpy(rjetty.jetty_id.eid.raw, eid, 16);
 		rjetty.jetty_id.uasid = 0;
 		rjetty.jetty_id.id = (uint32_t)strtoul(argv[3], NULL, 0);

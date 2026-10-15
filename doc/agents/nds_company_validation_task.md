@@ -244,6 +244,37 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P233（批次 P2-33 回执，用户带回）—— 发往内核的内容逐字节一致；换库路线证伪；球进入内核源码层
+
+**判定：A 🎯 strace 证明裸成功侧与 nvmf_tgt 失败侧的 IMPORT_JETTY_EX
+（cmd=47）**304B TLV 描述表逐字段一致**（tag/len/flag 全同）、凭据一致
+（CapEff 全权、NoNewPrivs=0、Seccomp=0）→ **import 成败不由用户态
+可见参数决定，而由内核内部 per-context/进程状态决定**（内核返回
+EPERM）。B ❌ UMDK liburma（TLV 版）在此 rc2 内核根本不可用（查询
+EINVAL×19+、nvmf_tgt 设备打开即超时失败、裸进程 import 亦 EPERM）
+→ **"换 UMDK 库"修复方向证伪**。C ✅ 模块参数清单（含
+ubcore_enable_shared_ctp=N 值得注意）。D ✅ 还原。**
+
+- **A 项细节**：两侧全部 uburma 调用同编码 cmd=0x55、设备
+  /dev/uburma/udmac0d1e2；裸侧 24 个唯一调用全 ret=0；nvmf_tgt 侧
+  48 个，唯一失败正是 cmd=47（IMPORT_JETTY_EX，errno=1 EPERM）；
+  差异仅 nvmf_tgt 在 import 前多本地 CREATE_JETTY（P2-28 已排除）。
+- **B 项细节**：UMDK 库下裸进程 import 亦 EPERM（kdrv=0）；
+  nvmf_tgt 换装后在 urma device open 阶段即失败（create_context/
+  query 超时 ~5s）——比 import 更早。**换库假设正式出清**。
+- **C 项**：内核 6.6.0-159；模块 udma/uburma/ubcore/ubase/ummu_core；
+  ubcore 参数：g_ubcore_log_level=5、**ubcore_enable_shared_ctp=N**、
+  ubcore_conn_timeout=30000、max_retry_cnt=11、ratelimit_burst=10；
+  uburma 参数：log_level=5、ratelimit_burst=10 等。
+- **外部下一步（接手判定）**：证据已收窄到"内核在 import 路径上对
+  DPDK 进程的 context 判 EPERM"。用户态可见信息已穷尽（strace 全
+  同）→ **转入内核驱动源码分析**：本地 _p2_recon 有 urma 驱动全源
+  码（uburma_cmd_import_jetty_ex → ubcore_import_jetty →
+  create_tpid_priv → get_tp_list_from_ops → udma ctrlq），从源码找
+  EPERM 判定点与 per-context 状态（uasid/shared_ctp/白名单等）。
+  注意内核内部 ret=-2=-ENOENT（ctrlq send）与用户态 EPERM 的映射
+  关系也需从源码确认。
+
 ### 回执导入 2026-10-09 #P232（批次 P2-32 回执，用户带回）—— 发起方 env 无影响（含设计缺口修正）；变量必须移到 nvmf_tgt
 
 **判定：A ✅ liburma_common.so.0(0.0.1) 三者（nvmf_tgt/urma_perf/裸
@@ -1562,6 +1593,67 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #66：批次 P2-34（导入方隔离终判——"importer 先建了自己的本地 jetty"）
+
+**背景**：外部已完成内核源码第一轮分析（本地 urma_driver_full 快照）：
+① import 的 ctrlq GET_TP_LIST 请求携带**调用进程 PID**
+（`tp_cfg_req.flag = current->tgid & 0xFFFFFF`），失败码来自**管理侧
+对请求的处理结果**（wait_completed 返回 -ctx->result，本例=2）；
+② PID 掩码 24 位，截断排除；③ 本地源码与运行内核存在版本差
+（create_tpid_priv 不在快照中），静态分析到此为止。
+**新发现的结构性差异（11 个批次以来唯一没测过的组合）**：nvmf_tgt 在
+import 前创建了**自己的本地 jetty**（accept → create_jetty →
+handshake，lib/nvmf/urma.c:577）；而所有成功的裸进程 import 都**没有**
+本地 jetty。探针已升级（p228 rev3，p2 新增 P2_CREATE_JETTY 旋钮）。
+
+**A. 决定性实验（裸进程复现尝试）**：
+```bash
+# p228 rev3 重编（doc/agents/debug/p228_probe.c，git pull 或文件同步）
+# 终端 1：p228 p1 建资源（全默认），记 EID/JETTY
+# 终端 2：
+P2_CREATE_JFC=1 P2_CREATE_JFR=1 P2_CREATE_JETTY=1 \
+  p228 p2 <eid> <jetty_id> 0xACFE
+# 判定：
+#   import FAILED → 🎯 根因坐实："importer 已建本地 jetty 后再 import
+#     必败"（与 DPDK 无关！），转 B
+#   import OK → 该组合排除，转 D
+```
+
+**B.（若 A 复现）最小触发组合二分**：
+```bash
+# 每次只变一个（p1 不变）：
+P2_CREATE_JETTY=1 P2_CREATE_JFC=1 P2_CREATE_JFR=0   # jetty 不绑共享 JFR？
+#   （注：share_jfr=1 无 JFR 会建 jetty 失败，若如此记录并跳过）
+P2_CREATE_JETTY=1 JETTY_PRIORITY=2
+P2_CREATE_JETTY=1 JETTY_DEPTH=256
+# 带回每组合 import 结果 + dmesg
+```
+
+**C.（若 A 复现）SPDK 侧修复实验**：
+```bash
+# 若确认"先建本地 jetty 再 import"是触发条件，SPDK target 的修复 =
+# 调整 accept 顺序：import（读 HELLO 即可发起）→ 建本地 jetty → 发
+# HELLO_RSP。外部出 patch 后由我同步——本批先带回头判数据。
+# （协议可行性：import 的对象是 initiator 的 jetty，与 target 自身
+#   jetty 无关；RSP 需要的 jetty_id 可后补。）
+```
+
+**D.（若 A 不复现）内核侧取证升级**：
+```bash
+# 1. 模块参数（运行时可逆，实验后立即恢复原值 5 并带回前后 dmesg 行数）：
+cat /sys/module/ubcore/parameters/g_ubcore_log_level    # 记原值
+echo 8 > /sys/module/ubcore/parameters/g_ubcore_log_level   # 临时提级
+# 重跑一次失败 import，抓 dmesg 全量 ubcore/uburma/udma 行，立即：
+echo 5 > /sys/module/ubcore/parameters/g_ubcore_log_level   # 恢复
+# （uburma 同法；提级仅限本批测试窗口，属运行时可逆操作，不落盘）
+# 2. ftrace 检查（只读）：
+ls /sys/kernel/debug/tracing/events/ 2>/dev/null | grep -i "ub\|udma"
+```
+
+**E. 还原**（5 文件状态照旧；探针/日志清理；模块参数必须恢复）。
+
+**回传**：A/B 结果表 + dmesg；C/D 按条件执行，注明「批次 P2-34 完毕」。
 
 ### 指令 2026-10-09 #65：批次 P2-33（导入方攻坚——strace 对比 + 带调试的 UMDK liburma 换装试验）
 
