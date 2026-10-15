@@ -244,6 +244,31 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P238（批次 P2-38 回执，用户带回）—— 🎯 分叉函数名到手：ubcore_find_get_tp_id_state_entry
+
+**判定：E-A 🎯 p232 成功路径 = **reuse 命中同一个孤儿 8388644**
+（get_tp_list 计数 0，全程不查询）；E-B ❗ urma_perf 失败路径 = 未
+命中 → GET_TP_LIST ×3 全 -2。**E-C 🎯 ftrace 符号级调用树：两条路
+径自 ubcore_import_jetty 起**逐符号完全一致**，直至——
+成功侧进入 `ubcore_find_get_tp_id_state_entry`（命中 state entry →
+import_ex → active_tp → create_vtpn）；失败侧跳过它，转
+`ubcore_get_tp_list_helper → from_ops`。分叉第一函数 =
+**ubcore_find_get_tp_id_state_entry**；其上游键构造 =
+`ubcore_set_tpid_list_key` + 查找 `ubcore_ht_find_get_tpid_list`。**
+D ✅ 还原（ftrace NOP、level 5、孤儿未触碰）。
+
+- **Q-A1**：p232 成功 = reuse 命中（非 GET_TP_LIST 成功）。
+- **Q-A2**：命中对象 = 跨批次稳定的孤儿 8388644；被 import 的对端
+  jetty = p237 的 8294。
+- **关键矛盾定格**：键构造函数相同 + TLV 输入相同 + 对端相同 →
+  查找结果不同 → **查找键必含"每进程不同"的字段**（候选：uasid/
+  ucontext 派生值——三个函数均不在本地快照，运行内核更新的实现，
+  静态分析无法再推进）。
+- **下一步（外部采纳）**：kprobe 抓查找键的内存实参——
+  `ubcore_hash_table_lookup_nolock(ht, hash, key)`（本地快照有此
+  签名）+ `ubcore_set_tpid_list_key`——两场景各抓一次，键字节 diff，
+  "每进程不同"的字段直接现形。
+
 ### 回执导入 2026-10-09 #P237（批次 P2-37 回执，用户带回）—— 🎯 触发面收窄至 SPDK transport 的 import 路径（env/EAL/JFC 全排除）
 
 **判定：E-A 🎯 urma_perf（DPDK, SPDK transport）对**已知健康的裸
@@ -1711,6 +1736,59 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #71：批次 P2-39（kprobe 抓查找键实参——两场景键字节 diff，定位"每进程不同"的字段）
+
+**背景**：P2-38 分叉函数 = ubcore_find_get_tp_id_state_entry（成功侧
+命中 / 失败侧跳过）。键构造与 TLV 输入相同而结果不同 → 键必含
+per-process 字段。本批用 kprobe 把**查找键的内存内容**抓出来直接
+diff（运行内核符号在 ftrace 已确认存在；kprobe 属 debugfs 瞬态操作，
+重启即清，不落盘）。
+
+**A. kprobe 挂载（root，debugfs）**：
+```bash
+cd /sys/kernel/debug/tracing
+# 查找函数（本地快照签名：(ht, hash, key)，aarch64 → x0/x1/x2）：
+echo 'p:rkp ubcore_hash_table_lookup_nolock ht=%x0 hash=%x1 k0=+0(%x2):x64 k1=+8(%x2):x64 k2=+16(%x2):x64 k3=+24(%x2):x64 k4=+32(%x2):x64 k5=+40(%x2):x64 k6=+48(%x2):x64' > kprobe_events
+echo 1 > events/kprobes/rkp/enable
+# 若挂载报错（符号/参数不支持），降级尝试：
+echo 'p:skp ubcore_set_tpid_list_key a0=%x0 a1=%x1 d0=+0(%x1):x64 d1=+8(%x1):x64 d2=+16(%x1):x64 d3=+24(%x1):x64 d4=+32(%x1):x64 d5=+40(%x1):x64' > kprobe_events
+```
+
+**B. 裸成功侧取证**：
+```bash
+echo 1 > tracing_on
+# 跑 p232 SPDK_ENV=1 对 p237（成功 import）
+echo 0 > tracing_on
+cp trace /home/tools/app/p239_log/kprobe_p232.txt
+```
+
+**C. SPDK 失败侧取证**：
+```bash
+echo 1 > tracing_on
+# 跑 urma_perf -M cpu 对 p237（失败 import）
+echo 0 > tracing_on
+cp trace /home/tools/app/p239_log/kprobe_perf.txt
+```
+
+**D. 分析（带回原始两份 trace 即可，外部做 diff）**：
+```bash
+# trace 行自带 comm/PID——按进程过滤后，找 import 邻近行的 k0..k6
+# 对比两侧：哪个 8 字节字段不同 = per-process 字段
+# （预期差异候选：uasid / ucontext 派生值；eids 应相同）
+```
+注意：lookup_nolock 会被其他表查找触发（噪音）——按"import 时间窗
++ 前后文"过滤；两场景用相同过滤标准。
+
+**E. 还原**：
+```bash
+echo 0 > events/kprobes/rkp/enable
+echo -:rkp > kprobe_events
+# level 5 / ftrace NOP / 进程清理 / 5 文件照旧
+```
+
+**回传**：两份 kprobe trace 原文（import 邻近段）+ 初步字段 diff，
+注明「批次 P2-39 完毕」。
 
 ### 指令 2026-10-09 #70：批次 P2-38（p232 成功路径取证 + ftrace 符号级调用树对比）
 
