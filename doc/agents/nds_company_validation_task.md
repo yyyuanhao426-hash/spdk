@@ -244,6 +244,31 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P252（批次 P2-52 回执，用户带回）—— RA jetty 替换机制生效；失败码位移 9→4（LOC_ACCESS_ERR）；逐行对比需 p248 源码
+
+**判定：A ✅ 重编（advertising/get_ra_jetty_info 均在位）；B ✅ -M cpu
+回归 PASS（3396/0，且无 advertising 行 = cpu 不受影响 ✓）；C ❌
+STILL_FAIL 但形态显著改变：**
+- **RA jetty 替换机制生效**：dmesg 铁证——target I/O qpair 导入的
+  jetty id=11366 = initiator 自报的 RA jetty（admin qpair 仍是 SPDK
+  jetty 4593）；"advertising" 行未打印仅因 NOTICELOG 默认级别抑制。
+- **失败码位移**：target status=9（ACK_TIMEOUT）→ **status=4
+  （URMA_CR_LOC_ACCESS_ERR，本地内存访问错误）**；initiator -71 →
+  I/O qpair Connect -5（sct 0 sc 6）。
+- **tjetty 替换改变了内核行为但未打通** → "tjetty 必须为 RA jetty"
+  假设**部分成立**（方向对）但不足——数据面仍有独立缺陷。D/E ✅
+  还原（本批新建 RA reuse tpid 8388652 未触碰；孤儿 8388644 在位）。**
+
+- **对照悖论（待解）**：p248 变体（自建 jetty + import RA jetty +
+  import HBM seg + READ）**成功**；SPDK 数据面**同形态失败**。且
+  p248 成功 READ 的 wr dump（src/dst 全 0、user_ctx=0x2）**不可信**
+  ——打印疑似捕获了未填充/未实际 post 的模板（src/dst 全 0 不可能
+  传输 64KB）——**真实 post 的 WR 构造必须从源码确认**。
+- **下一步（#85）**：带回 p248_probe.cpp **全文源码文本**（含
+  urma_read_remote 的 WR 构造与 post 调用、core 创建参数）+
+  p219 的 nds_urma_core_create 原文 → 外部与 SPDK
+  （nvmf_urma_post_data + nvme_urma_create_jetty）逐行对比 → 修复。
+
 ### 回执导入 2026-10-09 #P251（批次 P2-51 回执，用户带回）—— libnds 切换生效但 RA 栈完整度假设证伪；差异收口至"数据面远端腿"
 
 **判定：A ✅ provider 切换生效且无破坏（新 urma_perf 含 libnds 全栈
@@ -2075,6 +2100,36 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #85：批次 P2-53（p248 源码全文带回——SPDK 数据面逐行对比的基础）
+
+**背景**：P2-52 的 RA jetty 替换改变了内核行为（失败码 9→4）但未打
+通。p248 变体（同形态）成功、SPDK 失败，逐行对比需要 **p248 探针的
+完整源码文本**——此前只带回过文件、未贴内容，外部本地没有。
+
+**A. 带回源码全文（只读，直接贴回执）**：
+```bash
+cat /home/tools/app/p248_log/p248_probe.cpp
+# 全文原样贴入回执（约 500 行；重点段落：
+#   1) nds_urma_core_create —— ctx/jfc/jetty 的创建参数全文
+#      （jfc depth/flag、jfr depth/token/flag、jetty depth/priority/
+#       max_sge/rnr/err_timeout/flag）
+#   2) urma_read_remote —— WR 构造与 post 的完整代码
+#      （local_sge/remote_sge 各字段赋值、wr.opcode/flag/user_ctx/
+#       tjetty、urma_post_jetty_send_wr 的调用形式）
+#   3) local buffer 的注册方式（urma_register_seg 的 cfg 全字段）
+# 若全文过长，按上述三段优先；另附 p219_probe.cpp 的
+# nds_urma_core_create 段（若与 p248 不同）
+```
+
+**B. SPDK 侧对照素材（已具备，无需重抓）**：P2-49 的 NDS-PULL dump
+（失败 pull 的 wr80/seg48/sge 原始字节）+ P2-47 的审计矩阵。外部将
+用 A 项源码与 lib/nvmf/urma.c 的 nvmf_urma_post_data、
+nvme_urma_create_jetty 逐行 diff。
+
+**C. 约束**：纯只读；无现场变更。
+
+**回传**：A 项源码全文（三段），注明「批次 P2-53 完毕」。
 
 ### 指令 2026-10-09 #84：批次 P2-52（RA jetty 数据面判决——HELLO 发布 RA jetty，数据面通过就地 V2）
 
