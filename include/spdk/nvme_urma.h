@@ -21,12 +21,43 @@ enum spdk_nvme_urma_memory_type {
 };
 
 /**
+ * Direct-route segment descriptor (NDS): the fields a remote peer needs to
+ * urma_import_seg() this memory without the initiator having called
+ * urma_register_seg() locally. Produced by a provider's get_segment_info()
+ * from accelerator-native registration (e.g. NPU HBM via RA/HCCP
+ * RaCtxLmemRegister: token_id from the lmem key, eid/uasid from the RA
+ * domain — colleague_c nds_get_segment_info semantics, P2-23).
+ */
+struct spdk_nvme_urma_seg_info {
+	uint8_t eid[16];
+	uint32_t uasid;
+	uint64_t va;
+	uint32_t token_id;
+	uint64_t len;
+};
+
+/**
+ * NDS direct route: the initiator's data-plane jetty. For NPU HBM the
+ * data-plane jetty must be the RA jetty (libra domain) — the HBM segment
+ * (RA lmem nonPin registration) is only remotely DMA-able via the
+ * RA-domain TP.
+ */
+struct spdk_nvme_urma_ra_jetty_info {
+	uint8_t eid[16];
+	uint32_t uasid;
+	uint32_t jetty_id;
+};
+
+/**
  * Optional accelerator-memory provider.
  *
  * XDS, CUDA, ROCm and NPU integrations can use this interface without adding
  * accelerator SDK headers to SPDK.  pin() must keep the allocation alive until
  * unpin() is called.  export_dmabuf() is optional; a provider may instead rely
  * on URMA peer-memory registration of the returned device virtual address.
+ * get_segment_info() is optional: when present and successful, the region is
+ * exported to the peer through the direct route (capsule carries the
+ * synthesized urma_seg_t) and local urma_register_seg() is skipped entirely.
  */
 struct spdk_nvme_urma_memory_provider {
 	const char *name;
@@ -35,6 +66,10 @@ struct spdk_nvme_urma_memory_provider {
 	void (*unpin)(void *provider_ctx, void *pin_handle);
 	int (*export_dmabuf)(void *provider_ctx, void *pin_handle, int *fd,
 			      uint64_t *offset);
+	int (*get_segment_info)(void *provider_ctx, void *pin_handle,
+				struct spdk_nvme_urma_seg_info *info);
+	int (*get_ra_jetty_info)(void *provider_ctx,
+				 struct spdk_nvme_urma_ra_jetty_info *info);
 	void *provider_ctx;
 };
 
@@ -47,6 +82,7 @@ struct spdk_nvme_urma_memory_stats {
 	uint64_t dmabuf_registrations;
 	uint64_t peer_memory_registrations;
 	uint64_t registration_failures;
+	uint64_t direct_registrations;
 };
 
 /** Register an accelerator-memory provider. Providers are process-global. */
@@ -96,6 +132,15 @@ int spdk_nvme_urma_memory_region_export(
 
 /** Read or reset process-wide URMA memory registration diagnostics. */
 void spdk_nvme_urma_get_memory_stats(struct spdk_nvme_urma_memory_stats *stats);
+
+/**
+ * NDS direct route: query the provider's data-plane (RA) jetty. Returns
+ * 0 and fills info when the provider's full NDS/RA stack is ready;
+ * -ENOTSUP/-ENODEV otherwise (the HELLO then advertises the regular
+ * SPDK jetty).
+ */
+int spdk_nvme_urma_provider_get_ra_jetty_info(enum spdk_nvme_urma_memory_type type,
+		struct spdk_nvme_urma_ra_jetty_info *info);
 void spdk_nvme_urma_reset_memory_stats(void);
 
 /** Modified By Yida: dump per-phase timing breakdown (register/send/completion/release/total) */

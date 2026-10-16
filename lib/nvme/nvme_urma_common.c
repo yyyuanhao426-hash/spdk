@@ -4,6 +4,8 @@
 
 #include "nvme_urma_internal.h"
 
+#include <dlfcn.h>
+
 #define SPDK_URMA_PROVIDER_COUNT (SPDK_NVME_URMA_MEM_XDS + 1)
 
 struct spdk_nvme_urma_memory_region {
@@ -11,6 +13,11 @@ struct spdk_nvme_urma_memory_region {
 	size_t length;
 	enum spdk_nvme_urma_memory_type type;
 	urma_target_seg_t *target_seg;
+	/* NDS direct route: segment synthesized from accelerator-native
+	 * registration (RA/HCCP), carried in the capsule for peer import;
+	 * npu_direct regions have target_seg == NULL. */
+	urma_seg_t direct_seg;
+	bool npu_direct;
 	const struct spdk_nvme_urma_memory_provider *provider;
 	void *pin_handle;
 	int dmabuf_fd;
@@ -31,6 +38,39 @@ static size_t g_numa_chip_id_count;
 
 #define SPDK_URMA_STAT_INC(member) \
 	__atomic_fetch_add(&g_memory_stats.member, 1, __ATOMIC_RELAXED)
+
+/* Modified By NDS: urma_register_seg_dmabuf 是 liburma gds 分支的扩展符号，
+ * 标准版 liburma 没有。改为运行时 dlsym 解析（RTLD_DEFAULT），使同一份
+ * urma_perf 二进制既能配 gds liburma 也能配标准 liburma 运行——批次 4 的
+ * 标准库对照实验因 undefined symbol 无法进行，此改动解锁该实验，
+ * 同时让 host-only 路线（cpu/posix/npu-staged）摆脱对 gds 库的运行时依赖。 */
+typedef urma_target_seg_t *(*spdk_urma_reg_seg_dmabuf_fn)(urma_context_t *,
+		urma_seg_cfg_t *, int, uint64_t);
+
+static spdk_urma_reg_seg_dmabuf_fn g_reg_seg_dmabuf_fn;
+static pthread_once_t g_reg_seg_dmabuf_once = PTHREAD_ONCE_INIT;
+
+static void
+spdk_urma_resolve_reg_seg_dmabuf_fn(void)
+{
+	g_reg_seg_dmabuf_fn = (spdk_urma_reg_seg_dmabuf_fn)
+			      dlsym(RTLD_DEFAULT, "urma_register_seg_dmabuf");
+	if (g_reg_seg_dmabuf_fn == NULL) {
+		SPDK_NOTICELOG("liburma has no urma_register_seg_dmabuf "
+			       "(standard build); dmabuf registration disabled\n");
+	}
+}
+
+static urma_target_seg_t *
+spdk_urma_register_seg_dmabuf(void *urma_context, urma_seg_cfg_t *cfg,
+			      int dmabuf_fd, uint64_t offset)
+{
+	pthread_once(&g_reg_seg_dmabuf_once, spdk_urma_resolve_reg_seg_dmabuf_fn);
+	if (g_reg_seg_dmabuf_fn == NULL) {
+		return NULL;
+	}
+	return g_reg_seg_dmabuf_fn(urma_context, cfg, dmabuf_fd, offset);
+}
 
 static int
 spdk_urma_runtime_get(void)
@@ -386,6 +426,40 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 			SPDK_URMA_STAT_INC(registration_failures);
 			goto fail_provider;
 		}
+		/* NDS direct route: the provider synthesizes the peer-importable
+		 * segment from accelerator-native registration (P2-23: eid/uasid
+		 * from the RA domain, token_id from the lmem key). The capsule
+		 * carries it and the target imports it — no local
+		 * urma_register_seg()/is_gpu_seg roundtrip, which cannot work
+		 * for NPU HBM (P2-8 verdict). Attribute values follow
+		 * colleague_c nds_urma_import_remote_seg (nds_urma.c:457). */
+		if (region->provider->get_segment_info != NULL) {
+			struct spdk_nvme_urma_seg_info si;
+
+			rc = region->provider->get_segment_info(
+				     region->provider->provider_ctx,
+				     region->pin_handle, &si);
+			if (rc == 0) {
+				memset(&region->direct_seg, 0, sizeof(region->direct_seg));
+				memcpy(region->direct_seg.ubva.eid.raw, si.eid,
+				       sizeof(region->direct_seg.ubva.eid.raw));
+				region->direct_seg.ubva.uasid = si.uasid;
+				region->direct_seg.ubva.va = si.va;
+				region->direct_seg.len = si.len;
+				region->direct_seg.attr.bs.cacheable = URMA_NON_CACHEABLE;
+				region->direct_seg.attr.bs.access = URMA_ACCESS_READ |
+								    URMA_ACCESS_WRITE |
+								    URMA_ACCESS_ATOMIC;
+				region->direct_seg.token_id = si.token_id;
+				region->npu_direct = true;
+				SPDK_URMA_STAT_INC(direct_registrations);
+				*region_out = region;
+				return 0;
+			}
+			fprintf(stderr, "provider %s get_segment_info rc=%d — "
+				"falling back to urma_register_seg\n",
+				region->provider->name, rc);
+		}
 	}
 
 	cfg.va = (uint64_t)addr;
@@ -402,7 +476,7 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 		rc = region->provider->export_dmabuf(region->provider->provider_ctx,
 					     region->pin_handle, &region->dmabuf_fd, &offset);
 		if (rc == 0) {
-			region->target_seg = urma_register_seg_dmabuf(urma_context, &cfg,
+			region->target_seg = spdk_urma_register_seg_dmabuf(urma_context, &cfg,
 								       region->dmabuf_fd, offset);
 			if (region->target_seg != NULL) {
 				SPDK_URMA_STAT_INC(dmabuf_registrations);
@@ -504,12 +578,55 @@ spdk_urma_memory_region_get_tseg(struct spdk_nvme_urma_memory_region *region)
 	return region == NULL ? NULL : region->target_seg;
 }
 
+bool
+spdk_urma_memory_region_is_direct(const struct spdk_nvme_urma_memory_region *region)
+{
+	return region != NULL && region->npu_direct;
+}
+
+int
+spdk_nvme_urma_provider_get_ra_jetty_info(enum spdk_nvme_urma_memory_type type,
+		struct spdk_nvme_urma_ra_jetty_info *info)
+{
+	const struct spdk_nvme_urma_memory_provider *provider;
+	int rc = -ENOTSUP;
+
+	if (info == NULL || type >= SPDK_URMA_PROVIDER_COUNT) {
+		return -EINVAL;
+	}
+	pthread_mutex_lock(&g_provider_mutex);
+	provider = g_providers[type];
+	if (provider != NULL && provider->get_ra_jetty_info != NULL) {
+		rc = provider->get_ra_jetty_info(provider->provider_ctx, info);
+	}
+	pthread_mutex_unlock(&g_provider_mutex);
+	return rc;
+}
+
+urma_seg_t
+spdk_urma_memory_region_get_direct_seg(const struct spdk_nvme_urma_memory_region *region)
+{
+	if (region == NULL) {
+		return (urma_seg_t){};
+	}
+	return region->direct_seg;
+}
+
 int
 spdk_nvme_urma_memory_region_export(const struct spdk_nvme_urma_memory_region *region,
 				    void *buf, size_t *length)
 {
 	if (region == NULL || length == NULL) {
 		return -EINVAL;
+	}
+	if (region->npu_direct) {
+		if (buf == NULL || *length < sizeof(region->direct_seg)) {
+			*length = sizeof(region->direct_seg);
+			return buf == NULL ? 0 : -ENOSPC;
+		}
+		memcpy(buf, &region->direct_seg, sizeof(region->direct_seg));
+		*length = sizeof(region->direct_seg);
+		return 0;
 	}
 	if (buf == NULL || *length < sizeof(region->target_seg->seg)) {
 		*length = sizeof(region->target_seg->seg);

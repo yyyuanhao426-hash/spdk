@@ -523,6 +523,24 @@ nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
 						 uqpair->jetty_count, (uint64_t)UINT32_MAX));
 	local.max_io_size = uqpair->max_io_size;
 	local.capsule_transport = uqpair->device->opts.capsule_transport;
+	/* NDS direct route: advertise the RA jetty (libra domain) as the
+	 * data-plane jetty instead of the SPDK-created one. The HBM segment
+	 * (RA lmem nonPin registration) is only remotely DMA-able via the
+	 * RA-domain TP — a pull/read WR whose tjetty is the SPDK jetty
+	 * ACK-times-out (P2-48/P2-51). The target imports the advertised
+	 * jetty unchanged, so its data-plane wr.tjetty lands on the RA
+	 * jetty (the p248-proven shape). */
+	{
+		struct spdk_nvme_urma_ra_jetty_info ra = {};
+
+		if (spdk_nvme_urma_provider_get_ra_jetty_info(SPDK_NVME_URMA_MEM_NPU,
+				&ra) == 0) {
+			memcpy(&local.eid, ra.eid, sizeof(local.eid));
+			local.jetty_id = ra.jetty_id;
+			SPDK_NOTICELOG("NDS: advertising RA jetty %u as data-plane jetty\n",
+				       ra.jetty_id);
+		}
+	}
 	rc = nvme_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
 	if (rc == 0) {
 		rc = nvme_urma_write_full(uqpair->fd, &local, sizeof(local));
@@ -798,7 +816,14 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 				__atomic_add_fetch(&g_timing.reg_count, 1, __ATOMIC_RELAXED);
 			}
 		}
-		capsule.data.seg = spdk_urma_memory_region_get_tseg(ureq->region)->seg;
+		if (spdk_urma_memory_region_is_direct(ureq->region)) {
+			/* NDS direct route: capsule carries the synthesized
+			 * urma_seg_t (RA/HCCP domain); the target imports it
+			 * through its existing W5 path unchanged. */
+			capsule.data.seg = spdk_urma_memory_region_get_direct_seg(ureq->region);
+		} else {
+			capsule.data.seg = spdk_urma_memory_region_get_tseg(ureq->region)->seg;
+		}
 		capsule.data.address = (uint64_t)addr;
 		capsule.data.length = req->payload.size;
 		capsule.data.chip_id = uqpair->device->opts.numa_affinity ?

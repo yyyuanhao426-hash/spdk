@@ -162,6 +162,15 @@ int spdk_urma_device_poll_recv_jfc(struct spdk_urma_device *device, uint32_t ind
 uint8_t spdk_urma_memory_chip_id(const void *addr);
 urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 	struct spdk_nvme_urma_memory_region *region);
+int spdk_nvme_urma_provider_get_ra_jetty_info(enum spdk_nvme_urma_memory_type type,
+		struct spdk_nvme_urma_ra_jetty_info *info);
+
+/* NDS direct route: the provider synthesized the peer-importable segment
+ * from accelerator-native registration (RA/HCCP), no local tseg exists. */
+bool spdk_urma_memory_region_is_direct(
+	const struct spdk_nvme_urma_memory_region *region);
+urma_seg_t spdk_urma_memory_region_get_direct_seg(
+	const struct spdk_nvme_urma_memory_region *region);
 
 /* Modified By Yida(v7): 整池注册表（实现见 nvme_urma_common.c）。由 initiator
  * 预注册缓冲或 target iobuf 整池注册填充；I/O 提交路径用 find() 采纳覆盖本
