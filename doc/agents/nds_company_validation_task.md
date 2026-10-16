@@ -2307,6 +2307,76 @@ handle）、jetty 表（jetty_cnt=10）两场景逐字节一致，孤儿 8388644
   lmem 注册不在 urma_admin 的 seg/tp 表可见层**（在 nds/RA 内部表）
   ——与 P2-23 的"nds 内部表"结论一致。
 
+
+### 回执导入 2026-10-09 #P260（批次 P2-60 回执，用户带回）—— 跨设备证伪；多 jetty 数组错配假设成型
+
+**判定：A ❌ 跨设备两方向都失败且失败点前移（admin qpair 阶段即
+status=4，advertising OFF 也一样）→ "同设备自连接路由缺陷"证伪，
+且跨设备引入独立更早的问题；C1（同设备 advOFF）经典形态复现
+（I/O ×2 status=4）；C2（跨设备 advOFF）admin qpair 也过不去
+（status=4）。D ✅ 还原。**
+
+- **外部综合 26 批数据 + nds_v2 代码阅读，新根因假设（多 jetty 数组
+  错配）**：同事B 重构后的握手是 **multi-jetty 数组**——HELLO 发布
+  `jetty_ids[i]`（SPDK jets 的 id），target 按 `remote.jetty_ids[i]`
+  逐个 import（eid 统一用 remote.eid）。我们的 RA jetty 替换**只改了
+  jetty_ids[0]**——jetty_ids[1..] 仍是 SPDK jetty 的 id，但 eid 已换
+  成 RA 会话 eid → **target 导入了 {RA eid, SPDK jetty id} 的错配
+  对**！数据 WR 按 round-robin（next_jetty++ % jetty_count）分布在
+  所有 pair 上——落在错配对的远端读 → HBM 无应答（status=9）或访问
+  拒绝（status=4），取决于哪个 pair 接到失败的 WR——与 P2-51~60 的
+  交替现象吻合。
+- **修法（零代码）**：`SPDK_URMA_NUM_JETTY_PER_EP=1`（jetty_count=1，
+  两侧）+ advertising ON → HELLO 只发布 RA jetty → 全部数据 WR 走
+  RA 域 → 与 p248 成功形态一致。
+- **前置发现（P2-60）**：133 期间重启过（孤儿 tpid 8388644 随重启消
+  失——预期）；设备名未变号（udmac0d1e2=df08:0b00、udmac1d1e2=df0a:
+  0b00，恰对应 p248 的 df08/df0a 两设备）；跨设备的 admin 阶段失败
+  为独立问题（不阻塞同设备路线）。
+
+### 指令 2026-10-09 #94：批次 P2-61（多 jetty 错配判决——jetty_count=1 + RA jetty 单播，数据面通过就地 V2）
+
+**背景**：外部综合 26 批数据 + nds_v2 代码阅读，新根因假设 = **多
+jetty 数组错配**：HELLO 发布 jetty_ids[]（SPDK jets 的 id）+ 我们只
+替换了 jetty_ids[0]（RA jetty）→ jetty_ids[1..] 与 RA eid 错配 →
+target 导入的错配对上的数据 WR 失败（status=9/4 交替，round-robin
+分布）。**修法零代码**：jetty_count=1（env）→ HELLO 只发布 RA
+jetty。
+
+**A. 判决（核心，env 两侧）**：
+```bash
+# target 与 initiator 两侧都：
+export SPDK_URMA_NUM_JETTY_PER_EP=1
+export SPDK_URMA_JETTY_COUNT=1
+# advertising ON（默认，代码无条件发布 RA jetty——jetty_count=1 时
+# jetty_ids[0] 被 NDS 块覆盖为 RA jetty id）
+# 跑 -M npu（level 8 + 双侧 stderr）：
+#   数据面通过（errors=0 + 数据一致 + 无 -71/status=4/9）→
+#   🎯🎯 根因坐实（多 jetty 错配），就地 V2 完成！
+#   仍失败 → 带回 stderr/dmesg + NDS-PULL 类 dump（如可行）
+```
+
+**B.（A 通过时）V2 固化 + V3 预备**：
+```bash
+# 1) -M cpu 回归（jetty_count=1 下 host 路径验证）
+# 2) urma_admin seg/tp 快照 + -M npu 计时段/带宽全量（V3 基线）
+# 3) -M cpu / -M npu 同条件对比
+# 4) 记录最终 env 组合（正式固化由外部出 patch：NPU 模式下
+#    jetty_count 强制 1 或 jetty_ids[] 全部替换为 RA jetty id）
+```
+
+**C.（A 仍败）对照矩阵**：
+```bash
+# 1) jetty_count=1 + advertising OFF（对照：connect 应通，
+#    数据面旧形态确认）
+# 2) jetty_count=2 + advertising ON（复现错配）
+# 3) 带回两侧 stderr/dmesg
+```
+
+**D. 还原**：env 随进程不残留；照旧还原其余。
+
+**回传**：A 项结果（+B/C 按条件），注明「批次 P2-61 完毕」。
+
 ### 指令 2026-10-09 #93：批次 P2-60（跨设备判决——target/initiator 分属不同 udmac 设备，通过就地 V2）
 
 **背景**：P2-59 发现关键拓扑事实：p248 的工作流（跨设备：P2 的
