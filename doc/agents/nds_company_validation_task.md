@@ -2101,6 +2101,81 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
 
+### 回执导入 2026-10-09 #P254（批次 P2-54 回执，用户带回）—— nds_v2 落地（2 处残留冲突由测试 agent 就地修复）；-M npu 失败前移至 CONNECT 阶段
+
+**判定：A ✅ 全量同步（18 文件，git archive 打包）+ 2 处残留冲突就地
+修复（① nvme_urma.c:539 jetty_ids[] 数组改名——同事B multi-jetty
+重构；② mk/nvme.libtest.mk 恢复 $(C_SRCS-y)——我们的 Makefile 补丁
+基于旧版，丢掉了该增量 → urma_perf_npu.c 曾不参与编译）+ 重编四目
+标；B ✅ -M cpu 回归 6100/0；C ❌ -M npu 失败前移：I/O qpair CONNECT
+阶段即失败（rc -5, sct 0 sc 6），target 2× status=4
+（LOC_ACCESS_ERR, type=1=DATA 完成事件）；D 跳过；E ✅ 还原。**
+
+- **⚠️ 外部流程教训（认账）**：上一轮"唯一冲突已解决"说法不实——
+  3way apply 只解决了显式冲突，**语义级残留**（同事B 把 jetty_id
+  改成 jetty_ids[] 数组、Makefile 的 $(C_SRCS-y) 增量）漏检。教训：
+  移植后必须 (a) 全量编译验证（本次正是编译错误兜住的）、(b) grep
+  上游重构涉及的字段改名。
+- **状态定性修正**：P2-52 时"advertising 未打印"实为 SPDK 默认日志
+  级别抑制（NOTICELOG 零初始化=DISABLED），提级后确认 advertising
+  每-I/O-qpair 一次；且 P2-52 的 "11366" 当时只是 session coords
+  打印——本批提级后确认 advertising 实际生效 2 次（每 I/O qpair）。
+- **失败形态**：nds_v2 基线上，RA jetty advertising 使 I/O qpair 的
+  CONNECT 失败（-5, sct 0 sc 6）+ target 侧 2× DATA 完成
+  status=4（LOC_ACCESS_ERR）；内核侧仅 register_seg 噪声、零错误行。
+  -M cpu（无 NPU 路径）不受影响。
+- **下一步（#87 对照实验）**：nds_v2 上**撤销 advertising 块**重跑
+  -M npu——connect 恢复则坐实"advertising 断开 connect"（RA jetty
+  不能承载 SPDK 的 connect/HELLO 流程，修法需改为数据面单独走
+  RA jetty）；仍失败则 nds_v2 基线自身有独立问题（与同事B 的已知
+  用法对照排查）。
+
+### 指令 2026-10-09 #87：批次 P2-55（对照实验——nds_v2 撤销 advertising，切分"advertising 断 connect"与"基线自身问题"）
+
+**背景**：nds_v2 上 RA jetty advertising 使 I/O qpair CONNECT 失败
+（-5 + target status=4 DATA 完成 LOC_ACCESS_ERR）。本批一组对照实验
+切割变量。
+
+**A. 对照组：nds_v2 撤销 advertising（一行注释）**：
+```bash
+# lib/nvme/nvme_urma.c nvme_urma_exchange_hello 内的 NDS direct route 块：
+#   if (spdk_nvme_urma_provider_get_ra_jetty_info(...) == 0) {
+# 整块注释（或加 static bool 开关 env SPDK_NDS_ADVERTISE 控制，默认关）
+# 重编 lib/nvme + urma_perf + nvmf_tgt
+# 跑 -M npu（level 8 + 双侧 stderr）：
+#   connect 结果？（成功则继续看数据面：status=9 旧形态还是 -71？）
+```
+
+**B.（A 的 connect 成功时）基线数据面形态确认**：
+```bash
+# 继续跑到 Verification WRITE 失败点：
+#   status=9（旧形态）→ 坐实"advertising 断 connect"，数据面问题
+#     回到原点（与 P2-51 一致），外部重新设计 RA jetty 接入方式
+#   其他形态 → 带回
+```
+
+**C. capsule_transport 变体（若 A connect 成功）**：
+```bash
+# 他重构后新增可配置 capsule 传输方式（tcp/sendrecv）——确认当前
+# 默认（nvme_urma_common.c:207 = TCP）与 nvmf 侧参数：
+grep -n "capsule" app/nvmf_tgt/*.c lib/nvmf/*.c | grep -i "transport\|sendrecv" | head -5
+# 若 nvmf_create_transport 有 capsule 参数，试 sendrecv 对照一次
+```
+
+**D.（A 的 connect 仍失败时）nds_v2 基线自身排查**：
+```bash
+# 不带 advertising 也 connect 失败 → nds_v2/urma_enable 基线在 133
+# 的 -M npu 连接就有独立问题（与我们的修改无关）——
+# 1) 同参数跑 -M cpu（对照，应通）
+# 2) 检查 urma_enable 已知用法：同事B 测试用的 nvmf_create_transport
+#    参数（CONTEXT.md/scripts 里有完整命令行——带回原文）
+```
+
+**E. 还原**：照旧（注释块还原、level 5、进程清、5 文件照旧）。
+
+**回传**：A 项结果（connect/数据面）+ B/C/D 项按条件，注明
+「批次 P2-55 完毕」。
+
 ### 指令 2026-10-09 #86：批次 P2-54（基线切换 urma_enable/nds_v2——重建 + 回归 + -M npu 重跑）
 
 **背景**：同事B 要求切换 urma_enable 分支（其包含大量数据面修复：
