@@ -2152,6 +2152,83 @@ SPDK_NDS_ADVERTISE 与日志补丁已还原）。**
   令牌错 → 该 jetty 上的远端访问被拒）。此为下一个判决点（#88）。
 - **另**：P2-53（p248 源码全文带回）尚未回执——逐行对比素材仍需要。
 
+
+### 回执导入 2026-10-09 #P256（批次 P2-56 回执，用户带回）—— 令牌矩阵 4/4 全败但带回 p248 源码：缺失的格子找到了
+
+**判定：A ❌ jetty import token=0 证伪（运行时实证 token 确为 0，仍
+Connect -5 + status=4）；C ❌ 令牌 4 组合矩阵（jetty{0,0xACFE} ×
+seg{0,0xACFE}）全部同败 → 令牌假设按已测值证伪。D ✅ 还原。**
+**但 C 项带回 p248_probe.cpp 全文（423 行）——真正的逐行对比完成，
+发现两个此前 26 批全部漏掉的参数差异：**
+1. **seg 导入令牌**：p248 用 `token = NDS_URMA_TOKEN`（**非 0、非
+   0xACFE**——nds_urma.h 常量）；P2-56 矩阵只测了 {0, 0xACFE}，
+   **恰好漏掉真实值**。URMA seg 访问授权模型 = import token 必须匹
+   配注册时的 token_value：HBM 段经 nds_buf_register 注册时的
+   token_value = NDS_URMA_TOKEN → p248 用 NDS_URMA_TOKEN 导入 ✓ 授权
+   通过；SPDK 用 0xACFE 导入 → 账面成功但访问被拒 → status=4/9。
+2. **trans_mode**：测试 agent 标注"SPDK -M npu 用 RC（CTP 优先）"
+   vs p248 的 RM——待核实（本地查证 -M npu 默认 RM，SPDK_URMA_TRANS_
+   MODE 未设时为 RM；RC 来源待确认）。
+- **p248 工作 READ 全参数（源码解码）**：local seg 注册
+  {va=dst, len, token=NDS_URMA_TOKEN, NON_CACHEABLE, R|W|A}；
+  import jetty {RA 坐标, CTP, token=0}；import seg {RA HBM 坐标,
+  token=NDS_URMA_TOKEN, NON_CACHEABLE, R|W|A, NOMAP}；WR：READ、
+  src=rsg(HBM)、dst=lsg(本地)、tjetty=import 的 RA jetty、post 自建
+  jetty、user_ctx=2。
+- **下一步（#90）**：取 NDS_URMA_TOKEN 实际值 → SPDK target 的 seg
+  import token 改为该值（jetty=0）→ 精确复刻 p248 参数 → -M npu。
+
+### 指令 2026-10-09 #89：批次 P2-57（seg 导入令牌=NDS_URMA_TOKEN——精确复刻 p248 参数，通过就地 V2）
+
+**背景**：p248 源码逐行对比完成。与 SPDK 失败 pull 的全部已对齐项之
+外，**最后一个未对齐参数 = seg 导入令牌**：p248 用 NDS_URMA_TOKEN
+（nds_urma.h 常量，非 0 非 0xACFE），SPDK 用 0xACFE。URMA 模型：seg
+import token 必须匹配注册时的 token_value（HBM 经 nds_buf_register
+注册时 token_value=NDS_URMA_TOKEN）——令牌不匹配 = 账面成功但访问被
+拒（status=4/9）。
+
+**A. 取 NDS_URMA_TOKEN 实际值（只读）**：
+```bash
+grep -rn "define NDS_URMA_TOKEN" /home/tools/app/colleague_c_repo/nds/include/nds_urma.h
+# 带回十六进制值（原样）
+```
+
+**B. SPDK seg 导入令牌改值（env 开关方式，精确隔离）**：
+```bash
+# lib/nvmf/urma.c：两处 seg 导入（nvmf_urma_post_data 的
+# urma_import_seg token 参数）改为 env 可控：
+#   static uint32_t nds_seg_token(void) {
+#       const char *v = getenv("SPDK_NDS_SEG_TOKEN");
+#       if (v && v[0]) return (uint32_t)strtoul(v, NULL, 0);
+#       return SPDK_URMA_DEFAULT_TOKEN;   /* 0xACFE 缺省 */
+#   }
+#   —— urma_import_seg(..., &token, ...) 的 token.token = nds_seg_token()
+# 重编 lib/nvmf + nvmf_tgt（CCDK-ABI 照旧）
+```
+
+**C. -M npu 判决（核心）**：
+```bash
+# advertising ON（HELLO 发布 RA jetty，照 P2-52 形态）+
+export SPDK_NDS_SEG_TOKEN=<A 项的 NDS_URMA_TOKEN 值>
+# 跑 -M npu：
+#   数据面通过（errors=0 + 数据一致）→ 🎯🎯 根因最终坐实
+#     （seg 导入令牌必须匹配 RA 注册令牌），就地 V2 完成！
+#   仍失败 → 带回 stderr/dmesg
+```
+
+**D.（C 通过时）V2 固化 + V3 预备**：
+```bash
+# 1) -M cpu 回归（确认 host 路径无破坏——host 段的 import token
+#    也会被改，需验证）
+# 2) urma_admin seg 快照 + 计时段/带宽全量（V3 基线）
+# 3) -M cpu / -M npu 同条件对比
+```
+
+**E. 还原**：env 不残留；改动留 diff（通过后外部出正式 patch 固化）。
+
+**回传**：A 项令牌值 + C 项结果（+D 项若 V2 通过），注明
+「批次 P2-57 完毕」。
+
 ### 指令 2026-10-09 #88：批次 P2-56（RA jetty 导入令牌判决——token=0 对齐 P2-19，数据面通过就地 V2）
 
 **背景**：P2-55 切分成立：advertising ON 使 connect 失败（target
