@@ -2178,6 +2178,82 @@ seg{0,0xACFE}）全部同败 → 令牌假设按已测值证伪。D ✅ 还原�
 - **下一步（#90）**：取 NDS_URMA_TOKEN 实际值 → SPDK target 的 seg
   import token 改为该值（jetty=0）→ 精确复刻 p248 参数 → -M npu。
 
+
+### 回执导入 2026-10-09 #P257（批次 P2-57 回执，用户带回）—— 令牌维度彻底出清；锁定最后一个未测参数：import_flag 的 cacheable/access 属性
+
+**判定：A 🎯 NDS_URMA_TOKEN = 0xACFEU（nds_urma.h:25）= SPDK_
+URMA_DEFAULT_TOKEN——**p248 的 seg 导入令牌与 SPDK 现值本来就一致**，
+#89 的前提不成立（测试 agent P2-56 的"非 0 非 0xACFE"标注有误，
+外部 #89 未独立核实即跟随——流程教训）；C ❌ 实测印证（改/不改同
+形）→ **令牌维度（jetty×seg）全部出清**。B ✅ env 机制落地（
+SPDK_NDS_SEG_TOKEN，留 diff）。E ✅ 还原。**
+
+- **p248 源码逐行对比（外部完成）——剩余唯一未对齐参数 = import
+  flag 的 cacheable/access 属性**：
+  | 项 | p248（成功） | SPDK target（失败） |
+  |---|---|---|
+  | import_flag.cacheable | NON_CACHEABLE | **CACHEABLE** |
+  | import_flag.access | R\|W\|ATOMIC | **R\|W** |
+  | mapping | SEG_NOMAP ✓ | SEG_NOMAP ✓ |
+  | jetty import token | 0 | 0xACFE（已测，排除） |
+  | trans_mode | RM | RM（本地查证：默认 RM，无 RC 设置；测试 agent 的 RC 标注待核实，#91 附验证） |
+- **机制吻合**：HBM 经 nds_buf_register 注册为 NON_CACHEABLE+R|W|A；
+  SPDK 的 seg 导入用 {CACHEABLE, R|W}——**授权属性与注册属性冲突 →
+  responder 拒绝 → status=4 LOC_ACCESS_ERR**（访问拒绝语义精确吻合）。
+- **关键：该对齐在有效基线上从未测过**——P2-48 B 测过但当时 ABI 未
+  修（tp_type 被读错，该测试无效）；现在 ABI 修复了，这是最后一个
+  未测参数。#91 重测。
+
+### 指令 2026-10-09 #91：批次 P2-58（import_flag 对齐重测——有效基线上的最后一个未对齐参数，通过就地 V2）
+
+**背景**：P2-57 出清令牌维度后，p248（成功）与 SPDK（失败）的逐行
+对比只剩一个未对齐参数：**seg 导入 flag = {CACHEABLE, R|W} vs
+{NON_CACHEABLE, R|W|A, NOMAP}**。HBM 注册属性为 NON_CACHEABLE+R|W|A
+（nds_buf_register），导入属性与之冲突 → responder 拒绝 →
+status=4 LOC_ACCESS_ERR。P2-48 B 曾测过但当时 ABI 未修（无效测试）；
+现在 ABI 已修复，这是有效基线上的首次对齐测试。
+
+**A. 对齐改动（重做 P2-48 B 的 diff，CCDK-ABI 基线）**：
+```bash
+# lib/nvmf/urma.c nvmf_urma_post_data（约 L943-945）：
+#   import_flag.bs.cacheable = URMA_CACHEABLE       → URMA_NON_CACHEABLE
+#   import_flag.bs.access    = R|W                  → R|W|ATOMIC
+#   （mapping=SEG_NOMAP 不动）
+# 重编 lib/nvmf + nvmf_tgt（CCDK-ABI 照旧）
+```
+
+**B. -M cpu 回归（先确认 host 路径无破坏）**：
+```bash
+# 照 P2-46 A.4 同款：completed errors=0 = PASS
+# （host 段的导入属性也变为 NON_CACHEABLE+R|W|A——需实测无副作用）
+```
+
+**C. -M npu 判决（核心）**：
+```bash
+# 照 P2-46 B 完整部署（level 8 + 双侧 stderr）+ advertising ON：
+#   数据面通过（errors=0 + 数据一致 + 无 -71/status=4/9）→
+#   🎯🎯 V2 完成！直连链路全程打通！
+#   仍失败 → 带回 stderr/dmesg（错误码形态）+ 转下一层
+```
+
+**D.（C 通过时）V2 固化 + V3 预备**：
+```bash
+# 1) urma_admin seg 快照
+# 2) -M npu 计时段/带宽全量（V3 基线）
+# 3) -M cpu / -M npu 同条件对比
+```
+
+**E. 附加：trans_mode 核实（回应测试 agent 的 RC 疑问）**：
+```bash
+# -M npu 跑一次，dmesg 或临时打印确认 initiator 的
+# opts.transport_mode 实际值（预期 RM=1；排除测试 agent 的 RC 疑问）
+```
+
+**F. 还原**：改动留 diff（通过则外部出正式 patch 固化）；照旧还原
+其余。
+
+**回传**：A 重编 + B 回归 + C 项结果（+D/E），注明「批次 P2-58 完毕」。
+
 ### 指令 2026-10-09 #89：批次 P2-57（seg 导入令牌=NDS_URMA_TOKEN——精确复刻 p248 参数，通过就地 V2）
 
 **背景**：p248 源码逐行对比完成。与 SPDK 失败 pull 的全部已对齐项之
