@@ -511,6 +511,25 @@ spdk_urma_memory_region_is_direct(const struct spdk_nvme_urma_memory_region *reg
 	return region != NULL && region->npu_direct;
 }
 
+int
+spdk_nvme_urma_provider_get_ra_jetty_info(enum spdk_nvme_urma_memory_type type,
+		struct spdk_nvme_urma_ra_jetty_info *info)
+{
+	const struct spdk_nvme_urma_memory_provider *provider;
+	int rc = -ENOTSUP;
+
+	if (info == NULL || type >= SPDK_URMA_PROVIDER_COUNT) {
+		return -EINVAL;
+	}
+	pthread_mutex_lock(&g_provider_mutex);
+	provider = g_providers[type];
+	if (provider != NULL && provider->get_ra_jetty_info != NULL) {
+		rc = provider->get_ra_jetty_info(provider->provider_ctx, info);
+	}
+	pthread_mutex_unlock(&g_provider_mutex);
+	return rc;
+}
+
 urma_seg_t
 spdk_urma_memory_region_get_direct_seg(const struct spdk_nvme_urma_memory_region *region)
 {

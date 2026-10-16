@@ -102,6 +102,8 @@ void spdk_urma_device_close(struct spdk_urma_device *device);
 uint32_t spdk_urma_env_u32(const char *name, uint32_t default_value);
 urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 	struct spdk_nvme_urma_memory_region *region);
+int spdk_nvme_urma_provider_get_ra_jetty_info(enum spdk_nvme_urma_memory_type type,
+		struct spdk_nvme_urma_ra_jetty_info *info);
 
 /* NDS direct route: the provider synthesized the peer-importable segment
  * from accelerator-native registration (RA/HCCP), no local tseg exists. */

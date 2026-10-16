@@ -37,6 +37,18 @@ struct spdk_nvme_urma_seg_info {
 };
 
 /**
+ * NDS direct route: the initiator's data-plane jetty. For NPU HBM the
+ * data-plane jetty must be the RA jetty (libra domain) — the HBM segment
+ * (RA lmem nonPin registration) is only remotely DMA-able via the
+ * RA-domain TP.
+ */
+struct spdk_nvme_urma_ra_jetty_info {
+	uint8_t eid[16];
+	uint32_t uasid;
+	uint32_t jetty_id;
+};
+
+/**
  * Optional accelerator-memory provider.
  *
  * XDS, CUDA, ROCm and NPU integrations can use this interface without adding
@@ -56,6 +68,8 @@ struct spdk_nvme_urma_memory_provider {
 			      uint64_t *offset);
 	int (*get_segment_info)(void *provider_ctx, void *pin_handle,
 				struct spdk_nvme_urma_seg_info *info);
+	int (*get_ra_jetty_info)(void *provider_ctx,
+				 struct spdk_nvme_urma_ra_jetty_info *info);
 	void *provider_ctx;
 };
 
@@ -118,6 +132,15 @@ int spdk_nvme_urma_memory_region_export(
 
 /** Read or reset process-wide URMA memory registration diagnostics. */
 void spdk_nvme_urma_get_memory_stats(struct spdk_nvme_urma_memory_stats *stats);
+
+/**
+ * NDS direct route: query the provider's data-plane (RA) jetty. Returns
+ * 0 and fills info when the provider's full NDS/RA stack is ready;
+ * -ENOTSUP/-ENODEV otherwise (the HELLO then advertises the regular
+ * SPDK jetty).
+ */
+int spdk_nvme_urma_provider_get_ra_jetty_info(enum spdk_nvme_urma_memory_type type,
+		struct spdk_nvme_urma_ra_jetty_info *info);
 void spdk_nvme_urma_reset_memory_stats(void);
 
 /** Modified By Yida: dump per-phase timing breakdown (register/send/completion/release/total) */

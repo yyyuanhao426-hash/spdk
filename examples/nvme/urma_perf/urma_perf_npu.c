@@ -419,6 +419,12 @@ struct npu_driver {
 	nds_buf_deregister_fn nds_buf_deregister_cb;
 	nds_get_segment_info_fn nds_get_segment_info_cb;
 	bool nds_ready;
+	/* NDS session coordinates (RA jetty), captured at nds init via a
+	 * scratch registration — the data-plane jetty advertised in HELLO */
+	uint8_t nds_ra_eid[16];
+	uint32_t nds_ra_uasid;
+	uint32_t nds_ra_jetty_id;
+	bool nds_coords_valid;
 	/* RA jetty coordinates, parsed from QpCreateInfo.key.value
 	 * (nds_parse_jetty_info semantics): the authoritative source for the
 	 * direct-route segment descriptor (P2-23 B / P2-24 A). */
@@ -542,6 +548,34 @@ npu_nds_init(void)
 	}
 	g_npu.nds_ready = true;
 	printf("NDS (libnds full stack) ready\n");
+
+	/* Capture the NDS session coordinates (RA jetty eid/uasid/jetty_id)
+	 * via a scratch HBM registration — these advertise the data-plane
+	 * jetty in HELLO (P2-48: a self-built jetty CAN remote-read the RA
+	 * HBM when the WR's tjetty is the RA jetty; the SPDK-created jetty
+	 * ACK-times-out). */
+	{
+		void *scratch = NULL;
+		struct nds_segment_infos infos;
+
+		if (g_npu.malloc(&scratch, 65536, NPU_ACL_MEM_MALLOC_HUGE_FIRST) == NPU_ACL_SUCCESS &&
+		    g_npu.nds_buf_register_cb(scratch, 65536) == 0 &&
+		    g_npu.nds_get_segment_info_cb(scratch, &infos) == 0) {
+			memcpy(g_npu.nds_ra_eid, infos.h2d.eid, sizeof(g_npu.nds_ra_eid));
+			g_npu.nds_ra_uasid = infos.h2d.uasid;
+			g_npu.nds_ra_jetty_id = infos.h2d.jetty_id;
+			g_npu.nds_coords_valid = true;
+			printf("NDS session coords: jetty_id=%u uasid=%u\n",
+			       g_npu.nds_ra_jetty_id, g_npu.nds_ra_uasid);
+		} else {
+			fprintf(stderr, "nds scratch registration failed — "
+				"RA jetty coords unavailable\n");
+		}
+		if (scratch != NULL) {
+			g_npu.nds_buf_deregister_cb(scratch);
+			g_npu.free(scratch);
+		}
+	}
 	return 0;
 }
 
@@ -1095,6 +1129,32 @@ npu_provider_pin(void *provider_ctx, void *addr, size_t length, void **pin_handl
  * makes registration fall back to the legacy urma_register_seg path
  * (harmless: it fails visibly on 133). */
 static int
+npu_provider_get_ra_jetty_info(void *provider_ctx,
+			       struct spdk_nvme_urma_ra_jetty_info *info)
+{
+	(void)provider_ctx;
+	if (info == NULL) {
+		return -EINVAL;
+	}
+	/* Available only when the NPU path was actually initialized
+	 * (-M npu / -M npu-staged); -M cpu must keep advertising the
+	 * regular SPDK jetty. */
+	if (g_npu.nds_coords_valid) {
+		memcpy(info->eid, g_npu.nds_ra_eid, sizeof(info->eid));
+		info->uasid = g_npu.nds_ra_uasid;
+		info->jetty_id = g_npu.nds_ra_jetty_id;
+		return 0;
+	}
+	if (g_npu.ra_ready) {
+		memcpy(info->eid, g_npu.ra_seg_eid, sizeof(info->eid));
+		info->uasid = g_npu.ra_uasid;
+		info->jetty_id = g_npu.ra_jetty_id;
+		return 0;
+	}
+	return -ENODEV;
+}
+
+static int
 npu_provider_get_segment_info(void *provider_ctx, void *pin_handle,
 			      struct spdk_nvme_urma_seg_info *info)
 {
@@ -1165,6 +1225,7 @@ static const struct spdk_nvme_urma_memory_provider g_npu_provider = {
 	.pin = npu_provider_pin,
 	.unpin = npu_provider_unpin,
 	.get_segment_info = npu_provider_get_segment_info,
+	.get_ra_jetty_info = npu_provider_get_ra_jetty_info,
 };
 
 int

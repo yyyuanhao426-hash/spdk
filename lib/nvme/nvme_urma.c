@@ -414,6 +414,24 @@ nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
 	local.transport_mode = uqpair->device->opts.transport_mode;
 	local.max_queue_depth = uqpair->num_entries + 1;
 	local.max_io_size = uqpair->device->opts.max_io_size;
+	/* NDS direct route: advertise the RA jetty (libra domain) as the
+	 * data-plane jetty instead of the SPDK-created one. The HBM segment
+	 * (RA lmem nonPin registration) is only remotely DMA-able via the
+	 * RA-domain TP — a pull/read WR whose tjetty is the SPDK jetty
+	 * ACK-times-out (P2-48/P2-51). The target imports the advertised
+	 * jetty unchanged, so its data-plane wr.tjetty lands on the RA
+	 * jetty (the p248-proven shape). */
+	{
+		struct spdk_nvme_urma_ra_jetty_info ra = {};
+
+		if (spdk_nvme_urma_provider_get_ra_jetty_info(SPDK_NVME_URMA_MEM_NPU,
+				&ra) == 0) {
+			memcpy(&local.eid, ra.eid, sizeof(local.eid));
+			local.jetty_id = ra.jetty_id;
+			SPDK_NOTICELOG("NDS: advertising RA jetty %u as data-plane jetty\n",
+				       ra.jetty_id);
+		}
+	}
 	rc = nvme_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
 	if (rc == 0) {
 		rc = nvme_urma_write_full(uqpair->fd, &local, sizeof(local));

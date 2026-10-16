@@ -244,6 +244,33 @@ sudo ./build/examples/urma_perf -r '<trid>' -M npu -t 5
 齐了之后 commit + push，在回执区末尾注明「四项交付完毕，等待外部指令」。
 ## 9. 内部 AI 回执区
 
+### 回执导入 2026-10-09 #P251（批次 P2-51 回执，用户带回）—— libnds 切换生效但 RA 栈完整度假设证伪；差异收口至"数据面远端腿"
+
+**判定：A ✅ provider 切换生效且无破坏（新 urma_perf 含 libnds 全栈
+分支，"NDS (libnds full stack) ready" 出现；-M cpu 回归 6088/0 全
+通）；C ❌ -M npu 仍 -71 / target status=9（与切换前逐字节一致）
+→ **"HBM 侧 RA 栈完整度"假设证伪**。D/E ✅ 还原（provider-switch
+源码与二进制保留）。**
+
+- **libnds 切换确认**：nds_init/nds_buf_register/nds_get_segment_info
+  三接口全走 libnds；libra 日志消失；无 fallback；libnds 正常加载并
+  init。
+- **关键对照升级（P2-48 C + 本批）**：裸 p248 用**自建 jetty**（SPDK
+  同款创建）对同一 RA HBM 段 READ 完全成功 → **"自建 liburma jetty
+  不能远端访问 HBM"不成立**；而 SPDK 数据面同形态失败 → 差异不在
+  jetty 的域，而在 **WR 的远端腿（tjetty）指向哪个 jetty**：
+  - p248 成功：tjetty = **import 的 P1 RA jetty**（P2-19 形态）
+  - SPDK 失败：tjetty = **import 的对端 SPDK jetty**
+- **外部综合判定（新根因假设，#84 判决）**：RA lmem nonPin 注册的
+  HBM 段，其远端可达性绑定在 **RA 域的 TP/jetty** 上；数据面 WR 的
+  tjetty 必须是 **RA jetty**。SPDK 的 pull/wr.tjetty = 对端 SPDK
+  jetty → 远端腿落在 SPDK 域 → HBM 无应答 → ACK 超限（status=9）。
+  **修法（外部已编码）**：initiator 在 HELLO 里**发布 RA jetty 坐标**
+  （nds 会话eid/uasid/jetty_id，替代 SPDK jetty 坐标）→ target 现有
+  代码 import 到的就是 RA jetty → wr.tjetty 自然落在 RA 域 → 与
+  p248 成功形态一致，**target 零改动**。-M cpu 不受影响（NPU 路径未
+  初始化时 provider 返回 -ENODEV，不替换）。
+
 ### 回执导入 2026-10-09 #P250（批次 P2-50 回执，用户带回）—— libnds API 极简确认；切换条件齐备
 
 **判定：libnds 对外 API 极简且正合需求——nds_init(void)（内部完整
@@ -2048,6 +2075,54 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
 **边界提醒**：SSU（UB 原生盘）是同事C 的项目领域，不是我们的目标；
 除非 RA 路径被证实不可行且需要fallback，否则不再深入 SSU 硬件相关
 的实验。
+
+### 指令 2026-10-09 #84：批次 P2-52（RA jetty 数据面判决——HELLO 发布 RA jetty，数据面通过就地 V2）
+
+**背景**：P2-51 证伪"RA 栈完整度"后，外部综合全部数据提出并已编码
+新根因假设：**RA lmem nonPin 注册的 HBM 段，远端可达性绑定在 RA 域
+TP/jetty 上；数据面 WR 的 tjetty 必须是 RA jetty**（p248 成功形态：
+post 自建 jetty + tjetty=import 的 RA jetty；SPDK 失败形态：tjetty=
+import 的对端 SPDK jetty）。**修法已编码**：initiator 的 HELLO 改发
+RA jetty 坐标（nds 会话 eid/uasid/jetty_id，provider 新 op
+get_ra_jetty_info），target 代码零改动（其 import/wr.tjetty 自然落
+在 RA jetty）。-M cpu 不受影响（NPU 未初始化时不替换）。
+
+**A. 同步 + 重编（CCDK-ABI 配置照 P2-46；新 urma_perf 含
+"NDS: advertising RA jetty" 字符串）**：
+```bash
+git pull --ff-only    # 取本批前置 commit
+make -C lib/nvme && make -C lib/nvmf && make -C app/nvmf_tgt \
+  && make -C examples/nvme/urma_perf
+strings urma_perf | grep "advertising RA jetty"   # STRING_OK
+```
+
+**B. -M cpu 回归（应全通，且无 "NDS: advertising" 行——cpu 不触发
+NPU 路径）**：
+```bash
+# 照 P2-46 A.4 同款回环：completed errors=0 = PASS
+```
+
+**C. -M npu 判决（核心）**：
+```bash
+# 照 P2-46 B 完整部署（level 8 + 双侧 stderr）：
+# initiator stdout 期望新增：NDS: advertising RA jetty <id>
+# target stderr：W4→W10 管线
+# 判定：
+#   数据面通过（errors=0 + 数据一致 + 无 -71/status=9）→ 🎯🎯 V2 完成！
+#   仍 -71/status=9 → 带回双侧 stderr + dmesg（假设证伪，外部转
+#     wr.tjetty 语义源码分析）
+```
+
+**D. V2 通过时的附加取证**：
+```bash
+# 1) urma_admin show dev udmac0d1e2 seg —— HBM 段的注册/导入形态
+# 2) 短跑带宽/IOPS 计时段输出（V3 性能对比的基线数据）
+```
+
+**E. 还原**：照旧（level 5、进程清、5 文件照旧；ccdkcompat 与
+二进制保留）。
+
+**回传**：A/B/C 项完整输出（+D 项若 V2 通过），注明「批次 P2-52 完毕」。
 
 ### 指令 2026-10-09 #83：批次 P2-51（provider 切换 libnds 全栈——判决兼修复，数据面通过就地 V2）
 
