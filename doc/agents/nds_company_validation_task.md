@@ -2130,6 +2130,74 @@ UB 原生盘，我们的存储端点是标准 NVMe 盘、走 URMA 传输）。
   RA jetty）；仍失败则 nds_v2 基线自身有独立问题（与同事B 的已知
   用法对照排查）。
 
+
+### 回执导入 2026-10-09 #P255（批次 P2-55 回执，用户带回）—— 变量切割成立：advertising 是 connect 失败的直接原因
+
+**判定：A 🎯 对照组（advertising OFF）connect **立即恢复**（-5=0、
+io qpair fail=0），数据面回到 P2-51 旧形态（status=9, type=1 DATA）；
+advertising ON → 必现 connect -5 ×2 + status=4。**"advertising 断
+connect"坐实**——RA jetty 发布方式把失败从"数据面 status=9"前移为
+"连接阶段 status=4"，未真正打通。C ✅ capsule_transport 默认 TCP；
+urma（sendrecv）变体 connect 成功（advertising OFF）但数据面仍
+status=9（新增 type=3 CAPSULE_TX 完成）。D ✅ 还原（env 开关
+SPDK_NDS_ADVERTISE 与日志补丁已还原）。**
+
+- **同事B 标准用法对照**：其标准命令行用 **-M posix**（真实 NVMe 盘
+  + host 内存）——我们的 -M npu（loop.img + HBM 直连）不在其标准
+  路径覆盖内；其双节点性能测试 46 GiB/s 为 -M posix 形态。
+- **三组数据的叠合（关键）**：p248 工作流 import RA jetty 用
+  **token=0**（P2-19 权威：jetty import token=0），SPDK target 用
+  **token=0xACFE**（SPDK_URMA_DEFAULT_TOKEN）——RA jetty 的导入令
+  牌不一致，可能是"tjetty=RA jetty 时 LOC_ACCESS_ERR"的原因（import
+  令牌错 → 该 jetty 上的远端访问被拒）。此为下一个判决点（#88）。
+- **另**：P2-53（p248 源码全文带回）尚未回执——逐行对比素材仍需要。
+
+### 指令 2026-10-09 #88：批次 P2-56（RA jetty 导入令牌判决——token=0 对齐 P2-19，数据面通过就地 V2）
+
+**背景**：P2-55 切分成立：advertising ON 使 connect 失败（target
+CAPSULE_TX/DATA 完成 LOC_ACCESS_ERR）；advertising OFF 则 connect 恢
+复但数据面 status=9。**新判决点：导入令牌**——p248 工作流 import RA
+jetty 用 token=0（P2-19 权威：jetty import token=0），SPDK target 用
+0xACFE。若 RA jetty 的访问授权绑定导入令牌，则 0xACFE 导入的 jetty
+其远端访问被拒（LOC_ACCESS_ERR）——与 P2-52/54 的 status=4 吻合。
+
+**A. 令牌判决（一行改动，核心）**：
+```bash
+# lib/nvmf/urma.c nvmf_urma_handshake：import target_jetty 时
+# （remote.ra_valid=1 的 RA jetty 分支）token 改 0：
+#   urma_token_t token = {.token = 0};   /* RA jetty import token=0 (P2-19) */
+#   ——注意仅 RA jetty 分支改 0；SPDK jetty 的普通 import 保持 0xACFE
+# 重编 lib/nvmf + nvmf_tgt（CCDK-ABI 照旧）
+# 跑 -M npu（advertising ON，即 HELLO 发布 RA jetty 照常）：
+#   判定：
+#     connect 通过 + 数据面通过（errors=0 + 数据一致）→ 🎯🎯 根因坐实
+#       （RA jetty 导入令牌必须为 0），就地 V2 完成！
+#     仍失败 → 带回 stderr/dmesg（错误码形态：仍 status=4 还是别的）
+```
+
+**B.（A 通过时）V2 判据固化 + V3 预备**：
+```bash
+# 1) -M cpu 回归（确认 host 路径无破坏）
+# 2) urma_admin show dev udmac0d1e2 seg 快照
+# 3) -M npu 计时段/带宽输出全量（V3 基线）
+# 4) -M cpu / -M npu 同条件对比各一次
+```
+
+**C.（A 仍败）令牌矩阵扩展**：
+```bash
+# jetty import token × seg import token 组合：
+#   jetty{0, 0xACFE} × seg{0, 0xACFE}   （seg 的 token 在 W5 import，
+#     对应 nvmf_urma_post_data 的 urma_import_seg token 参数）
+#   4 组合各跑一次 -M npu，带回数据面结果
+# 仍全败 → 带回 P2-53 的 p248 源码（该批回执未交）+ 全部素材，
+#   外部做逐行 diff
+```
+
+**D. 还原**：照旧（改动留 diff；level 5；进程清；5 文件照旧）。
+
+**回传**：A 项结果（connect/数据面）+ B/C 项按条件，注明
+「批次 P2-56 完毕」。
+
 ### 指令 2026-10-09 #87：批次 P2-55（对照实验——nds_v2 撤销 advertising，切分"advertising 断 connect"与"基线自身问题"）
 
 **背景**：nds_v2 上 RA jetty advertising 使 I/O qpair CONNECT 失败
