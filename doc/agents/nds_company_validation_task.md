@@ -7052,3 +7052,113 @@ ping -c 3 141.61.84.151
 - B2 无 UMDK/liburma → 编译缺口，可在 197 上装 UMDK 或把 245 编好的
   二进制拷贝过去，回报时注明选择哪种方式
 - D/E 的输出是 Phase 2 内核桥接模块设计的直接输入，务必原文记录
+
+### 回执导入 2026-10-16 #P261（批次 P2-61 回执，用户带回）—— 多 jetty 假设证伪；唯一稳定变量仍是"HELLO 是否发布 RA jetty"
+
+**判定：前置核实 🆕 默认 `opts->num_jetty_per_ep = SPDK_URMA_DEFAULT_
+JETTY_COUNT = 1`（nvme_urma_common.c:193-195）→ **P2-54~60 全部早已
+在 jetty_count=1 下运行**，本批 A 的 env 为空操作；133 无任何
+SPDK_URMA_*/SPDK_NDS_* 环境残留。A ❌ jc=1 + advON 仍 connect -5 ×2
++ target status=4 ×2（多 jetty 假设证伪）；C1（jc=1+advOFF）复现
+P2-55 旧形态（connect 通、数据面 status=9）；C2（jc=2+advON）与
+jc=1 结局完全相同。D ✅ 还原（nvme_urma.c=b4807e83、urma.c=
+0b0c913b、nvmf_tgt=90348d82、urma_perf=01dc9304，md5 全复原）。**
+
+- **HELLO 诊断打印实证（临时补丁，跑后已还原）**：
+  - admin qpair：`jetty_count=1 ids=17354 eid_eq_dev=1`（SPDK jetty）
+  - I/O qpair：`jetty_count=1 ids=11239 eid_eq_dev=0`（RA jetty）
+  - target 收到：`remote.jetty_count=1 ids=11239`
+  - → 单 jetty 下**不存在 jetty_ids[1..]**，"数组错配"前提不成立。
+- **🆕 附带发现**：admin qpair 实际**未发布 RA jetty**——NPU
+  provider 在 prepare_workers() 才注册，晚于 admin qpair 连接（其时
+  get_ra_jetty_info 返回非 0）。如需"全程 RA jetty"须把 provider
+  注册提前。
+- **综合 P2-55~61**：结局**只由 advertising ON/OFF 决定**（ON →
+  connect 失败 status=4；OFF → connect 通、数据面 status=9），与
+  jetty_count 无关。根因回到 **"target 导入对端 RA jetty 后的可用
+  性/访问语义"** 层。
+- **外部对 P2-60 结论的一处修正（依据 p248 源码原文）**：P2-60 写
+  "p248 成功形态并非 target 导入对端 jetty"——不准确。p248
+  role_p2 确实执行 `urma_import_jetty(rj={p1 的 RA eid/uasid/
+  jetty_id}, token=0)` 且 `wr.tjetty = 导入结果` 后 post READ/
+  WRITE（p248_probe.cpp L120/L208 附近）。即 **"导入对端 RA jetty +
+  导入段 + 自建 jetty post"在探针内是成功的**。
+- **由此 p248（成功）与 SPDK target（失败）的剩余差异收敛为**：
+  1. **jetty 的创建方式**——探针用 CCDK `nds_urma_core_create`
+     （cfg={NDS_URMA_DEPTH, NDS_URMA_TOKEN, NDS_URMA_PRIORITY}，内部
+     建 ctx+jfc+jetty）；SPDK 用 `nvme_urma_create_jetty`
+     （nvme_urma.c:421-480：send/recv JFC 分离（depth 4096×2 个）、
+     每 jetty 独立 JFR（depth=min(2048, max)、tag_matching=NO、
+     min_rnr_timer=TYPICAL、token=0xACFE、jfc=recv JFC）+
+     `urma_create_jetty{depth=2048, trans_mode=TM_RM, priority=
+     device->priority(默认 -1→urma 默认), max_sge=5, multi_path=0,
+     rnr_retry=7, err_timeout=17, flag.share_jfr=1, shared.jfr/
+     shared.jfc}`。CCDK 与 SPDK 的这组参数从未在探针内单变量对照过
+     （P2-48C 的"SPDK 同款"只是架构同款，仍走 CCDK core_create）。
+  2. SPDK 进程环境（DPDK/EAL——P2-28~41 已初步证伪，但未在探针内
+     复刻 SPDK jetty 创建的前提下证伪）。
+
+### 指令 2026-10-16 #95：批次 P2-62（jetty 创建方式判决——p248 探针内 CCDK core_create vs SPDK 原始创建序列，单变量对照）
+
+**背景**：P2-61 收敛出唯一未测差异 = **jetty 创建方式**。本批在已
+验证成功的 p248 探针内做**单变量替换**：只换"自己这侧 jetty 怎么
+建"，其余（TCP 交换、import p1 RA jetty/seg、WR 构造、post、验证）
+全部不动。SPDK 源码**零改动**。
+
+**A.（核心判决）p248 探针加 SPDK-style jetty 创建开关**：
+```bash
+# 1) cp p248_probe.cpp p262_probe.cpp，role_p2/role_w 的
+#    urma_read_remote/urma_write_remote 中，把
+#    nds_urma_env_init/nds_query_device0_local_eid/nds_urma_copy_eid/
+#    urma_get_device_by_eid/nds_urma_select_eid_index/
+#    nds_urma_core_create 换成 SPDK nvme_urma.c:421-480 的原始创建
+#    序列（env 开关 P248_JETTY=spdk 时启用，默认关=原 CCDK 路径，
+#    保证可回归对照）：
+#    - urma_create_jfc ×2（send JFC + recv JFC，depth=4096，
+#      照 nvme_urma_common.c:1080-1120 的 jfc_cfg 字段）
+#    - urma_create_jfr（depth=min(2048, dev_cap.max_jfr_depth)，
+#      tag_matching=URMA_NO_TAG_MATCHING，trans_mode=TM_RM，
+#      max_sge=min(5, dev_cap.max_jfr_sge)，
+#      min_rnr_timer=URMA_TYPICAL_MIN_RNR_TIMER，token=0xACFE，
+#      jfc=recv JFC）
+#    - urma_create_jetty：cfg.jfs_cfg = {depth=2048, trans_mode=TM_RM,
+#      priority=device priority（SPDK_URMA_JETTY_PRIORITY 默认 -1 →
+#      不设/urma 默认，注明取值），max_sge=5, multi_path=0,
+#      rnr_retry=7, err_timeout=17, jfc=send JFC}；
+#      cfg.flag.bs.share_jfr=1；cfg.shared.jfr=上面 JFR；
+#      cfg.shared.jfc=recv JFC
+#    - 用该 jetty 的 jfc poll（即 send JFC）替代原 core 的 jfc poll
+# 2) 编译（-lurma -lands? 照 p248 的 Build 注释；如需 CCDK 头则与
+#    原路径并存，开关切换）
+# 3) 跑（p1 零改动，p2 用 P248_JETTY=spdk）：
+#    P248_JETTY=spdk ./p262_probe p2
+#    判据同 p248：READ cr.status=0 + verify MATCH(0xA5)、
+#    WRITE cr.status=0 + verify MATCH(0x5A)
+```
+- **A 通过** → SPDK 原始创建方式在探针内**可行** → jetty 创建参数
+  出清，根因回到 SPDK 进程内其它环节（外部综合另出方向）。
+- **A 失败** → 根因锁定 **jetty 创建参数**（SPDK 序列在探针内复现
+  LOC_ACCESS_ERR/ACK_TIMEOUT 即坐实）→ 转 B 二分。
+
+**B.（A 失败时）参数二分**：
+```bash
+# 1) urma_admin show dev <dev> jetty 分别 dump 两种 jetty
+#    （P248_JETTY 不设=CCDK / =spdk）的属性表，逐字段 diff
+# 2) 逐项 env 旋钮对齐 CCDK（建议顺序：priority(-1→2) → depth
+#    (2048→NDS_URMA_DEPTH 实测值) → max_sge → rnr_retry/
+#    err_timeout → JFR 拓扑(去独立 JFR/去 share_jfr)），
+#    每对齐一项跑一次 READ，定位到具体参数
+# 3) 记录 CCDK 侧权威值：NDS_URMA_DEPTH / NDS_URMA_TOKEN /
+#    NDS_URMA_PRIORITY 的宏值（CCDK 头文件），带回
+```
+
+**C.（A 通过时）反向加参**：从"探针成功形态"逐项加回 SPDK 参数
+（JFC 分离 → 独立 JFR → share_jfr → depth/priority…），直到复现
+失败——同样可定位参数；做完 1~2 项即止，其余记录后带回。
+
+**D. 还原**：p262_probe.cpp 为新文件（不触碰 SPDK 源）；本批 SPDK
+侧零改动 → 常规还原清单照旧（level、进程、hugepages、git status
+与 P2-54 基线一致）。
+
+**回传**：A 项判据结果（+B/C 按条件 + CCDK 宏值），注明
+「批次 P2-62 完毕」。
