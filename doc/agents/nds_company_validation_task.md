@@ -2204,6 +2204,83 @@ SPDK_NDS_SEG_TOKEN，留 diff）。E ✅ 还原。**
   修（tp_type 被读错，该测试无效）；现在 ABI 修复了，这是最后一个
   未测参数。#91 重测。
 
+
+### 回执导入 2026-10-09 #P258（批次 P2-58 回执，用户带回）—— import_flag 证伪；trans_mode 疑问解除；排除矩阵收官
+
+**判定：A ✅ 对齐改动落地（⚠️ 实测纠正：nds_v2 基线的 cacheable 本来
+就是 NON_CACHEABLE，净改动仅 access R|W → R|W|ATOMIC）；B ✅ -M cpu
+回归 PASS（6100→1227+1230/0，host 段导入属性同步变化无副作用，且
+NDS-TRANSMODE 打印确认 transport_mode=1(RM) tp_type=1(CTP)——测试
+agent 的 RC 疑问解除）；C ❌ -M npu 仍 Connect -5 ×2 + target
+status=4 ×2，与 P2-54~57 零变化 → **import_flag 证伪**。D 未触发；
+E ✅ trans_mode=RM 实测；F ✅ 还原（两 patch 留证）。**
+
+- **累计排除维度收官**：ABI 结构错位（已修）、RA jetty 发布（有效但
+  引入新失败形态）、jetty/seg 导入令牌（全出清）、seg 导入 flag
+  （出清）、capsule 传输方式、trans_mode、JFC/context/env/EAL、设备
+  选择、HBM 侧 RA 栈完整度（libnds 切换）。
+- **稳定现象（二选一镜像）**：advertising OFF → connect 通 + 数据面
+  pull WR 对 HBM 无应答（status=9）；advertising ON → CONNECT 阶段
+  LOC_ACCESS_ERR（status=4）。
+- **测试 agent 建议 + 外部新取证方向**：p248 与 SPDK 的结构性差异
+  （单进程自建 vs 跨进程+导入 RA jetty 的语义/权限域）。**外部新
+  线索（下批核心）**：P2-46 的 seg 表快照中有 **eid=0000…0000/va=0
+  且 len=65536（= 我们 HBM 池大小）的条目**——若那是我们的 HBM lmem
+  注册（eid/va 记录为 0），设备无法把远端读路由到 HBM——对照 p248
+  P1 注册后的 seg 表即可判定（#92）。
+
+### 指令 2026-10-09 #92：批次 P2-59（seg 表三时刻对照——我们的 HBM lmem 注册在设备表中的记录形态）
+
+**背景**：P2-46 的 seg 快照（106 条）中存在 **eid=0000…0000 / va=0 /
+len=65536** 的条目——与 urma_perf 的 HBM 池大小吻合。若那是我们的
+HBM lmem 注册（eid/va 记录为 0），则设备无法把远端读 {eid=df00:…,
+uasid=0, va=0x120000018000} 路由到 HBM → 远端读无应答（status=9）的
+机理闭环。对照 p248 P1 的注册形态即可判定。
+
+**A. seg 表三时刻对照（核心）**：
+```bash
+# 场景 1：p248 流程（对照，成功形态）
+#   P1 起后（nds_buf_register 完成后、P2 READ 前）：
+urma_admin show dev udmac0d1e2 seg > p259_log/seg_p248_p1.txt
+#   （P1 的 64KB HBM 注册应出现在表中——记录其 eid/va/len/token_id）
+#   P2 READ 成功后再 dump 一次：seg_p248_p2_after.txt
+
+# 场景 2：SPDK 流程（失败形态）
+#   urma_perf -M npu 起（nds init 完成、provider pin 的
+#   nds_buf_register 完成后、I/O connect 失败前/后各一次）：
+urma_admin show dev udmac0d1e2 seg > p259_log/seg_spdk_after_reg.txt
+urma_admin show dev udmac0d1e2 seg > p259_log/seg_spdk_after_fail.txt
+
+# 判定：
+#   p248 的 HBM 条目 eid/va 是否正确记录（非 0）？
+#   SPDK 的 HBM 条目（len=65536）eid/va 是否为 0？
+#   两者形态差异 = 注册记录缺陷的直接证据
+```
+
+**B.（若场景 2 的 HBM 条目 eid/va=0 而场景 1 正常）注册调用差异定位**：
+```bash
+# 两条注册路径的内核行为对比（level 8）：
+#   p248 P1 的 nds_buf_register 时的内核行
+#   urma_perf provider pin 的 nds_buf_register 时的内核行
+# 带回两段 dmesg（重点：RaCtxLmemRegister 相关行、注册的 addr/len/
+# token/eid 记录）
+# ——若两路径内核行为一致而 seg 表记录不同 → 问题在 libnds 内部状态
+#   （如注册绑定的 ctx/eid），外部读 p248 与 SPDK 的调用时序差异
+```
+
+**C.（若两场景的 HBM 条目 eid/va 都正确记录）**：
+```bash
+# seg 表形态排除 → 远端读失败在路由/权限的其他环节——
+# 按 P2-58 测试 agent 建议：UMMU/ubcore 对 import 的 RA jetty 的
+# TP/权限域取证（urma_admin show dev udmac0d1e2 tpid 8388644 全字段
+# + tpid_reuse + jetty 表，两场景对照）
+```
+
+**D. 还原**：照旧（level 5、进程清、5 文件照旧）。
+
+**回传**：A 项四份 seg 表关键段（HBM 条目定位）+ B/C 项按条件，注明
+「批次 P2-59 完毕」。
+
 ### 指令 2026-10-09 #91：批次 P2-58（import_flag 对齐重测——有效基线上的最后一个未对齐参数，通过就地 V2）
 
 **背景**：P2-57 出清令牌维度后，p248（成功）与 SPDK（失败）的逐行
