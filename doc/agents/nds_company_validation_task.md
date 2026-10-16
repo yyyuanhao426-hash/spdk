@@ -2281,6 +2281,75 @@ urma_admin show dev udmac0d1e2 seg > p259_log/seg_spdk_after_fail.txt
 **回传**：A 项四份 seg 表关键段（HBM 条目定位）+ B/C 项按条件，注明
 「批次 P2-59 完毕」。
 
+
+### 回执导入 2026-10-09 #P259（批次 P2-59 回执，用户带回）—— seg 表维度出清；测试 agent 发现关键拓扑事实：p248 是跨设备工作流
+
+**判定：A 🎯 seg 表三/六时刻逐字节相同（各 17498B，diff 全空）——
+seg 表静态、两侧都不体现 HBM（grep df00/0x12000… 均 0 命中）；P2-46
+怀疑的 eid=0/va=0/len=65536 条目在静息基线即存在（107 条）= **设备
+预存资源，非我们的 HBM 注册**——假设证伪。B/C ✅ TP 表（46 tp_
+handle）、jetty 表（jetty_cnt=10）两场景逐字节一致，孤儿 8388644
+在位；无权限域差异行。D ✅ 还原（纯只读）。**
+
+- **🆕 测试 agent 发现的关键拓扑事实（外部采纳为下一判决）**：
+  **p248 的工作流是跨设备的**——P1（HBM 侧）eid …df000100、P2（读
+  取侧）eid …df0a0b00，分属不同 udmac 设备；而 SPDK 的 -M npu 回环
+  中 target 与 initiator **同在 udmac0d1e2**（自连接 TP 8388644，
+  local==peer==df08:0b00）。
+  → **跨设备读 RA HBM 成功过（p248）；同设备自连接读从未成功
+  （status=9/4）**——设备拓扑是唯一未被系统排除的维度！
+- **判决实验（#93，零成本）**：SPDK 的 -M npu 回环改为**跨设备**——
+  target（nvmf_tgt）dev_name=udmac1d1e2、initiator
+  SPDK_URMA_DEV_NAME=udmac0d1e2（或对调）——若 pull WR 经 UB 真跳
+  一跳后成功 → 根因坐实（同设备自连接路由缺陷），且数据路径变为
+  HBM → 设备 X UB → 设备 Y → target → SSD（真实 UB 跳）→ V2。
+- **另**：seg 表静态且不体现 HBM 也说明 **nds_buf_register 的 HBM
+  lmem 注册不在 urma_admin 的 seg/tp 表可见层**（在 nds/RA 内部表）
+  ——与 P2-23 的"nds 内部表"结论一致。
+
+### 指令 2026-10-09 #93：批次 P2-60（跨设备判决——target/initiator 分属不同 udmac 设备，通过就地 V2）
+
+**背景**：P2-59 发现关键拓扑事实：p248 的工作流（跨设备：P2 的
+jetty 在 df0a:0b00 设备、P1 的 RA jetty 在 df00:0100 设备）成功；
+SPDK 的 -M npu 回环（同设备 udmac0d1e2 自连接）失败。本批零成本判
+决：**target 与 initiator 分属不同 udmac 设备**跑 -M npu。
+
+**A. 跨设备 -M npu（核心）**：
+```bash
+# target 侧：
+SPDK_URMA_DEV_NAME=udmac1d1e2 nvmf_tgt ...（URMA transport + listener 4420，
+  dev_name=udmac1d1e2，loop.img + bdev_aio 照旧）
+# initiator 侧：
+SPDK_URMA_DEV_NAME=udmac0d1e2 urma_perf -M npu ...（HBM 在 udmac0d1e2 侧）
+# ——即数据路径：HBM(urma_perf) → udmac0d1e2 → UB → udmac1d1e2 →
+#    nvmf_tgt → SSD（真实跨设备 UB 跳）
+# advertising ON（HELLO 发布 RA jetty 照常）
+# 判定：
+#   connect + 数据面通过（errors=0 + 数据一致）→ 🎯🎯 根因坐实
+#     （同设备自连接路由缺陷），就地 V2 完成！
+#   connect 失败 → 对调（target=udmac0d1e2、initiator=udmac1d1e2）再试
+```
+
+**B.（A 通过时）V2 固化 + V3 预备**：
+```bash
+# 1) -M cpu 回归（host 路径，跨设备同验）
+# 2) urma_admin seg/tp 快照 + 计时段/带宽全量（V3 基线）
+# 3) 记录最终工作配置（两侧 DEV_NAME 组合）
+```
+
+**C.（A 两个方向都失败）**：
+```bash
+# 1) 同设备对照（两侧同 udmac0d1e2）——确认失败形态不变
+# 2) 跨设备 + advertising OFF（对照：数据面应 status=9 旧形态）
+# 3) 带回全部结果——外部综合（若跨设备也不通，剩余候选 = tjetty
+#    路由语义，转 p248 源码逐行 diff 的 post jetty 语义分析）
+```
+
+**D. 还原**：照旧。
+
+**回传**：A 项结果（两侧 DEV_NAME 组合 + connect/数据面）+ B/C 项
+按条件，注明「批次 P2-60 完毕」。
+
 ### 指令 2026-10-09 #91：批次 P2-58（import_flag 对齐重测——有效基线上的最后一个未对齐参数，通过就地 V2）
 
 **背景**：P2-57 出清令牌维度后，p248（成功）与 SPDK（失败）的逐行
