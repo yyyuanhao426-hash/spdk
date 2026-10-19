@@ -7403,3 +7403,84 @@ b4807e83… + 重编 nvmf_tgt/urma_perf（90348d82…/01dc9304…）。
 
 **回传**：A 判据结果（+B/C 按条件 + 最终 env），注明
 「批次 P2-65 完毕」。
+
+### 回执导入 2026-10-19 #P265（批次 P2-65 回执，用户带回）—— 私有 JFC/JFR 证伪；🆕 线索：差异精确到 jetty 创建时机（导入前 vs 导入后）
+
+**判定：A ❌ 双侧私有 JFC/JFR（每 qpair send/recv 各一 + 私有 JFR）
+未恢复链路（connect -5 + status=4，失败数由 2× 降为 1×）；C ❌
+三变体（仅私有 send / 仅私有 recv / depth 对齐）全部失败 → JFC/JFR
+归属不是根因，P2-64 的归属推论被本批证伪。D ✅ 还原（md5 全复原，
+二进制同基线）。**
+
+- **🆕 D 项决定性对照（本批最有价值的观测）**：同一探针 jetty、
+  同一 tjetty、同一远端段，只换本地段来源：
+  - D1 本地=探针自建 64KB scratch → cr.status=0，真实流程仍
+    status=4；
+  - D2 本地=SPDK 真实 WR 用的局部 tseg（iobuf 池同一对象）→
+    cr.status=0，**且本次 connect 未失败（-5 ×0、无 status=4）**，
+    但 attach 报 Incorrect IOCCSZ 0（探针对同一 buffer 的额外 READ
+    扰动了 CONNECT 胶囊载荷）。
+  → 本地段注册（iobuf 池 vs 临时 register_seg）不是变量。
+  → **探针 jetty 的一次成功 READ 之后，qpair jetty 的 WR 不再
+    超时**——即差异不在 jetty 的参数/归属，而在 **jetty 对象与
+    tjetty 的"首次使用"状态**：探针 jetty 在握手导入**之后**创建
+    → 一発成功；qpair jetty 在握手导入**之前**创建 → 首次 WR
+    ACK_TIMEOUT。
+- **环境教训（带回）**：SPDK 进程名会变成 reactor_0，
+  `pkill -x nvmf_tgt` 无效 → 必须 `pkill -f 'build/bin/nvmf_tgt'`；
+  残留 target 会抢占 core 锁、遗留 hugepage，本批已用清场后数据
+  重跑。每轮部署后校验 pid+listening。
+- **收敛**：P2-64/65 合起来把差异收敛到"用于数据面 WR 的 jetty
+  对象本身（创建时机/首用状态）"——下一步判决：把 target 数据面
+  jetty 的创建移到握手导入之后（或首次 WR 前重建/预热）。
+
+### 指令 2026-10-19 #99：批次 P2-66（jetty 创建时机判决——target 数据面 jetty 改在握手导入之后创建/重建）
+
+**背景**：P2-65 D2 显示"探针 jetty（导入后创建）一次成功 READ 后，
+qpair jetty（导入前创建）的 WR 不再超时"。本批判决：**创建时机**
+是否是根因。通过即 V2 完成。SPDK 源码改动为 env 门控。
+
+**A.（核心判决）导入后重建 target 数据面 jetty**：
+```bash
+# lib/nvmf/urma.c target 侧 nvmf_urma_handshake：remote jetty/seg
+# 导入成功之后，加 env 开关 SPDK_NDS_JETTY_RECREATE=1：
+#   - destroy 该 uqpair 现有的数据面 jetty（uqpair->jetty / jettys[]
+#     与配套 jfr——注意 capsule 收发若依赖它，先确认无在途 WR；
+#     参照 P2-64 插桩位置：post_data 的 import_seg 之后亦可）
+#   - 用与原来相同的 cfg 重新 urma_create_jfr + urma_create_jetty
+#   - 更新 uqpair 指针，后续 post_data 自然用新 jetty
+#   - 销毁路径同步（fini/error）
+# 跑 -M npu（advertising ON，双侧无需其他 env）：
+#   - connect + 数据面通过（errors=0 + 数据一致）→ 🎯🎯 创建时机
+#     坐实，V2 完成！转 B
+#   - 仍失败 → 转 C
+```
+
+**B.（A 通过时）V2 固化 + V3 基线**：
+```bash
+# 1) -M cpu 回归（无回归）
+# 2) advOFF 对照一轮（本轮重启后 advOFF 也 connect 失败——记录
+#    两种 advertising 是否同根统一）
+# 3) -M npu 计时段/带宽全量 + urma_admin seg/tp 快照（V3 基线）
+# 4) 记录最终 env；正式固化方案（默认开 or 保留 env）由外部定
+```
+
+**C.（A 仍败）预热变体**：
+```bash
+# 在 remote jetty 导入成功后、真实数据 WR 前，用探针式自建 jetty
+# 对同一 tjetty + 同一远端段做一次无害预热 WR（读到一个专用
+# scratch 本地缓冲，避开 CONNECT 胶囊的 iobuf 以免 D2 的
+# IOCCSZ 扰动）：
+# c1 预热用 READ（opcode=READ，1 字节或最小长度）
+# c2 预热用 WRITE 到远端（若可安全指定远端缓冲；否则仅 c1）
+# 若预热后真实流程通过 → 根因=首用/TP 建立，修复方案改为"导入后
+# 一次预热调用"（外部出实现）
+```
+
+**D. 还原**：改动 env 门控；A 通过则产物保留为 V2；A 败则回填
+lib/nvmf/urma.c=0b0c913b… 、nvme_urma.c=b4807e83… 并 clean 重编
+（90348d82…/01dc9304…）。另：**部署校验 pid+listening，清场用
+pkill -f 'build/bin/nvmf_tgt'**。
+
+**回传**：A 判据结果（+B/C 按条件 + 最终 env），注明
+「批次 P2-66 完毕」。
