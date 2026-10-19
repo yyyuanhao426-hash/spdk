@@ -7638,3 +7638,87 @@ nvmf/urma.c=0b0c913b…），clean 重编；部署校验 pid+listening、
 清场 pkill -f 'build/bin/nvmf_tgt'；常规清单照旧。
 
 **回传**：A 判据结果（+B/C 按条件），注明「批次 P2-68 完毕」。
+
+### 回执导入 2026-10-19 #P268（批次 P2-68 回执，用户带回）—— 注册方式出清；⚠️ 地址结论不干净，tjetty 维度浮出
+
+**判定：A ❌ 同地址/同长度现场 urma_register_seg 重注册（8/8，
+regfail 0）后，I/O qpair 的 1024B connect WR 仍 status=4；同 run
+原流程仍失败（插桩无副作用）。C 三变体（池内另一页/池首 64B/
+scratch）均 status=0，但整体 run 均以 connect -5 结束（数据投到
+错误地址 → 命令语义失败，不是 status=4 复现）。D ✅ 还原。**
+
+- ⚠️ **git 前提偏差（必须记录）**：133 的 HTTP 代理 141.1.75.181:
+  3128 已不通，`git fetch` 超时，本地对象库无 0d3959509/b2ddf7248，
+  origin/nds_v1 仅到 92ab0bc6f。**实验在 P2-67 收尾基线（两源文件
+  +两二进制 md5 逐字节一致）上完成**，任务书 #101 正文取自对话原文。
+  → 后续 133 可能长期无法拉取 GitHub：指令必须保持自包含（本文件
+  正文即权威），回执带回不依赖 push。
+- **A 数据细读（本批最有价值的矛盾点）**：同一 run 内同一批
+  重注册——6 个 status=0 全部是**管理 qpair 的 4096B WR
+  （addr=0x200005400000）**；2 个 status=4 全部是**I/O qpair 的
+  1024B connect WR（va=0x200005400000 / 0x200006400000）**。
+  **同一地址 0x200005400000 在管理 qpair 上成功、在 I/O qpair 上
+  失败** → "地址区间"不成立；注册方式/属性/token_id/access/ctx/
+  eid/uasid 亦全出清（B 项两套 tseg 对照：唯一差异 access 0x6→0xe、
+  token_id、va/len；注册均为 SPDK_NVME_URMA_MEM_HOST 路径；注意
+  urma_reg_seg_flag_t 无 mapping 位，SEG_NOMAP 是 import 专用）。
+- **由此产生的关键怀疑（外部综合 P2-61/64/67/68）**：失败的 WR 全部
+  发生在 **I/O qpair** 上，而管理 qpair 的 WR 全部成功。两者的差异
+  = **tjetty 来源**：advON 下管理 qpair 发布并导入的是 **SPDK
+  jetty**（P2-61 实测 eid_eq_dev=1），I/O qpair 发布并导入的是
+  **RA jetty**（eid_eq_dev=0）。→ 真正待判的交互项可能是
+  **qpair jetty × tjetty=RA jetty**，而 P2-67 的 a2/a3 很可能
+  打在管理 qpair 的调用路径上（日志无法区分 uqpair 身份），使
+  "iobuf×qpair jetty" 的结论存在混杂。**本批先补台账，再做 I/O
+  qpair 路径上的 2×2。**
+
+### 指令 2026-10-19 #102：批次 P2-69（tjetty 维度判决——全量 WR 台账 + I/O qpair 路径 2×2）
+
+**背景**：P2-68 证明失败只出现在 I/O qpair 的 WR 上（管理 qpair
+全成功），两者唯一已知差异 = 导入的 tjetty 是 RA jetty vs SPDK
+jetty。本批用**全量台账**先把失败集合的特征钉死，再在 I/O qpair
+路径上做 2×2 拆交互项。
+
+**A.（全量 WR 台账，先跑）**：
+```bash
+# env SPDK_NDS_LEDGER=1（export 给 nvmf_tgt 进程！）
+# nvmf_urma_post_data 每条 WR 提交前记：
+#   NDS-LEDGER: up=0x.. self_jetty=0x.. jetty_id=? tjetty=0x..
+#               tjetty_id=? opcode=? len=? laddr=0x.. tseg=0x..
+#               user_ctx=0x.. jfc=? qid=?(若可) role=admin|io
+# 完成时记：NDS-LEDGER-CR: jfc=? user_ctx=? status=?
+# 判定失败集合特征：
+#   - 是否 100% 落在 role=io 且 tjetty_id=对端 RA jetty id；
+#   - 管理 qpair（tjetty_id=对端 SPDK jetty id）是否 100% 成功；
+#   - self_jetty 与 tjetty 的 id 对，以及 len 分布。
+# 带回完整台账（>50 条则带回前后各 20 + 全部失败条）。
+```
+
+**B.（I/O qpair 路径 2×2）**：仅拦截 role=io 的 WR（len=1024、
+tjetty=RA），四格各一轮：
+```bash
+# b1 真实 jetty + scratch 本地段（新 malloc 4KB + register）→ ?
+# b2 探针 jetty（私有 JFC/JFR）+ 真实 iobuf 本地段 → ?
+# b3 探针 jetty + scratch（应 PASS，对照）
+# b4 真实 jetty + 真实 iobuf（应 FAIL，对照）
+# 每格打印 NDS-TJ2X: cell=b? self_jetty=? tjetty_id=? laddr=?
+#             post=? cr.status=?
+# 判读：
+#   b1 PASS + b2 FAIL → 交互项 = qpair jetty × tjetty=RA（本地段无关）
+#   b1 FAIL + b2 PASS → 交互项 = qpair jetty × iobuf 本地段（tjetty 无关）
+#   b1/b2 均 PASS 且 b4 FAIL → 三因子/时序交互（带回台账）
+#   b1/b2 均 FAIL → tjetty=RA 本身即毒化源（结合 b3 若 PASS 则锁定
+#     "本地 jetty 需与 tjetty 来源匹配"）
+```
+
+**C.（补充，若 B 指向 tjetty）**：把管理 qpair 的 tjetty 换成 RA
+jetty（同一管理 qpair jetty、同一 4096B WR）→ 若失败 = tjetty=RA
+是唯一毒化源，与 qpair 身份无关；若成功 = 需 qpair jetty × RA
+组合。
+
+**D. 还原**：插桩 env 门控用后回填（nvme_urma.c=b4807e83…、
+nvmf/urma.c=0b0c913b…），clean 重编；部署校验 pid+listening、
+清场 pkill -f 'build/bin/nvmf_tgt'；常规清单照旧。
+
+**回传**：A 台账 + B 四格结果（+C 按条件），注明
+「批次 P2-69 完毕」。
