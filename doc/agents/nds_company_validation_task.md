@@ -7162,3 +7162,86 @@ jc=1 结局完全相同。D ✅ 还原（nvme_urma.c=b4807e83、urma.c=
 
 **回传**：A 项判据结果（+B/C 按条件 + CCDK 宏值），注明
 「批次 P2-62 完毕」。
+
+### 回执导入 2026-10-19 #P262（批次 P2-62 回执，用户带回）—— jetty 创建方式出清；嫌疑转向"发布坐标本身 / nvmf_tgt 进程内部"
+
+**判定：A 🎯 SPDK 原始创建序列（nvme_urma.c:421-480 逐项照抄）在探针内
+READ/WRITE 全 MATCH → jetty 创建维度出清（B 二分不触发）；C 反向加参：
+depth 16↔2048、priority 2↔0、max_sge 1↔5 任取一端均 PASS（c1
+share_jfr=0 是探针缺口+SPDK 上游恒为 1，不作为结论）。D ✅ 还原
+（SPDK 树零改动、level 5/5、hugepages=0）。**
+
+- **CCDK 宏值带回**：NDS_URMA_DEPTH=16U、NDS_URMA_TOKEN=0xACFEU
+  （=SPDK 默认）、NDS_URMA_PRIORITY=2U（SPDK 实测 0——
+  spdk_urma_select_priority 取第一个提供 CTP 的槽；两者都通）。
+- **设备能力实测**：max_jfc_depth=1048576、max_jfr_depth=32768、
+  max_jfr_sge=4（SPDK 的 JFR max_sge 实际被截到 4 非 5）、
+  max_jfs_depth=8192、max_jfs_sge=13。
+- **排除矩阵更新（31 批）**：jetty 创建方式与创建参数（depth/
+  priority/max_sge/JFR 拓扑）全部出清。**p248/p262 探针内
+  "import 对端 RA jetty + import HBM 段 + 自建 jetty（任意方式）
+  post READ/WRITE"全流程稳定成功**。
+- **剩余差异收敛（两条）**：
+  1. **urma_perf（SPDK initiator）发布的坐标本身是否可用**——SPDK
+     侧的 {eid, uasid, jetty_id, token_id, va} 由 provider
+     （urma_perf_npu.c→libnds）合成后经 HELLO 发布；探针 p1 的坐标
+     是 libnds 原生输出。若 provider 合成有误（如 uasid/jetty_id 取
+     自 scratch 会话而非 HBM 注册会话、或 token_id 错），target 侧
+     import 虽"成功"但连接/访问必被拒（LOC_ACCESS_ERR/status=9）。
+     ——**从未被独立验证过**。
+  2. **nvmf_tgt 进程内部**（device 层 JFC/JFR 共享、多 qpair、
+     nvmf_urma_post_data 的 WR 构造/选择）——若坐标本身可用，则
+     问题必在 target 进程内。
+
+### 指令 2026-10-19 #96：批次 P2-63（发布坐标判决——第三方裸进程 import urma_perf 发布的 RA jetty+HBM 段并 READ）
+
+**背景**：P2-62 出清 jetty 创建方式后，最小分叉 = **"坐标发布侧"
+vs "坐标消费侧（nvmf_tgt）"**。本批用一个**全新第三方裸进程**直接
+消费 urma_perf 经 HELLO 发布的同一套坐标：它能读通 → 坐标无责、
+问题锁定 nvmf_tgt 内部；读不通 → 坐标本身有问题（provider 合成），
+逐字段 diff provider 输出 vs libnds 原生输出。SPDK 源码零改动。
+
+**A.（核心判决）第三方裸进程消费 SPDK 发布的坐标**：
+```bash
+# 1) p262_probe.cpp 拷贝为 p263_probe.cpp，新增角色 x：
+#    从文件（如 /tmp/nds_coords.txt，每行 key=value）读
+#    {eid, uasid, jetty_id, token_id, va, len}，然后：
+#    - import jetty（rj=坐标四元组，CTP/RM，token=0）
+#    - import seg（token=0xACFE，iflag=NON_CACHEABLE+R|W|A+NOMAP，
+#      rseg.token_id=坐标里的 token_id）
+#    - 自建 jetty（CCDK core_create 与 SPDK 序列均可——P2-62 已证等价）
+#    - post READ 到本地缓冲，打印 cr.status（内容 pattern 未知，
+#      verify 可选/跳过）
+# 2) 起 urma_perf -M npu（advertising ON），从其 stderr 抓 HELLO
+#    发布的坐标（NDS session coords / capsule 打印；若信息不全，
+#    允许在 urma_perf 侧加临时打印后还原），写入 /tmp/nds_coords.txt
+#    ——保持 urma_perf 存活（HBM buf 不能释放）
+# 3) 跑 ./p263_probe x，判据：
+#    - cr.status=0 → 🎯 发布坐标对任意进程可用 → 坐标无责，
+#      问题锁定 nvmf_tgt 内部（转 C 记录，外部另出方向）
+#    - import 失败 / cr.status 非 0 → 发布坐标本身有问题 → 转 B
+```
+
+**B.（A 失败时）坐标逐字段 diff**：
+```bash
+# 同机同卡分别取两份坐标，逐字段对照（eid/uasid/jetty_id/token_id/
+# va 形态）：
+#   ① p263_probe p1（libnds 原生路径）的 nds_get_segment_info 输出
+#   ② urma_perf -M npu 的 provider（urma_perf_npu.c get_segment_info/
+#      get_ra_jetty_info）实际返回值（临时打印后还原）
+# 锁定第一个不一致的字段即根因；记录两份原始输出带回。
+```
+
+**C.（对照组，A 之前先跑，验证 role_x 本身正确）**：
+```bash
+# 用 p263_probe p1 的坐标（同一坐标格式写 /tmp/nds_coords.txt）
+# 跑 role_x → 应 PASS（import+READ cr.status=0）。
+# 此对照不过则 role_x 实现有问题，A 的结论无效。
+```
+
+**D. 还原**：p263_probe.cpp 新文件、SPDK 源零改动；临时打印用后
+还原；常规清单照旧（level 5/5、无残留进程、hugepages、git status
+与基线一致）。
+
+**回传**：C 对照结果 + A 判据结果（+B 按条件两份坐标原始值），注明
+「批次 P2-63 完毕」。
