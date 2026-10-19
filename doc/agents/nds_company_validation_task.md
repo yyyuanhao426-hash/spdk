@@ -7722,3 +7722,79 @@ nvmf/urma.c=0b0c913b…），clean 重编；部署校验 pid+listening、
 
 **回传**：A 台账 + B 四格结果（+C 按条件），注明
 「批次 P2-69 完毕」。
+
+### 回执导入 2026-10-19 #P269（批次 P2-69 回执，用户带回）—— 🎯🎯 唯一失败因子坐实：tjetty = 导入的 RA jetty
+
+**判定：A 台账 8 条——失败集合 100% = role=io 且 tjetty_id=对端
+RA jetty（10287）；管理 qpair（tjetty_id=24492=SPDK jetty）100%
+status=0。🔴 决定性反例：#1 与 #8 同一 laddr(0x200005400000)、同一
+len(1024)、同一 local tseg(0x40608c60)，只差 tjetty → 地址/iobuf
+假设彻底否证（P2-68 C 结论撤回）。B 2×2（b1 真实 jetty+scratch /
+b2 探针 jetty+真实 iobuf / b3 双探针 / b4 双真实）全部 status=4 →
+**任何本地 jetty 打向 RA tjetty 都超时**。C 镜像（同一 I/O jetty、
+同一 1024B WR，tjetty 由 RA 换成 SPDK jetty）→ status=0 ×2，
+**connect -5 = 0，握手完全成功**。D ✅ 还原。**
+
+- **结论**：唯一必要且充分的失败因子 = **远端 tjetty 是被导入的 RA
+  jetty**（uasid=0），与 qpair 身份、本地 jetty、本地段、地址、长度、
+  注册方式全部无关。换成 SPDK jetty 立即成功。
+- **附带纠正 P2-67**：其 a1/a2/a3 的插桩只触发一次且未按 role
+  过滤，实际打在管理 qpair 路径上——"iobuf×qpair jetty"是混杂结论。
+- **git 前提更新**：133 直连 GitHub 不可达是常态；本机经
+  proxycn2.huawei.com:8080 fetch + git archive → scp 已可同步任务书。
+- **外部对根因的收窄**：SPDK 侧 import 构造（nvmf/urma.c:680-736）
+  与 p248/p263 探针逐字段对照——eid/id/uasid/trans_mode=RM/type=
+  JETTY/tp_type=CTP 全同；`flag` 未设=0=URMA_DEF_ORDER 等价；仅
+  token 差异（0xACFE vs 0，P2-56 已测两值均败）。**参数层面无新
+  差异**。剩余唯一结构性可疑点 = **本地 eid 与 RA eid 的路由关系**：
+  探针 context 的 local_eid 来自 nds_query_device0_local_eid（可能即
+  RA eid df00:0100），而 nvmf_tgt 的 device 是 udmac0d1e2
+  （df08:0b00）→ 对 RA jetty（df00:0100）是**跨 eid 导入**；若探针
+  本地 eid 也是 df08 则跨 eid 在裸进程可行、差异回到进程环境。
+
+### 指令 2026-10-19 #103：批次 P2-70（本地 eid / TP 路由取证——跨 eid 判决）
+
+**背景**：P2-69 把失败因子钉死为 tjetty=RA jetty。参数层面已无
+差异，剩余两种解释：① **跨 eid 路由**（本地 df08 → RA df000100）；
+② 进程环境（DPDK）。本批先取证、再单变量判决。
+
+**A.（核心取证）两条导入路径的 TP/local_eid 对照**：
+```bash
+# 1) 跑 p263_probe x（role_x，消费 RA 坐标 import+READ，已知成功），
+#    带回它 eid_dump("[R] local_eid") 的实际值，以及运行中：
+#    urma_admin show dev <dev> tp  （-w 全表）→ 找到该进程创建的
+#    TP 条目：tpid / local_eid / peer_eid / trans_mode / state
+# 2) 同机同刻跑 nvmf_tgt（advON，导入 RA jetty）+ urma_perf，
+#    取 target 侧创建的 TP 条目（peer_eid 应为 RA eid df00:0100）
+# 3) 逐字段 diff 两套 TP（local_eid/peer_eid 是关键）：
+#    - 探针 local_eid == RA eid（同 eid）→ 根因=跨 eid 路由 → 转 B
+#    - 探针 local_eid == df08（跨 eid 也可行）→ 差异在进程环境 →
+#      转 C
+```
+
+**B.（若坐实跨 eid）修法判决**：
+```bash
+# B1 在 role_x 里把自建 jetty 的 device 强制为 udmac0d1e2
+#    （df08:0b00，与 nvmf_tgt 相同）再 import RA jetty + READ：
+#    - 失败 → 跨 eid 根因坐实（裸进程也一样）
+#    - 成功 → 跨 eid 可行，差异在进程环境 → 转 C
+# B2（B1 失败时）试 target 侧 device 换成能路由 RA eid 的设备：
+#    遍历 /sys 下所有 udmac*，对同一 RA 坐标 import+READ，
+#    找出能通的 dev（若存在）→ 修法 = target --dev-name 指定该设备
+# B3（B2 也无）记录结论：需要 RA 侧提供"设备 eid 版本"的 jetty
+#    （即 RaCtxQpCreate 输出应发布设备 eid 可路由坐标）——外部找
+#    CCDK/RA agent 确认是否可行
+```
+
+**C.（若探针本地 eid 也是 df08）进程环境判决**：
+```bash
+# p232 式：裸进程 + spdk_env_init（DPDK EAL）后直调 liburma
+# 对 RA 坐标 import+READ → 失败 = DPDK EAL 环境是毒化源；
+# 成功 = 差异在 nvmf_tgt 代码路径（回到代码二分）
+```
+
+**D. 还原**：本批取证为主、无源码固化改动；临时打印/旋钮用后
+回填（基线 md5 不变）；常规清单照旧。
+
+**回传**：A 两套 TP 条目原文 + local_eid 值（+B/C 按条件），注明
+「批次 P2-70 完毕」。
