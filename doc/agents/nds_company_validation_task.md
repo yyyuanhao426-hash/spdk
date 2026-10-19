@@ -7798,3 +7798,79 @@ b2 探针 jetty+真实 iobuf / b3 双探针 / b4 双真实）全部 status=4 →
 
 **回传**：A 两套 TP 条目原文 + local_eid 值（+B/C 按条件），注明
 「批次 P2-70 完毕」。
+
+### 回执导入 2026-10-19 #P270（批次 P2-70 回执，用户带回）—— 🎯🎯🎯 根因坐实：chip 路由；两侧 chip1 后数据面全通
+
+**判定：A TP 对照——探针成功进程 local_eid=df0a:0b00
+（udmac1d1e2/chip1）、target 失败进程 local_eid=df08:0b00
+（udmac0d1e2/chip0），peer_eid 同为 df00:0100，其余字段全同 →
+"跨 eid"不成立，唯一差异 = 本地设备/chip。B 设备扫描（裸探针
+单变量）：chip0 全 status=4；chip1 全 status=0（d1e2~d1e6 均通，
+tp_cnt 非判据）。B1 裸探针强制 chip0 也失败 → **DPDK/EAL 彻底
+排除**。B2 修法验证（零源码改动）：两侧都 chip1 → **connect -5=0、
+target status=4=0/9=0、数据 WR 全部完成（completion n=14 无错误）**，
+仅剩 I/O qpair connect rc=-125。D ✅ 还原（源码/二进制 md5 不变）。**
+
+- **根因（38→39 批收官）**：RA eid df00:0100 只能经 **chip1
+  （udmac1*）** 访问；nvmf_tgt 默认 chip0（udmac0d1e2）→ 数据
+  READ 被回 ACK_TIMEOUT(status=4)。与注册方式、本地段、jetty 参数、
+  DPDK 环境均无关。**P2-69 的"tjetty=RA 即毒化"实际是"tjetty=RA
+  且本地在 chip0"。**
+- **修法方向**：target 侧 URMA 设备指定为能路由 RA eid 的 chip1
+  设备（SPDK_URMA_DEV_NAME=udmac1d1e2 或 --dev-name）；生产两机
+  场景只需改 target；同机回环需两侧同 chip。
+- **剩余问题（独立）**：两侧 chip1 后 I/O qpair connect rc=-125
+  (Operation canceled)。外部查证：**-125 来自 nvme_fabric.c:619
+  （connect 命令超时 → -ECANCELED）**，即 CONNECT 命令在超时窗口内
+  未完成；数据 WR n=14 完成说明胶囊层面在动。需定位：是 initiator
+  超时太短（RA 路径首次 TP 慢），还是 target 侧某步没响应。
+- 环境残余：本次 import 在 udmac* TP 表留下条目（每设备约 1 条，
+  udmac1d1e2 仍 60），按共享设备纪律未删任何 tpid。
+
+### 指令 2026-10-19 #104：批次 P2-71（-125 判决——I/O qpair connect 超时的时间线与归属）
+
+**背景**：chip1 配置下数据面已通，仅 I/O qpair connect 返回 -125
+（nvme_fabric.c:619 = connect 命令超时 ECANCELED）。本批查清 -125
+到底是我们等太短，还是 target 侧没响应/响应丢失。**配置保持两侧
+chip1**（SPDK_URMA_DEV_NAME=udmac1d1e2，回环两侧同 chip）。
+
+**A.（核心取证）全时间线**：
+```bash
+# 两侧 level 8 + 时间戳（urma_perf/target stderr 加 ms 时间戳或
+# 用 ts 工具；不改源可用 `ts '%.s'` 包一层）。
+# 1) initiator：打印/确认每个 qid 的 CONNECT 发起时刻、超时值、
+#    失败时刻；确认是 1 个还是 2 个 I/O qpair 失败、哪个成功
+#    （若 n=14 的完成里含成功 qpair 的数据 WR）
+# 2) target：每个 qid 的 connect 胶囊到达时刻、握手完成、
+#    qpair 创建/导入/handshake 完成、CONNECT 响应发出时刻；
+#    有无错误行
+# 3) 两侧日志按时间轴对齐，判定三种形态之一：
+#    T1 target 从未收到 CONNECT 胶囊 → 通道/胶囊路径问题
+#    T2 target 收到但未响应或在响应前卡住 → target 侧步骤定位
+#    T3 target 已响应但 initiator 未在超时前收到 → 超时/延迟
+# 带回两侧原文日志（节选关键 50 行 + 完整时间线表）
+```
+
+**B.（超时值判决）**：
+```bash
+# 查 SPDK 侧 connect 超时来源（ctrlr opts：transport_ack_timeout?
+# 或 fabrics connect 的固定超时）并临时放大（env 或临时改常量，
+# 用后还原）重跑两侧 chip1：
+#   - 放大后 connect 成功 → 纯延迟问题（T3），记录需要的超时量级
+#   - 仍 -125 → 不是超时长度问题，按 A 的 T1/T2 定位
+```
+
+**C.（T2 时）target 侧步进插桩**：
+```bash
+# 在 target 的 I/O qpair 建立路径逐步打印时间戳：
+#   accept → handshake(HELLO 收/导入 jetty/回 RSP) → qpair 创建
+#   → CONNECT 胶囊 pull 完成 → 响应 post → 完成
+# 找出与 admin qpair 相比多耗时/卡住的步骤（chip1 专属）
+```
+
+**D. 还原**：本批以取证为主；临时日志/常量用后回填，源码与
+二进制 md5 回到基线（0b0c913b…/b4807e83…/90348d82…/01dc9304…）；
+常规清单照旧（共享设备 TP 条目不清）。
+
+**回传**：A 时间线 + B 结果（+C 按条件），注明
+「批次 P2-71 完毕」。
