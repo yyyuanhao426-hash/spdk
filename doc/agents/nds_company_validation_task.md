@@ -8113,3 +8113,83 @@ status=0、errors=0**；**-b ≥ 2 → 立即失败，失败条数恒为 batch�
 用后回填/clean 重编；常规清单照旧、共享 TP 条目不删。
 
 **回传**：A 判据（+B/C 按条件），注明「批次 P2-74 完毕」。
+
+### 回执导入 2026-10-19 #P274（批次 P2-74 回执，用户带回）—— 并发/seg/token 全排除；唯一变量 = transport qpair jetty
+
+**判定：A ✅ 裸探针全通——两块独立注册、token 不同
+（1114624/1115136）、同 jetty，depth=2/8 交替读 100%，补测
+depth 32/64、WRITE 方向、p1 满载仍 100%。C ✅ target 侧私有
+jetty 手动连发 2/8 条（READ 与 WRITE）全部 status=0；关 import
+缓存无改善。B 🎯 台账决定性事实：-b 8 每批 10 条数据 WR 中，
+**成功/失败条目的 remote seg/token/local tva/len/self jetty/
+tjetty 完全相同**，唯一差异 = user_ctx 与提交顺序；**失败的
+全是 push=1（WRITE 方向），且恒为"前 3 条成功、后 7 条
+status=8(REM_ACCESS_ABORT)"**（三次独立 run + priority/tp_type
+变体复现）。D ✅ 还原。**
+
+- **已排除（本批新增）**：远端 seg 地址区间、远端 token_id、
+  并发条数 2/8/32/64、传输方向 READ/WRITE、接收方服务/负载、
+  import 缓存、jetty priority/tp_type。
+- **唯一剩余变量**：**transport 的 qpair jetty 对象及其 JFR/JFC
+  绑定**——qpair jetty 使用 device->jfrs[i] + device->recv_jfcs[i]
+  + device->send_jfcs[send_jfc_idx]，且与 capsule 收包资源同源；
+  探针/私有 jetty 用自建 JFC/JFR，同一 tjetty/同一 seg/同一方向
+  并发 8 条全绿。
+- **修复候选（下一批）**：数据 WR 改走**每 qpair 独立的 data jetty**
+  （自建 JFR/JFC），与 capsule 收发解耦——即本批已验证 100% 成功
+  的形态。若需保留共享 jetty，则逐项替换排查"多 jetty 共享
+  recv JFC 时 CQE/接收缓冲归属"。
+- 临时基线仍是每 qpair 单 outstanding（-b 1，P2-73 已验证
+  1500~3100 条零错误）。
+
+### 指令 2026-10-19 #108：批次 P2-75（数据 jetty 解耦修复判决——数据 WR 走每 qpair 独立 jetty）
+
+**背景**：P2-74 收敛唯一变量 = qpair jetty 的共享 JFR/JFC 绑定；
+私有 jetty 8 条并发全绿。本批把数据面 WR 切到每 qpair 独立的
+data jetty（env 门控），验证修复。通过即 V2 收口。
+
+**A.（核心判决）数据 WR 走独立 data jetty**：
+```bash
+# lib/nvme/nvme_urma.c nvme_urma_create_jetty()/qpair 结构加
+# env 开关 SPDK_NDS_DATA_JETTY=1（**两侧**都开）：
+#   - 每 qpair 额外建 1 个 data jetty：自建 send JFC + recv JFC
+#     （depth=4096，字段照 device 池）+ 自建 JFR（depth=2048、
+#     NO_TAG_MATCHING、TM_RM、max_sge 截 dev_cap、token=0xACFE、
+#     jfc=自建 recv）+ urma_create_jetty（jfs.depth=2048、
+#     jfs.jfc=自建 send、share_jfr=1、shared.jfr/jfc=自建）
+#   - 保留原 qpair jetty 不动（capsule 收发/HELLO 发布照旧）
+#   - post_data 的数据 WR 从 uqpair->jettys[idx] 改 post 到
+#     uqpair->data_jetty；完成轮询把 data jetty 的 send JFC 并入
+#     该 qpair 所属 worker 的 poll 集合（参照 P2-65 私有 JFC 的
+#     poll 补法）；销毁/error 路径同步
+# 跑 -M npu：两侧 chip1 + P2-72 双 jetty hack + **-b 8**（并发）：
+#   - 全部完成、errors=0、数据一致 → 🎯🎯 修复坐实，V2 收口！
+#   - 仍败 → B
+```
+
+**B.（A 仍败）共享 recv JFC 归属二分**：
+```bash
+# b1 只把 data jetty 的 recv JFC 改成 device 池（其余自建）→ 定位
+#    recv JFC 共享
+# b2 只把 send JFC 改成 device 池 → 定位 send JFC 共享
+# b3 只把 JFR 改成 device 池 → 定位 JFR 共享
+# 每变体 -b 8 一轮，记录 errors 与 status 分布
+```
+
+**C.（A 通过时）V2 固化 + V3 基线**：
+```bash
+# 1) -M cpu 回归（无回归）
+# 2) -b 1 与 -b 8（及默认）双配置数据一致性 + 计时段
+# 3) -M npu 带宽/IOPS 全量（V3 基线，注明并发档位）
+# 4) 记录最终 env/hack 组合：chip1 + 双 jetty（控制走 SPDK jetty、
+#    数据走 RA jetty）+ data jetty 独立；供外部写正式补丁：
+#    - HELLO 双坐标（RA eid + 设备 eid），target 按 remote seg
+#      ubva.eid 选 tjetty；
+#    - data jetty 每 qpair 独立（默认开或配置项）
+```
+
+**D. 还原**：env 门控；A 通过则产物保留为 V2；A 败回填四文件
+md5 基线并 clean 重编；常规清单照旧、共享 TP 条目不删。
+
+**回传**：A 判据结果（+B/C 按条件 + 最终 env 组合），注明
+「批次 P2-75 完毕」。
