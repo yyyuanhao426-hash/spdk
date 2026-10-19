@@ -7565,3 +7565,76 @@ nvmf/urma.c=0b0c913b…），clean 重编（90348d82…/01dc9304…）；
 
 **回传**：2×2 四格原始结果（+B/C 按条件），注明
 「批次 P2-67 完毕」。
+
+### 回执导入 2026-10-19 #P267（批次 P2-67 回执，用户带回）—— 🎯 交互项锁定：iobuf 池 tseg × qpair jetty
+
+**判定：A 四格——a1（探针 jetty×真实 WR 全字段）PASS、a2（qpair
+jetty×探针 WR）PASS；C 完成归属取证——status=4 均落在各自
+send_jfc_index（worker1→jfc1、worker0→jfc0）由正确 worker 轮询
+派发，a2 在同一 jfc 拿到 status=0 → 「完成落在无人轮询的 JFC」
+证伪；a3（补充格：qpair jetty×同远端 rva×len=1024×scratch 本地
+段）PASS。D ✅ 还原。**
+
+- **连续 5 格矩阵（同进程/同 tjetty/同远端段/len 对齐）**：
+  | 本地段 | jetty | 结果 |
+  |---|---|---|
+  | scratch 现场 register_seg | 探针 jetty | status 0 |
+  | iobuf 池 tseg | 探针 jetty | status 0（a1） |
+  | scratch 现场 register_seg | qpair jetty | status 0（a3） |
+  | scratch 64B | qpair jetty | status 0（a2） |
+  | **iobuf 池 tseg** | **qpair jetty** | **status 4（真实流程）** |
+  → **交互项，不是单因子：iobuf 池 tseg × qpair jetty 组合才超时。**
+  任一因子换掉即成功。
+- **WS 级教训**：SPDK_NDS_CROSS 首轮只 export 给 urma_perf（插桩在
+  target）→ 无输出；**env 必须 export 给 nvmf_tgt 进程**。
+- **下一步（测试 agent 建议，外部采纳）**：① 同一 iobuf 地址改用
+  逐 I/O 探针式 urma_register_seg 注册 → 判"注册方式/内存域" vs
+  "地址区间"；② iobuf tseg vs scratch tseg 逐字段对照
+  （token_id/ubva.va/attr/token_policy/mapping…）；③ 检查 iobuf
+  注册用的 memory_domain 与 qpair jetty 所属 TP 是否一致。
+
+### 指令 2026-10-19 #101：批次 P2-68（本地段注册方式判决——同一 iobuf 地址换探针式逐 I/O 注册）
+
+**背景**：P2-67 锁定交互项 = iobuf 池 tseg × qpair jetty。本批只动
+"iobuf 的本地 tseg 怎么来"，其余（qpair jetty、远端 rva/len、
+WR 构造）全部不动。SPDK 源码插桩、env 门控、用后还原。
+
+**A.（核心判决）同一地址、探针式重新注册**：
+```bash
+# 在 post_data 真实 WR 提交前（env SPDK_NDS_LOCALSEG=1）：
+#   - 取真实 WR 的本地 SGE 地址/长度（iobuf 池 tseg 的 addr/len）
+#   - 用探针式 urma_register_seg 对该地址现场注册一个新 tseg
+#     （P2-58 flags：NON_CACHEABLE + R|W|A + SEG_NOMAP、
+#     token_policy=NONE、token=0xACFE）
+#   - 用新 tseg 替换真实 WR 的本地 SGE 后 post（qpair jetty 不变），
+#     完成走正常流程；用后 urma_unregister_seg
+# 跑 -M npu（advON）：
+#   - 通过（errors=0 + 数据一致）→ 🎯 注册方式/属性是根因 → 转 B
+#   - 仍 status=4 → 地址区间/池本身特性 → 转 C
+# 对照：同 run 原流程仍失败（插桩无副作用）
+```
+
+**B.（A 通过时）tseg 逐字段对照**：
+```bash
+# 打印并带回两套 tseg 的字段（iobuf 池 vs 探针式重注册）：
+#   token_id、token_policy、ubva{va,uasid,eid}、len、attr
+#   {cacheable,access,mapping}、以及注册调用参数与所用 urma_context
+#   指针；同时确认 iobuf 池注册的 memory_domain 与 qpair jetty 的
+#   关联（SPDK register_memory 路径 vs 探针 register_seg）。
+# 第一个不一致字段即修复点；外部据此出固化 patch。
+```
+
+**C.（A 失败时）地址区间二分**：
+```bash
+# c1 同 iobuf 池内换另一块 1KB 地址（同注册方式）→ 若也败 = 池/域
+# c2 iobuf 池首地址 + 探针式重注册但 len 缩小到 64 → 排除长度
+# c3 把探针 scratch 注册进 qpair 的 context 后用 qpair jetty post
+#    （确认 context 关联无差异）
+# 记录各变体 status。
+```
+
+**D. 还原**：插桩 env 门控用后回填（nvme_urma.c=b4807e83…、
+nvmf/urma.c=0b0c913b…），clean 重编；部署校验 pid+listening、
+清场 pkill -f 'build/bin/nvmf_tgt'；常规清单照旧。
+
+**回传**：A 判据结果（+B/C 按条件），注明「批次 P2-68 完毕」。
