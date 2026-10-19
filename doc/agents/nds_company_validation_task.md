@@ -8585,3 +8585,28 @@ target completion error=0、wire mismatch=0。D ✅ 清理/重编/还原
 
 **回传**：A 的 commit hash/patch + push 结果（⚠️ 若 push 失败必须
 置顶报明）+ B 矩阵表，注明「批次 P2-80 完毕」。
+
+### 补充说明 2026-10-19（对指令 #113 A 的交付方式修正，重要性高）
+
+**背景**：测试 agent 处于公司内网、**不能 push 到 GitHub**；且 133 本地
+仓的 HEAD（a0feee19b）与线上 nds_v2 不是同一条历史线（非祖先），
+直接 `git format-patch` 的基线不同，补丁无法干净应用。
+
+**A 项改为"文件交付"（不再要求 push）**：
+```bash
+# 1) 交付 4 个 V2 文件的【完整内容】（tar 打包或文本带回均可）：
+#    examples/nvme/urma_perf/urma_perf_npu.c
+#    lib/nvme/nvme_urma.c
+#    lib/nvme/nvme_urma_internal.h
+#    lib/nvmf/urma.c
+# 2) 每个文件附 md5sum（应为已报的：
+#    urma_perf_npu.c=38f05de5…、nvme_urma.c=79c10531…、
+#    nvme_urma_internal.h=913267ca…、nvmf/urma.c=d2f686da…）
+# 3) 另附"相对 nds_v2 基线（3e3b4e414）的 diff"作为参考：
+#    在 133 上用最新 archive（3e3b4e414）解包出基线副本，
+#    diff -u 基线文件 工作树文件 > <file>.diff（4 份）
+# 4) 外部（用户侧）负责把这些文件应用到我方仓库并 commit + push，
+#    测试 agent 不需要访问 GitHub。
+```
+
+**其余 B/C/D 不变**（V3 快速矩阵、一页 md 汇总、环境还原）。
