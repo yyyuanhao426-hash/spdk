@@ -8038,3 +8038,78 @@ env 门控 hack（不新增固化改动）；用后回填/clean 重编；常规�
 
 **回传**：A 的失败阈值（第几条/长度关系）+ B 符号清单与轮询结果
 （+C 按条件），注明「批次 P2-73 完毕」。
+
+### 回执导入 2026-10-19 #P273（批次 P2-73 回执，用户带回）—— 裸探针全绿；根因收敛到 target 多 outstanding 数据 pull
+
+**判定：A ❌（假设不成立）裸探针全部 100% 成功——64KB×100、
+4KB×1000、16KB×200、depth 2/8/32、512KB 区任意偏移、双 jetty
+并发，全 ok；p1 进程 CPU 空转（2~3 ticks/1000 条）→ RA jetty
+接收侧**无需用户态服务**（B 假设否证；libnds 无公开 poll 导出，
+libra.so 有完整 CQ 面但插件 ABI 不暴露句柄）。C 🎯 真正触发条件：
+urma_perf **-b 1（单 outstanding）→ 1494~3114 条 64KB 全
+status=0、errors=0**；**-b ≥ 2 → 立即失败，失败条数恒为 batch−1
+（b2→1、b4→3、b8→7），4KB 与 64KB 完全相同**；失败码 status=8
+（REM_ACCESS_ABORT_ERR，远端主动 abort）。D ✅ 还原。**
+
+- **排除**：RA 域本身稳定（3000+ 条串行、depth32 并发、任意偏移、
+  512KB 区、双 jetty）；单次长度无关（4KB=64KB 曲线一致）；
+  接收资源/服务无关（p1 空转也全通）。
+- **收敛**：问题只在 **target 一次 post 多条数据 pull** 时出现；
+  单条串行永远正常。最可疑 = 多条 pull 同时在途时对
+  remote_seg / local_region / jetty 轮转的复用。
+- **可用的规避（V3 临时基线）**：数据 pull 收敛为每 qpair 单
+  outstanding（等价 perf -b 1），已验证 1500~3100 条零错误。
+- **外部补充核对（代码）**：nds_v2 已有 import 缓存
+  （SPDK_URMA_IMPORT_CACHE，按 seg 复用 tseg，v7）→ "每条 WR 都
+  import"不成立。**新的关键差异**：探针的深度并发读的是**同一个
+  远端 seg**；target 并发 pull 的目标是**不同 seg**（每个 I/O 的
+  HBM 缓冲 va 不同，P2-72 表：0x120000028000 / 0x120000018000）。
+  RA lmem 每个注册有不同的 token_id —— 并发访问不同 token 的 RA
+  seg 是否被远端 abort，从未测过。
+
+### 指令 2026-10-19 #107：批次 P2-74（并发目标判决——同 seg vs 不同 seg × 不同 token）
+
+**背景**：P2-73 把问题钉到"target 多 outstanding 数据 pull"；
+裸探针的并发只读过同一 seg。本批先在裸探针里把"并发 × 不同
+远端 seg/token"这个维度补齐，再在 target 侧台账对齐 abort。
+
+**A.（裸探针，核心）**：
+```bash
+# p274_probe = p273_probe + p1 注册两块独立 HBM 缓冲（libnds 各注册
+# 一次，导出 seg_A/seg_B 含各自 token_id）+ p2 新增 P274_TARGETS
+# 模式（1|2 个 seg）：
+#   a1 depth=2 两个 outstanding 都读 seg_A（对照，预期 ok）
+#   a2 depth=2 一读 seg_A、一读 seg_B（关键）
+#   a3 depth=8 交替 A/B
+#   a4 若 a2 失败：seg_A/seg_B 的 token_id 是否相同（打印）；
+#      若不同 → 再试两块 seg 但强制相同 token（若 API 允许），
+#      判"token 并发" vs "不同 seg 并发"
+#   a5 若 a2 通过：说明裸层没问题，转 C（target 特有）
+# 记录每条 cr.status、失败序号、两块 seg 的 {va,len,token_id}
+```
+
+**B.（target 侧台账对齐）**：
+```bash
+# 复用 P2-69 台账（env SPDK_NDS_LEDGER=1），跑两侧 chip1 + 双 jetty
+# hack + -b 8，带回每条数据 pull 的：
+#   seq/qid/self_jetty/remote seg{va,len,token_id}/local tva,len/
+#   user_ctx/status
+# 判读：每批成功的那 1 条 vs 失败的 batch−1 条，在
+#   remote seg / local tva / user_ctx / jetty 上的差异；
+#   失败集合是否恰好"同批中除第一条外的全部"。
+```
+
+**C.（若 A 全通）target 特有因素二分**：
+```bash
+# c1 同一 qpair、同一 remote seg、手动连发 2 条 pull（绕过上层
+#    多 I/O 编排）→ 是否复现；
+# c2 两条 pull 用同一 local tseg vs 不同 local 切片 → 定位
+#    local_region 复用；
+# c3 关闭 import 缓存（SPDK_URMA_IMPORT_CACHE=0）跑 -b 8 →
+#    排除缓存路径。
+```
+
+**D. 还原**：探针新文件；SPDK 仅复用已存在 env/hack，无固化改动；
+用后回填/clean 重编；常规清单照旧、共享 TP 条目不删。
+
+**回传**：A 判据（+B/C 按条件），注明「批次 P2-74 完毕」。
