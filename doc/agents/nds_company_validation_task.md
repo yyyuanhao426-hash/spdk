@@ -8269,3 +8269,76 @@ X1 通过则转 X2 判"发起侧形态"；全程补获 abort 的远端原因。
 
 **回传**：X1 判据结果（+B/C 按条件 + abort 原因原文），注明
 「批次 P2-76 完毕」。
+
+### 回执导入 2026-10-19 #P276（批次 P2-76 回执，用户带回）—— 发送环境/发起侧形态双双排除；🆕 内核线索 bogus jfcn
+
+**判定：A（X1）✅ 最小 SPDK 程序（spdk_env_init 同 EAL +
+spdk_urma_device 同参数 + target 同款 jetty + RA 坐标 import）
+WRITE/READ × depth 8/32 共 400/400 status=0 → **发送进程环境无责**。
+B① ✅ 真实回环降维（SPDK jetty 仅 1 条 1024B 握手 pull、数据面
+零 ctrl 路由）失败形态不变 → 与 perf 侧 SPDK jetty 无关。B② ✅
+p1 模拟 perf 形态（额外 SPDK 风格 jetty + 同进程 TCP capsule +
+8 并发写 RA HBM，512KB/64KB 两种 seg）100/100 → 发起侧形态单独
+不足以触发。C 🆕 失败 run 唯一新增内核原文：**`ubase: UDMA:
+Completion event for bogus jfcn <N>`（每失败 run 2 条；-b 1 成功
+对照 0 条）**；无 ubcore/uburma abort 文本；libra 的
+RaGetCqeErrInfo/RaCtxGetAsyncEvents 无头文件/ABI 未能安全调用。
+D ✅ 还原。**
+
+- **累计排除**：SPDK EAL/spdk_urma_device、target 同款 jetty 参数、
+  import 参数、并发 8/32、逐条偏移、perf 侧 SPDK jetty、发起侧
+  "额外 jetty + TCP capsule"形态。
+- **真实失败形态（决定性细节）**：失败 7 条全部是 **qid=1 的 RA
+  HBM 段 WRITE（push=1，eid=…df00:0100，va=0x120000018000，
+  len=65536，token=1114880）**；同一 target 的 qid=0 设备域 4KB
+  WRITE（eid=…df0a:0b00）5/5 全绿。→ 差异仍在"同一进程内两种域
+  的 WR 共存"这一真实回环形态。
+- **剩余两条待判**：
+  1. **URMA 控制面 pull 与 RA 数据 WR 的交错**（B②只做了 TCP
+     形态，未做 URMA ctrl-pull 交错）——最可疑；
+  2. **bogus jfcn 归属**：jfcn 值（62374/15502）与已建 JFC 的
+     对应关系，定位"完成事件为何落在不存在的 JFC 上"。
+
+### 指令 2026-10-19 #110：批次 P2-77（交错复现 + jfcn 溯源 + abort 原文）
+
+**背景**：P2-76 后只剩"真实回环内部"的差异，内核唯一线索是
+bogus jfcn。本批三件事，任一件命中即可收口。
+
+**A.（核心）URMA 控制面 pull 与 RA 数据 WR 交错复现**：
+```bash
+# 在 p276_probe 基础上加交错模式（新 p277_probe）：
+#   1) p1 同时发布：RA HBM 段（RA jetty 坐标）+ host 段
+#      （p1sim 的 SPDK jetty + host iobuf 的 seg 坐标）
+#   2) p2 import 两个 tjetty（RA + SPDK）与两个 tseg
+#   3) 交错提交（同一本地 jetty）：1 条 1024B READ→host 段
+#      （经 SPDK tjetty）与 8 条 4096B WRITE→RA 段（经 RA tjetty）
+#      按 1:8 循环 100 轮，逐条 poll，记录每条 status + 本地 jfcn
+# 判据：
+#   - 出现 status=8 + dmesg bogus jfcn → 🎯 交错复现，根因锁定
+#     "双域 WR 在同一发起上下文交错"
+#   - 全绿 → 交错不是触发条件，转 B/C
+```
+
+**B.（jfcn 溯源）**：
+```bash
+# 在真实回环失败 run 中：
+#   1) 记录所有已建 JFC 的标识（device send/recv jfc、ctrl tjetty
+#      import 相关、probe 私有 jfc）——打印其句柄/索引；
+#   2) 捕获 bogus jfcn 的原始 N 值（已有 62374/15502），与上表比对，
+#      判定它属于谁/或完全不存在；
+#   3) 若指向某个已销毁/复用的 JFC → 即根因（生命周期错误）。
+```
+
+**C.（abort 用户态原文）**：
+```bash
+# 在**独立小程序**里（避免崩溃影响主流程）用 dlopen+dlsym 取
+# libra 的 RaGetCqeErrInfo / RaGetCqeErrInfoList /
+# RaCtxGetAsyncEvents，做保守调用（按导出符号名、传大缓冲、
+# 只读打印前 64B hex），在真实回环失败窗口内调用；
+# 拿不到则记录导出的函数原型线索（strings/nm）带回。
+```
+
+**D. 还原**：探针新文件；SPDK 源码无固化改动（临时打印用后
+回填）；clean 重编；常规清单照旧、共享 TP 条目不删。
+
+**回传**：A 判据（+B/C 结果），注明「批次 P2-77 完毕」。
