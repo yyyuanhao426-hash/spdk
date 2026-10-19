@@ -8193,3 +8193,79 @@ md5 基线并 clean 重编；常规清单照旧、共享 TP 条目不删。
 
 **回传**：A 判据结果（+B/C 按条件 + 最终 env 组合），注明
 「批次 P2-75 完毕」。
+
+### 回执导入 2026-10-19 #P275（批次 P2-75 回执，用户带回）—— data jetty 独立化证伪；P2-74 结论修正；剩两类解释
+
+**判定：A ❌ 数据 WR 已确实走独立 data jetty（NDS-DJ 打印可证），
+-b 8 仍 8×status=0 + 7×status=8；B ❌ b1/b2/b3（recv JFC/send
+JFC/JFR 分别回退共享）三条曲线完全相同；补测 P2-74 私有 jetty
+配置复刻（depth16/max_sge1/prio2/单 JFC）仍败。p275 裸探针
+（target 同款 jetty、depth 8、逐条不同偏移、WRITE 到同一 RA HBM
+段）100/100。D ✅ 还原。**
+
+- **修正 P2-74 的一处表述**：其 C 步"私有 jetty 连发 8 条全绿"
+  实际打的是**胶囊载荷所在的 host iobuf 段**（设备域），不是 HBM
+  RA 段；"私有 jetty 已验证可行"只对 host 段成立。
+- **本批正式排除**：jetty 归属（共享 vs 独占）、send/recv JFC 与
+  JFR 的共享组合、jetty 参数（深度/优先级/max_sge/单双 JFC）。
+- **累计排除（P2-73/74/75）**：RA 域、seg/token、地址区间/偏移、
+  并发条数、方向、接收侧服务、import 缓存、priority/tp_type。
+- **剩余两类解释（下一批判决）**：
+  1. **发送进程环境**：nvmf_tgt（SPDK env/EAL、hugepages、多 JFC
+     池、spdk_urma_device 上下文创建参数）vs 裸 libnds 进程——同
+     坐标、同 jetty 参数，一个 3~8 条后 abort，一个 100 条全过。
+  2. **发起侧（perf）的 RA jetty 使用形态**：perf 进程同时跑
+     capsule TCP（SPDK jetty）+ HBM 数据（RA jetty），而探针 p1
+     只做 RA 发布且空闲。
+- 临时基线不变：每 qpair 单 outstanding（-b 1），已验证
+  1500~3100 条零错误。
+
+### 指令 2026-10-19 #109：批次 P2-76（进程环境 vs 发起侧形态判决）
+
+**背景**：P2-75 后只剩两类解释。本批 X1 先判"发送进程环境"；
+X1 通过则转 X2 判"发起侧形态"；全程补获 abort 的远端原因。
+
+**A.（X1，核心）最小 SPDK 程序连发 8/32 条**：
+```bash
+# 新文件 p276_spdk_probe.c（放 examples 或 /tmp，用 SPDK 构建系统
+# 或直接链接 build/lib 的库）：
+#   1) spdk_env_init（与 nvmf_tgt 同等 EAL 参数）
+#   2) spdk_urma_device 打开 udmac1d1e2（与 target 同参数）
+#   3) 从 /tmp/nds_coords.txt 读 p1（p275_probe p1）发布的 RA 坐标，
+#      urma_import_jetty + urma_import_seg（同 target 参数）
+#   4) 建与 target 同款 jetty（jfs depth2048/prio0/max_sge5/JFR2048/
+#      JFC4096）
+#   5) 对 RA HBM 段连发 depth=8 与 depth=32 的 WRITE（逐条不同偏移）
+#      + READ 对照，打印每条 cr.status
+# 判据：
+#   - 失败（3~8 条后 status=8）→ 🎯 发送进程环境（SPDK EAL/
+#     spdk_urma_device 上下文）坐实 → 转 C（在 nvmf_tgt 内逐步剥离
+#     EAL/device 参数二分）
+#   - 100% 成功 → 发送环境无责 → 转 B（X2）
+```
+
+**B.（X2，X1 通过时）发起侧形态判决**：
+```bash
+# 1) 在真实回环中给 perf 侧降维：让 urma_perf 的 SPDK jetty 不参与
+#    任何流量（capsule_transport 已 TCP；确认 perf 不向 SPDK jetty
+#    post 任何 WR），-b 8 重跑 → 若仍败=与 SPDK jetty 无关
+# 2) 若仍败：在 p1（裸探针）里模拟 perf 形态——p1 额外建一个 SPDK
+#    风格 jetty 并让 p2 对它做 TCP capsule 式收发，同时 p2 对 RA
+#    段打 8 并发 → 复现则发起侧形态坐实
+```
+
+**C.（全程）abort 原因取证**：
+```bash
+# 失败 run 期间在 **initiator（perf/p1 所在进程/同机）侧**：
+#   - dmesg 过滤 ubcore/uburma 相关行（level 8，前后快照）
+#   - libra.so 的 RaGetAsyncEvents / RaGetCqeErrInfo（若可调用）
+#   - urma_admin show dev tp / jetty 前后 diff
+# 目标是拿到"远端为什么 abort"（RQ 溢出/访问违约/token 等）。
+# 带回原文。
+```
+
+**D. 还原**：探针新文件；SPDK 源码无固化改动（如需临时打印用后
+回填）；clean 重编；常规清单照旧、共享 TP 条目不删。
+
+**回传**：X1 判据结果（+B/C 按条件 + abort 原因原文），注明
+「批次 P2-76 完毕」。
