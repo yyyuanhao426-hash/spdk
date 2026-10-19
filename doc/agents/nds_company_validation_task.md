@@ -8512,3 +8512,76 @@ env 门控）、把双 jetty 分流从 hack 固化为正式实现、跑回归与
 
 **回传**：A/B 编译与行为验证 + C 的回归/V3 数据 + 最终 git status，
 注明「批次 P2-79 完毕」。
+
+### 回执导入 2026-10-19 #P279（批次 P2-79 回执，用户带回）—— ✅ V2 收口：-M npu 并发 24768 条零错误，无任何临时 env
+
+**判定：A ✅ provider 整块注册 + entry 级引用计数（NDS 与 RA
+fallback 两路径同构；reg_ref + provider 互斥锁；env 门控删除；
+四目标编译通过）。B ✅ 双 jetty 正式化：wire v4，endpoint_desc
+尾部新增 host_eid[16]+host_jetty_id，双侧强校验版本；target
+同时 import RA/host 两个 tjetty，按 remote_data.seg.ubva.eid
+分流；SPDK_NDS_DUAL/CTRL_* hack 全删。行为验证：capsule 1024B
+→host 路 1 条、RA 数据 4096B →RA 路 24874 条。C ✅ 回归与基线
+（两侧 chip1、无任何 NDS env）：-M cpu b8 9925/0、b1 626/0；
+-M npu b8 25s **24768/0**、b1 1245/0；数据一致性预检全过；
+target completion error=0、wire mismatch=0。D ✅ 清理/重编/还原
+（TP 10 条未删）。**
+
+- **最终配置（V3 基线）**：
+  1. **chip1**：两侧 SPDK_URMA_DEV_NAME=udmac1d1e2（RA eid 仅经
+     chip1 可达）。
+  2. **双 jetty 分流**：主 jetty=RA jetty；host jetty=设备域 SPDK
+     jetty（host_eid=df0a:0b00）；target 按 seg.ubva.eid 选 tjetty
+     （==remote.eid → RA，否则 host）。
+  3. **整块注册**：provider 按 entry->addr/size 注册一次，per-I/O
+     pin 仅引用计数；get_segment_info 与注册范围严格一致。
+  4. wire v4 双侧强校验。
+- **性能（V3 起点，4KB/单 worker/loopback）**：b8 ≈3.87 MiB/s、
+  ~990 IOPS、avg 8.0ms / p99 12.0ms；b1 ≈0.49 MiB/s、~124 IOPS、
+  avg 8.0ms / p99 8.3ms。**-M cpu 与 -M npu 基本同幅**（3.88 vs
+  3.87 MiB/s）。
+- **V2 产物（4 文件，工作树形式）**：urma_perf_npu.c
+  (38f05de5…)、nvme_urma.c (79c10531…)、nvme_urma_internal.h
+  (913267ca…)、nvmf/urma.c (d2f686da…)。二进制：nvmf_tgt
+  04b85d48…、urma_perf 57d41620…。
+- ⚠️ 本地仓 HEAD 早于线上 nds_v2，改动仍在 133 工作树——需按
+  下一批 A 提交/交付。
+
+### 指令 2026-10-19 #113：批次 P2-80（V2 交付 + V3 基线采集）
+
+**A.（V2 交付，核心）提交并交付 4 个文件**：
+```bash
+# 1) 只 add 这 4 个文件（勿把历史 M 一起提交）：
+#    examples/nvme/urma_perf/urma_perf_npu.c
+#    lib/nvme/nvme_urma.c
+#    lib/nvme/nvme_urma_internal.h
+#    lib/nvmf/urma.c
+# 2) commit（消息建议）：
+#    urma: V2 NDS direct path — whole-allocation NPU registration,
+#    dual-jetty wire v4 (RA data + host capsule routing)
+#    并在消息正文列出三处要点与 P2-78 根因
+# 3) push nds_v2（若代理可用）：
+#      git push origin nds_v2
+#    若不可用：git format-patch -1 --stdout > V2_nds.patch
+#    并交付 patch 文件 + 上述 4 文件 md5 + commit hash
+# 4) 确认 push/交付结果（这是本轮唯一可交付物）
+```
+
+**B.（V3 快速表征，10 分钟级）**：
+```bash
+# 两侧 chip1、无任何 NDS env hack、target -m 0x3；每格 -t 10：
+#   -M npu：-T 1/2 × -b 8/32 × -o 4096/65536（共 8 格）
+#   记录：completed / errors（必须 0）/ bandwidth / IOPS /
+#         avg+p99 延迟；数据一致性预检结果
+#   附：-M cpu 取 1 格（-T 1 -b 8 -o 4096）作对照
+# 输出一张矩阵表（V3 基线素材，汇总给用户）
+```
+
+**C.（文档交付）**：把 A 的 commit/patch 信息 + B 的矩阵表 + 最终
+配置三要素整理成一页 md（放 doc/ 或交回正文），供汇报引用。
+
+**D. 还原**：常规环境还原；共享 TP 条目不删；探针目录保持已删
+状态。
+
+**回传**：A 的 commit hash/patch + push 结果（⚠️ 若 push 失败必须
+置顶报明）+ B 矩阵表，注明「批次 P2-80 完毕」。
