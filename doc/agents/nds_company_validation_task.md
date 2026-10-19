@@ -7323,3 +7323,83 @@ READ。这一步通过 → 导入和坐标在 nvmf_tgt 内也有效，失败在 
 clean 重编 nvmf_tgt（90348d82…）；常规清单照旧。
 
 **回传**：A 判据结果（+B/C 按条件），注明「批次 P2-64 完毕」。
+
+### 回执导入 2026-10-19 #P264（批次 P2-64 回执，用户带回）—— 🎯 根因收敛：数据面 jetty 的 JFC/JFR 归属（设备级共享池 vs 私有）
+
+**判定：A 🎯 nvmf_tgt 进程内探针 READ 通过——同一调用点（同一
+胶囊、同一 tjetty、同一远端段、同一份 WR 字节）：post 在探针自建
+jetty（私有 JFC×2+私有 JFR）上 cr.status=0 且 64KB 真实写入；post
+在 SPDK 的 uqpair->jettys[0]（device 级共享 send/recv JFC 池 +
+device 级 JFR 池）上 ACK_TIMEOUT。B ✅ WR 逐字段 diff：opcode/
+push/complete_enable/tjetty/src sge 全同，**唯一语义差异 = self
+jetty 身份**。同 run SPDK 原流程原样失败（自检块无副作用）。
+D ✅ 还原（md5 全复原、clean 重编同基线）。**
+
+- **32 批排除后的最终收敛**：坐标（P2-63）、导入（本轮 A 证明在
+  nvmf_tgt 内有效）、WR 构造（B 逐字节同）全部无责——**根因 =
+  数据面 WR 所在 jetty 的 JFC/JFR 拓扑**：uqpair->jettys[i] 挂在
+  device 级共享 JFC/JFR 池上（与 capsule 收发、其他 qpair 共用）；
+  P2-62/64 的成功形态全部是私有 JFC/JFR。创建参数（depth/priority/
+  max_sge）已证不敏感（P2-62）。
+- **旁证（环境行为变化，需留意）**：本次重启（boot 2026-10-19）后
+  **advOFF 也在 connect 阶段失败**（与 10-16 P2-61 的"advOFF
+  connect 正常"不同），advON/advOFF 形态一致；target 侧失败全部在
+  CONNECT 胶囊的 pull（1024B、opcode=READ、push=0）上——即 connect
+  阶段失败本身就是共享池 jetty 的 pull 失败，与数据面失败同根。
+- **推论**：修法 = 让 uqpair 数据面 jetty 摆脱 device 级共享池
+  （每 jetty/每 qpair 私有 JFC/JFR）。若成立，advON/advOFF 的差别
+  应消失（两者失败同根）。
+
+### 指令 2026-10-19 #98：批次 P2-65（JFC/JFR 归属判决——uqpair jetty 改私有 JFC/JFR，env 门控）
+
+**背景**：P2-64 收敛根因 = 数据面 jetty 挂设备级共享 JFC/JFR 池。
+本批给 nvme_urma_create_jetty 加 env 门控的私有模式，判决
+"共享池 → 私有"是否恢复链路。**这是修复候选批，通过即 V2 完成。**
+
+**A.（核心判决）私有 JFC/JFR 模式**：
+```bash
+# 1) lib/nvme/nvme_urma.c nvme_urma_create_jetty() 加 env 开关
+#    SPDK_NDS_JETTY_PRIVATE=1：
+#    - 每 jetty 私有：urma_create_jfc send+recv 各一（depth=4096，
+#      字段照 device 池的 jfc_cfg）+ urma_create_jfr（cfg 照旧：
+#      depth=min(2048,max)、NO_TAG_MATCHING、TM_RM、max_sge 截
+#      dev_cap、min_rnr_timer、token=0xACFE，但 jfc=私有 recv JFC）
+#      + jetty（cfg.jfs.jfc=私有 send JFC；share_jfr=1、
+#      shared.jfr=私有 JFR、shared.jfc=私有 recv JFC）
+#    - 资源挂到 uqpair 上，销毁路径（qpair 断开/error 路径）同步
+#      补 destroy（对齐现有 jfrs/jettys 的清理结构）
+# 2) 两侧都 export SPDK_NDS_JETTY_PRIVATE=1（initiator 的 qpair
+#    同样走 nvme_urma_create_jetty），advertising ON（默认），跑
+#    -M npu：
+#    - connect + 数据面通过（errors=0 + 数据一致 + 无 -71/
+#      status=4/9）→ 🎯🎯 根因坐实，V2 完成！转 B 固化
+#    - 仍失败 → 转 C
+# 3) 注意：本轮重启后 advOFF 也 connect 失败——若私有模式下两种
+#    advertising 形态一致地通过/失败，正好验证"同根"推论，均记录
+```
+
+**B.（A 通过时）V2 固化 + V3 基线**：
+```bash
+# 1) -M cpu 回归（私有模式下 host 路径无回归）
+# 2) advOFF 对照一轮（验证形态统一）
+# 3) -M npu 计时段/带宽全量 + urma_admin seg/tp 快照（V3 基线）
+# 4) 记录最终 env 组合；正式固化方案（默认开 or 保留 env）由外部定
+```
+
+**C.（A 仍败）归属二分**：
+```bash
+# 拆分变量定位毒化源（每变体一轮 -M npu）：
+# c1 仅私有 JFC（JFR 仍挂 device 池）
+# c2 仅私有 JFR（JFC 仍用 device 池）
+# c3 私有 JFC/JFR 但 depth 对齐 device 池（4096/2048——排除深度
+#    因素，虽然 P2-62 已证不敏感）
+# 记录各变体失败形态（connect 阶段/数据面阶段 + status 值）
+```
+
+**D. 还原**：改动为 env 门控（默认关，-M cpu 行为不变），保留不
+回滚（A 通过时为 V2 产物）；若 A 败且需回滚，nvme_urma.c 回填
+b4807e83… + 重编 nvmf_tgt/urma_perf（90348d82…/01dc9304…）。
+常规清单照旧。
+
+**回传**：A 判据结果（+B/C 按条件 + 最终 env），注明
+「批次 P2-65 完毕」。
