@@ -7958,3 +7958,83 @@ RA jetty。通过 → 根因坐实 + 修法定型（外部出正式补丁）。
 
 **回传**：A 判据结果（+B/C 按条件 + 最终 env/hack 形态），注明
 「批次 P2-72 完毕」。
+
+### 回执导入 2026-10-19 #P272（批次 P2-72 回执，用户带回）—— 🎯 双 jetty 分流验证：胶囊/控制路径 100% 打通；数据面剩 RA 域 HBM 段自身不稳
+
+**判定：A 部分通过——胶囊类 pull 2/2 status=0、connect -5=0、
+-125=0、target status=4=0（P2-71 的 T2 卡点消除）；但 HBM 数据
+pull 仍 status=9（perf completed=1 errors=8；qid1 1×0+2×9、
+qid2 3×0+8×9，失败统一约 +1.6s 返回）。C 取证——① token 0/
+0xACFE 两值均 8×9（不是因子）；② **C1 关键**：同 qid、同 ctrl
+tjetty（刚成功送达胶囊）、同本地 buffer，下一条 HBM 数据 pull
+仍 status=9 → **换 tjetty 无改善，变量只在远端 seg 的注册域**：
+设备域（df0a:0b00）4KB seg 全成功；RA 域（df00:0100）64KB seg
+前几条偶发成功后整体卡死。D ✅ 还原（四文件/二进制 md5 回基线）。**
+
+- **已定型的事实**：
+  1. **胶囊载荷（host iobuf，设备域 seg）必须经对端 SPDK jetty
+     pull——RA jetty 是毒化源**；双 jetty 分流机制成立（qid0 的
+     6/6 全成功反证）。
+  2. **HBM 数据面剩余问题不在 tjetty 选择**：选 RA tjetty 是域
+     匹配的正确做法，但 RA 域 64KB seg 的 pull 路径本身不稳定
+     （前几条成功 → 后续全部超时，~1.6s）。
+- **正式补丁输入（供外部）**：HELLO 同时携带 RA/HBM 坐标
+  （eid=df00:0100）与 SPDK/host 坐标（eid=设备 eid）；target 按
+  `remote_data.seg.ubva.eid` 选 tjetty。
+- **🆕 外部新假设（下一批判决）**：RA 域 HBM 段的 inbound pull 需要
+  **RA jetty 的接收侧被服务/轮询**（libnds RaCtxQpCreate 的 QP 是
+  用户态 jetty；urma_perf 进程创建它后没有任何人 poll 其 CQ/JFR）。
+  探针只做过**个位数次**远端读（1~2 条），所以没暴露；perf 循环
+  几十条后队列/服务停摆 → 前几条成功、其后卡死。~1.6s 的失败间隔
+  也与"重传耗尽"形态吻合。另一候选：64KB 单次传输的请求槽位限制
+  （用 4KB 对照可判）。
+
+### 指令 2026-10-19 #106：批次 P2-73（RA 域 HBM 段 pull 稳定性判决——重复读次数/长度 × 服务轮询）
+
+**背景**：P2-72 把问题压缩到"RA 域 64KB seg 的远端读：前几条成功
+后卡死"。本批先在裸探针里复现并量化（第几条失败、与长度/次数
+的关系），再验证"接收侧需要服务"假设。
+
+**A.（裸探针量化，先跑）**：
+```bash
+# p273_probe = p270_probe（role_p1/p2/role_x 照旧）+ p2 侧新增
+# 重复读模式 P273_READ_LOOP：
+#   a1 对同一 RA HBM 段连续 post READ len=65536 ×100（逐条 poll
+#      5s 超时），记录每条 cr.status 与耗时；输出第几条开始失败
+#   a2 len=4096 ×1000；a3 len=16384 ×200
+#   a4 若 a1 卡死：在每条之间 usleep / 或每 10 条重建一次 import
+#      （判断是"次数"还是"时间/状态"）
+# 判据：
+#   - 固定条数 K 后必败（与长度无关）→ RA jetty 接收资源/槽位耗尽
+#   - 64KB 必败、4KB 可长期成功 → 单次传输长度/槽位因素
+#   - 与条数无关、随时间失败 → TP/服务超时
+```
+
+**B.（服务轮询判决）**：
+```bash
+# 1) nm -D libnds.so/libra*.so | grep -i "poll\|recv\|progress\|cq"
+#    —— 找 RA jetty 的轮询/服务接口（带回完整符号清单）
+# 2) 若存在 poll 类 API：在 p2 的 READ 循环期间起一个线程按 100µs
+#    周期调用（p1 侧同样尝试），重跑 a1：
+#    - 不再卡死 → 🎯 "RA jetty 接收侧需被服务"坐实，修法= provider
+#      增加轮询线程
+#    - 仍卡死 → 转 C
+# 3) 若不存在公开 API：记录 libnds 内部线程/异步机制（RaInit
+#    async=true 的回调面），带回头文件符号
+```
+
+**C.（urma_perf 侧对照）**：
+```bash
+# 两侧 chip1 + 双 jetty hack（P2-72 的 v 基线脚本可直接复用）：
+# c1 -q 1、单 worker、同步重试 → 记录失败前成功条数是否与 A 的 K
+#    一致（一致=资源阈值，非并发竞争）
+# c2 若 A 显示 4KB 可长期成功：把 perf IO 大小改为 4KB 跑一轮
+#    （-o 4096）→ 若通过，则为 64KB 单次传输因素
+```
+
+**D. 还原**：探针新文件；SPDK 源码本批仅在 c1/c2 复用 P2-72 的
+env 门控 hack（不新增固化改动）；用后回填/clean 重编；常规清单
+照旧、共享 TP 条目不删。
+
+**回传**：A 的失败阈值（第几条/长度关系）+ B 符号清单与轮询结果
+（+C 按条件），注明「批次 P2-73 完毕」。
