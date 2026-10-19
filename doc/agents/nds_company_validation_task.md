@@ -8422,3 +8422,93 @@ nvme_urma_common.c=ad46e65d 与仓库版本一致）。**
 
 **回传**：A 台账（含每条 in_range 判定）（+B/C 按条件），注明
 「批次 P2-78 完毕」。
+
+### 回执导入 2026-10-19 #P278（批次 P2-78 回执，用户带回）—— 🎯🎯🎯 根因坐实并修复验证：provider 注册范围 4KB vs 发布 seg 64KB
+
+**判定：A 台账 17 条全部 in_range=1（算术越界排除），但发现决定性
+相关：成功条 addr_off 全为 0，失败条 addr_off 全为 4096~28672
+→ 只有段基址被接受。B′ 补做语义对照：消费侧与发布侧逐字节一致；
+发布侧 seg={va=池基址, len=整块 allocation 65536}，而 pin 侧
+`nds_buf_register(addr, 本次 I/O 长度 4096)` —— **公布的段范围
+大于真实注册范围**。B③ env 门控改为整块注册（FULLREG=1）后：
+**-b 8 → completed=9889~9952，errors=0，全部 data CR s=0**；
+-b 1 回归正常；预检 WRITE+READ verification passed。C 两本地
+jetty×depth4 800/800 → 多 TP 并发不是因子。D ✅ 还原。**
+
+- **根因（最终）**：`npu_provider_pin()` 按 `(addr, length=本次 I/O
+  长度)` 调 nds_buf_register，而 `npu_provider_get_segment_info()`
+  用 `handle->entry->addr` / `entry->size`（整块 allocation）发布
+  seg → addr_off>0 的 WR 落在未注册区域 → 远端 REM_ACCESS_ABORT
+  (status=8)。
+- **历史规律一并解释**：-b 1 只用 batch slot 0（偏移 0）→ 1500~3100
+  条零错误；-b N 的前 N-1 条偏移 >0 → 失败数恒为 batch−1。
+- **外部核对代码（D:\NDS\spdk-urma）**：pin 在
+  urma_perf_npu.c:1087 用 `(addr, length)`；unpin 在 :1207 已按
+  `entry->addr` 注销（本就与 pin 不对称）；get_segment_info 在
+  :1178/:1180 发布 `entry->addr` + `entry->size`。**修复需按 entry
+  维度做引用计数注册**（多个 I/O 并发 pin 同一整块时，首个 pin 注册、
+  最后一个 unpin 注销），否则会出现"一个 I/O 完成即注销整块"的竞态。
+
+### 指令 2026-10-19 #112：批次 P2-79（V2 固化 + V3 基线）
+
+**背景**：根因与修法均已实测。本批把修复固化为**默认路径**（去
+env 门控）、把双 jetty 分流从 hack 固化为正式实现、跑回归与 V3
+基线。**通过即 V2 收口、V3 启动。**
+
+**A.（V2 固化 1）provider 整块注册 + 引用计数**：
+```bash
+# examples/nvme/urma_perf/urma_perf_npu.c：
+#   1) struct npu_alloc_entry 增加 reg_ref（受 provider 级互斥锁保护）
+#   2) npu_provider_pin()：g_npu.nds_ready 路径改为
+#        lock; if (entry->reg_ref++ == 0)
+#            ret = nds_buf_register_cb(entry->addr, entry->size);
+#              /* 失败则回滚 ref 并返回 -EIO */
+#        handle->entry=entry; unlock;
+#      （RA fallback 路径同样改为按整块 entry 注册/引用计数）
+#   3) npu_provider_unpin()：lock; if (--entry->reg_ref == 0)
+#        nds_buf_deregister_cb(entry->addr); unlock;
+#   4) get_segment_info 保持 {entry->addr, entry->size}（与注册一致）
+#   5) 删除 SPDK_NDS_P278_FULLREG env 门控（默认即整块）
+#   6) 编译四目标（CCDK 兼容头照旧）
+```
+
+**B.（V2 固化 2）双 jetty 分流正式化（替换 P2-72 hack）**：
+```bash
+# 现状：P2-72 用"jetty_ids[1] 偷渡 SPDK jetty id + jetty_ids[2..5]
+# 携带设备 eid"的 env hack。正式实现：
+#   1) struct spdk_urma_endpoint_desc 尾部追加：
+#        uint8_t host_eid[16]; uint32_t host_jetty_id;
+#      （NDS 场景：host_eid=设备 eid、host_jetty_id=本端 SPDK jetty id；
+#       非 NDS 场景置 0）
+#   2) SPDK_URMA_WIRE_VERSION +1；两侧同版本校验（不一致明确报错）
+#   3) target 侧：handshake 同时 import ra_tjetty（eid=remote.eid）
+#      与 host_tjetty（eid=remote.host_eid, id=remote.host_jetty_id,
+#      token=0xACFE）；post_data 按 remote_data.seg.ubva.eid 选择：
+#       == remote.eid → ra_tjetty；否则 → host_tjetty
+#   4) initiator 侧：HELLO 填 host_eid=本端设备 eid、
+#      host_jetty_id=uqpair->jettys[0] 的 id（jetty_ids 语义恢复原样）
+#   5) 删除 SPDK_NDS_DUAL/CTRL_* env hack
+# 兼容性：-M cpu 与无 NPU 场景 host_eid 置 0 → 全部走 host_tjetty，
+# 行为等同原逻辑。
+```
+
+**C.（回归与 V3 基线）**：
+```bash
+# 1) -M cpu 回环全量（期望 errors=0，无回归）
+# 2) -M npu（两侧 chip1，无任何 NDS env hack）：
+#    - -b 8 长跑（-t 25 或 -n 大）：errors=0、数据一致
+#    - -b 1 回归：errors=0
+#    - 记录带宽/IOPS（V3 基线，注明并发档位）
+# 3) 记录最终配置：chip1 选择规则（target 侧必须能路由对端 RA eid）、
+#    双 jetty 分流、整块注册；写入 doc（外部补设计说明）
+```
+
+**D. 还原与提交**：
+```bash
+# 源码改动保留（V2 产物），git status 只应剩本次固化改动；
+# 临时探针/脚本清理；clean 重编；常规环境还原；TP 条目不清。
+# 提交建议（由外部在本地仓完成）：V2 固化补丁说明 + 本轮证据索引。
+```
+
+**回传**：A/B 编译与行为验证 + C 的回归/V3 数据 + 最终 git status，
+注明「批次 P2-79 完毕」。
