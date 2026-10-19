@@ -8342,3 +8342,83 @@ bogus jfcn。本批三件事，任一件命中即可收口。
 回填）；clean 重编；常规清单照旧、共享 TP 条目不删。
 
 **回传**：A 判据（+B/C 结果），注明「批次 P2-77 完毕」。
+
+### 回执导入 2026-10-19 #P277（批次 P2-77 回执，用户带回）—— 交错否证；bogus jfcn 为背景噪声；剩"前3成功后7 abort"待解释
+
+**判定：A ❌ 交错全绿（同一本地 jetty 上 1 条 1024B ctrl READ +
+8 条 4096B RA WRITE ×100 轮 = 900/900 status=0）→ 交错不是
+触发条件。B ❌ bogus jfcn 作废——失败窗口内 0 条；历史 N 值不在
+我们的 JFC/JFR/jetty 台账中；**60s 空闲窗口仍有 2 条**（其它设备
+00005/00006/00009/0000a 连续出现）→ 背景噪声；P2-76 的相关性
+来自 dmesg ring 被 ummu_vdev 洪泛后的采样偏差。C 部分：libra
+导出面受限（RaGetCqeErrInfo rc=128103 全零；List 未导出；
+RaCtxGetAsyncEvents 原型不明 SIGSEGV），未取得 abort 原文，但
+拿到字符串线索与推测原型。D ✅ 还原（含
+nvme_urma_common.c=ad46e65d 与仓库版本一致）。**
+
+- **方法学教训（带回）**：dmesg 取证一律用**时间戳窗口**，不用
+  行数差（ring 会被其它设备洪泛冲刷）。
+- **剩余唯一稳定现象**：真实回环 -b 8 时 target 对 RA HBM 段的
+  8 条 WRITE **恒为前 3 成功 + 后 7 status=8**；而裸探针（含
+  SPDK EAL、target 同款 jetty、同 seg/token、depth 8/32、交错、
+  双域）全绿。
+- **外部新怀疑（下一批核心）**：8 条 WR 的 **实际远端写入地址**
+  （remote_data.address）与导入的远端 seg 的 {ubva.va, len}
+  可能存在**越界**关系——前 3 条落在段内、其余越界 → 远端直接
+  abort。探针的偏移全部落在段内（0~0x63000），所以从未触发。
+  P2-74 台账只打印了 seg 基址（rseg_va=0x120000018000、
+  len=524288），**没有打印每条 WR 的 remote_data.address 与
+  addr+len vs seg 范围的判定**——这正是本批要补的。
+
+### 指令 2026-10-19 #111：批次 P2-78（远端地址越界判决——每条 WR 的实际目标地址 vs 导入段范围）
+
+**背景**：P2-77 后仅剩"前 3 成功 + 后 7 abort"这一稳定现象。最
+平常也最可能的解释 = 每条 WR 的远端地址越界。本批用台账直接把
+地址与段范围算出来。
+
+**A.（核心）逐条 WR 远端地址区间判定**：
+```bash
+# 复用 P2-69/P2-74 台账，新增打印（env SPDK_NDS_LEDGER=1，
+# export 给 nvmf_tgt）：
+#   每条数据 WR：seq/qid/push/len
+#     remote_data.address（WR 实际写入的远端 VA）
+#     remote_data.seg.ubva.va / seg.len / seg.token_id
+#     imported seg 的 ubva.va / len（urma_import_seg 的入参）
+#     判定 in_range = (address >= seg.ubva.va) &&
+#               (address + len <= seg.ubva.va + seg.len)
+#     status
+# 跑两侧 chip1 + 双 jetty hack + -b 8。
+# 判据：
+#   - 失败条 in_range=0 且成功条 in_range=1 → 🎯 越界根因坐实
+#   - 全部 in_range=1 → 越界排除，转 C
+```
+
+**B.（A 坐实时）越界来源定位**：
+```bash
+# 1) 对照 initiator 侧 capsule 里带的 {address, seg} 原始值与 target
+#    侧收到的值（临时打印，用后还原）——判断是发布侧算错还是
+#    消费侧算错
+# 2) 检查 address 的语义：是"段内偏移"还是"绝对 VA"；
+#    target 的 remote_sge.addr = remote_data.address 是否应改为
+#    seg.ubva.va + 偏移 / 或 seg 的 base 是否应为 address 所在
+#    的整池
+# 3) 修复候选（env 门控）：按 seg 范围修正 address，或让 initiator
+#    发布与 address 匹配的 seg 基址/长度
+# 4) -b 8 验证：全部完成 + errors=0 且数据一致 → V2 收口
+```
+
+**C.（A 全在范围内）两本地 jetty × 多 outstanding（唯一未测格）**：
+```bash
+# 探针补格：两个本地 jetty（同 context）各自 import 同一 RA tjetty，
+# 每个 depth=4 同时对同一 RA 段发 WRITE（共 8 并发）：
+#   c1 2 jetty × depth4（从未测过）
+#   c2 对照：1 jetty × depth8 / 2 jetty × depth1
+# 若 c1 失败 → 根因=多 TP 并发打同一 RA jetty；修法方向=RA jetty
+# 单 TP 化（单 qpair/单 jetty）或每 qpair 独立 RA jetty（需 RA 侧支持）
+```
+
+**D. 还原**：插桩 env 门控用后回填；四文件与二进制 md5 回基线；
+常规清单照旧、共享 TP 条目不删；dmesg 取证一律时间戳窗口。
+
+**回传**：A 台账（含每条 in_range 判定）（+B/C 按条件），注明
+「批次 P2-78 完毕」。
