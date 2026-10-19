@@ -7874,3 +7874,87 @@ chip1**（SPDK_URMA_DEV_NAME=udmac1d1e2，回环两侧同 chip）。
 
 **回传**：A 时间线 + B 结果（+C 按条件），注明
 「批次 P2-71 完毕」。
+
+### 回执导入 2026-10-19 #P271（批次 P2-71 回执，用户带回）—— -125 形态定为 T2；🆕 根因假设：RA jetty 无法访问 host 内存段
+
+**判定：A 时间线——2 个 I/O qpair 的 CONNECT 在 500ms
+（NVME_FABRIC_CONNECT_COMMAND_TIMEOUT）后 -125；admin qpair 正常。
+C 步进插桩——T2 坐实：target 收到 CONNECT 胶囊并解析
+（opc=127 cid=0 len=1024），但 **exec-enter/req-complete/rsp-post
+全为 0**，即卡在"抓取胶囊载荷"的 pull READ 上；admin qpair 同一
+路径 6.5ms 内完成。B 超时放大——500ms/2s 均 -125；10s 时 URMA 层
+8.0005s 超时 status=9(DATA)，随即错误响应 → **不是等太短，是那条
+pull 永不完成**。D ✅ 还原（四文件 md5 回基线）。**
+
+- **形态**：chip1 下 status=4 完全消失（P2-70 成立）；唯一失败 =
+  target 为 I/O qpair 抓取 CONNECT 载荷的那条 **pull READ**
+  （tjetty=RA jetty）。admin 的同款 pull（tjetty=SPDK jetty）正常。
+- **🆕 外部综合出的根因假设（与 P2-69/70 全部自洽）**：
+  **RA jetty 只能访问 RA/HCCP 域注册的内存（HBM）；而该 pull 的
+  远端段是 initiator 的 host 内存（SPDK 胶囊缓冲，经 urma_register_seg
+  注册在设备域）** → 经 RA jetty 的远端读无法完成（8s ACK 超时）。
+  佐证：p248/p263/role_x 的所有成功 READ 远端段都是 **RA 注册的
+  HBM**；所有失败 WR 的远端段都是 **host 内存**（胶囊/连接数据）。
+  admin qpair 用 SPDK jetty 读 host 内存 → 正常。
+- **修法方向（候选，待本批验证）**：**双 jetty 分流**——initiator
+  同时发布两类坐标：RA jetty（供 HBM/direct 段的数据搬运）+ SPDK
+  jetty（供 host 内存的控制/胶囊缓冲，eid 用设备 eid）；target 按
+  seg 类型选择 tjetty。HELLO 线格式需扩展（外部出正式补丁）。
+- ⚠️ 说明：P2-69 C（chip0 上）把 I/O connect 的 tjetty 换成 SPDK
+  jetty 后 connect 成功，与本假设一致——但当时数据 WR（RA tjetty）
+  仍因 chip0 失败；本批在 chip1 上重做，数据面应保持通过。
+
+### 指令 2026-10-19 #105：批次 P2-72（双 jetty 分流验证——host 段走 SPDK jetty、HBM 段走 RA jetty）
+
+**背景**：P2-71 定位到那条永不完成的 pull READ（胶囊载荷=host 内存
+经 RA tjetty）。本批用**最小 hack**（env 门控、不固化）验证双 jetty
+分流：CONNECT/胶囊类 pull 用对端 SPDK jetty，HBM 数据 pull 保持
+RA jetty。通过 → 根因坐实 + 修法定型（外部出正式补丁）。
+
+**A.（核心判决）按传输类型分流 tjetty（两侧 chip1）**：
+```bash
+# 前提：两侧 SPDK_URMA_DEV_NAME=udmac1d1e2。
+# 1) 取 initiator 的 SPDK jetty id：initiator 侧打印每个 I/O qpair
+#    的 self jetty id（nvme_urma.c 或台账插桩），记为 J_spdk。
+#    （回环两侧同 chip，对端设备 eid 即本机 udmac1d1e2 的 eid。）
+# 2) target 侧 env：
+#      SPDK_NDS_CTRL_JETTY=<J_spdk>
+#      SPDK_NDS_CTRL_EID=<udmac1d1e2 的 eid hex>
+#    在 handshake 中额外 urma_import_jetty({CTRL_EID, J_spdk},
+#    token=0xACFE) 得到 tjetty_ctrl。
+# 3) post_data 分流：
+#      len==1024 / 胶囊类 pull → tjetty_ctrl（SPDK jetty）
+#      其余（HBM 数据 WR）      → tjetty（RA jetty，不变）
+#    打印 NDS-DUAL: kind=capsule|data tjetty_id=? post=? cr.status=?
+# 4) 跑 -M npu（advON，两侧 chip1）：
+#    - connect -5=0、-125=0、数据 WR 全完成、无错误 →
+#      🎯🎯 双 jetty 分流坐实（RA jetty 仅 HBM、host 段需 SPDK jetty），
+#      V2 方案定型！转 B
+#    - 仍失败 → 带回分流后的台账，转 C
+# 注：若 J_spdk 无法从 initiator 取得，改在 HELLO 中临时追加打印
+#     （用后还原）；判定标准不变。
+```
+
+**B.（A 通过时）固化输入**：
+```bash
+# 1) -M cpu 回归（无影响）
+# 2) 计时段/带宽 + seg/tp 快照（V3 基线）
+# 3) 记录最终 env/hack 形态，供外部写正式补丁：
+#    HELLO 同时携带 RA jetty 坐标（HBM 域，eid=RA eid）与 SPDK
+#    jetty 坐标（host 域，eid=设备 eid），target 按 seg/传输类型选
+```
+
+**C.（A 失败时）取证明细分**：
+```bash
+# 记录分流后每条 WR 的 kind/tjetty/laddr/len/status 台账；
+# 若 capsule 类仍失败，试 token=0（P2-19 探针值）与 0xACFE 两值；
+# 若仍失败，转回"胶囊载荷远端段的注册域"取证（该 buffer 的
+# seg 注册上下文/设备）。
+```
+
+**D. 还原**：全部 env 门控/hack，用后回填；四文件 md5 回基线
+（0b0c913b…/b4807e83…/56a0cbbb…/03fdb08c…）、clean 重编
+（90348d82…/01dc9304…）；常规清单照旧、共享 TP 条目不删。
+
+**回传**：A 判据结果（+B/C 按条件 + 最终 env/hack 形态），注明
+「批次 P2-72 完毕」。
