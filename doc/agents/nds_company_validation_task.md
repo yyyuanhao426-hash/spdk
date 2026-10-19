@@ -7484,3 +7484,84 @@ pkill -f 'build/bin/nvmf_tgt'**。
 
 **回传**：A 判据结果（+B/C 按条件 + 最终 env），注明
 「批次 P2-66 完毕」。
+
+### 回执导入 2026-10-19 #P266（批次 P2-66 回执，用户带回）—— 创建时机/预热双证伪；差异收敛到"WR 投递上下文"（完成队列归属 / user_ctx）
+
+**判定：A ❌ 握手导入后重建数据面 jetty（HELLO_RSP 前，old→new id
+实测 3 次）仍 connect -5 ×2 + status=4 ×2；C1 ❌ 预热 READ 成功
+（cr.status=0）后真实 WR 仍 ACK_TIMEOUT → "首用/TP 建立"证伪；
+A2/C3/C4 ❌（请求时重建/探针形状/探针形状+私有+请求时，均失败，
+C4 仅单 worker 通过）。D ✅ 还原。**
+
+- **累计排除矩阵（P2-62→P2-66）**：jetty 创建方式、发布坐标、
+  进程内导入有效性（有效）、JFC/JFR 归属、本地段注册、创建时机
+  （导入前/后、accept/worker 线程）、jfs/jfr 深宽与 priority、
+  首用预热——全部出清。**注意：P2-66 后，凡是"重建/换 jetty
+  对象"的路线已全数失败；探针 jetty 上同一 tjetty+同一远端段+
+  同一本地 tseg 的 WR 始终成功。**
+- **剩余差异（测试 agent 提出，外部采纳为下一批）**：
+  1. **完成队列的轮询归属**：探针 WR 的完成由它自己创建的 JFC
+     在本线程紧密轮询；真实 WR 走 device 级 send JFC 池、由 poll
+     group 按 worker stride 轮询（且共享给所有 qpair）。
+  2. **WR 的 user_ctx/生命周期**：探针用常量，真实 WR 用
+     &ureq->cqe（指向 req 池）。
+  ⚠️ 需要修正一处逻辑：P2-65 D2 已在探针 jetty 上用"真实 dst
+  iobuf + 真实 tseg 对象"成功 READ 过（cr.status=0），所以
+  "探针 jetty + 接近真实的 WR"≠未知格；**真正未知的格子是
+  "qpair jetty + 探针 WR"**——本批 2×2 的核心。
+
+### 指令 2026-10-19 #100：批次 P2-67（WR 内容 × jetty 对象 2×2 交叉判决）
+
+**背景**：P2-66 后差异只剩两条（完成队列归属 / user_ctx）。本批
+用 2×2 交叉一刀切开：同一个调用点（nvmf_urma_post_data 真实 WR
+提交处，env SPDK_NDS_CROSS=1），只换"WR 内容"与"post 的 jetty"
+两个因子。SPDK 源码零固化改动（插桩用后还原）。
+
+**A.（核心判决）四格交叉**：
+```bash
+# 在 post_data 的真实 WR 提交点，按 env 选择四个格子各跑一轮
+# -M npu（advON）：
+# a1 探针 jetty + 真实 WR 逐字段复制
+#    - 探针 jetty = P2-66 C1 同款（私有 JFC×2/JFR、depth=16、
+#      prio=2）；WR 结构 memcpy 真实 wr，仅 post 目标换探针 jetty；
+#      完成在私有 send JFC 上紧密 poll（短超时 2s）
+#    - 预期参照：P2-65 D2 已近似通过（真实 dst+tseg 成功）
+# a2 qpair jetty + 探针 WR
+#    - 探针 WR = src=同一胶囊 rva、len=64、dst=专用 4KB scratch、
+#      user_ctx=常量 0x265；post 到 uqpair->jettys[0]（不换 jetty）
+#    - 完成在 device send JFC 短暂同步 poll（不改变正常流程；
+#      超时打印 NDS-CROSS a2 timeout）
+# 判读表：
+#   a1 PASS + a2 PASS → 两因子各自可投递 → 差异在完成匹配/轮询
+#     归属（转 C）
+#   a1 PASS + a2 FAIL → WR 内容（user_ctx/dst）是毒化源（转 B）
+#   a1 FAIL + a2 PASS → 真实 WR 内容在探针 jetty 上也不通 →
+#     双重因子/交互，带回两格原始结果再定
+#   a1 FAIL + a2 FAIL → 两因子均独立失败 → 带回原始结果再定
+```
+
+**B.（若锁定 WR 内容）逐字段二分**（均 post 到 uqpair jetty）：
+```bash
+# b1 user_ctx 换常量（其余仍为真实 WR）
+# b2 dst 换 4KB scratch（其余真实）
+# b3 len 换 64（其余真实）
+# 每项一轮 -M npu，第一次 PASS 的变体即定位到被替换的字段
+```
+
+**C.（若两格都 PASS）完成归属取证**：
+```bash
+# 记录并带回：
+# c1 真实 WR 的完成最终落在哪个 JFC（device send JFC 的 index）、
+#    被哪个线程/stride 轮询到、completion 的 status/user_ctx；
+# c2 探针 WR 完成所在私有 JFC 与 qpair jetty 的 jfs.jfc 归属对照
+#    （uqpair->send_jfc_index vs poll group 的实际轮询集合）；
+# 若发现"真实 WR 完成落在无人轮询的 JFC"，即根因。
+```
+
+**D. 还原**：插桩 env 门控、用后回填（nvme_urma.c=b4807e83…、
+nvmf/urma.c=0b0c913b…），clean 重编（90348d82…/01dc9304…）；
+部署校验 pid+listening、清场 pkill -f 'build/bin/nvmf_tgt'；
+常规清单照旧。
+
+**回传**：2×2 四格原始结果（+B/C 按条件），注明
+「批次 P2-67 完毕」。
