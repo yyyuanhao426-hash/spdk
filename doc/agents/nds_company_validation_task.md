@@ -7245,3 +7245,81 @@ vs "坐标消费侧（nvmf_tgt）"**。本批用一个**全新第三方裸进程
 
 **回传**：C 对照结果 + A 判据结果（+B 按条件两份坐标原始值），注明
 「批次 P2-63 完毕」。
+
+### 回执导入 2026-10-19 #P263（批次 P2-63 回执，用户带回）—— 发布坐标无责；问题锁定 nvmf_tgt 进程内部
+
+**判定：C ✅ role_x 对照 PASS（消费 p1 坐标 import+READ 全 MATCH，
+role_x 实现有效）；A 🎯 第三方裸进程消费 urma_perf 发布的坐标
+（eid=…df000100/uasid=0/jetty_id=9963/token_id=1114368/
+va=0x120000018000/len=65536）——import_jetty ok、import_seg ok、
+READ cr.status=0、64KB 全部真实读回（非空转）→ 坐标无责。同一
+坐标系下 urma_perf↔nvmf_tgt 仍失败（connect -5 ×2 + target
+status=4 ×2）。D ✅ 还原（三文件 md5 复原、二进制同 P2-61/62
+基线、树内无探针文件）。**
+
+- **32 批排除矩阵更新**：jetty 创建方式（P2-62）+ 发布坐标
+  （P2-63）双双出清。**同一套 RA 坐标：裸进程能 import+READ，
+  nvmf_tgt 不能**——差值只剩 nvmf_tgt 进程内部。
+- ⚠️ 教训记录：首轮 A 未置 hugepages → SPDK env 初始化失败、HELLO
+  未发出（provider dump 仍可用）；hugepages 完整重跑后才拿到 HELLO
+  线上值。后续涉及 urma_perf 的批次注意先核对 hugepages。
+- **nvmf_tgt 内部嫌疑清单（下一批输入）**：
+  1. 导入后的 WR 构造 / tjetty 选择（nvmf_urma_post_data）；
+  2. device 层 JFC/JFR 共享与多 qpair 复用（admin+2 I/O 共用
+     device context，导入 RA jetty 落在该 context）；
+  3. connect 流程中导入 jetty 的使用方式（advON 的失败点在
+     I/O qpair connect 阶段，数据面未到）。
+
+### 指令 2026-10-19 #97：批次 P2-64（nvmf_tgt 进程内自检判决——导入后立刻做探针式 READ）
+
+**背景**：P2-63 后唯一差值在 nvmf_tgt 进程内。本批把 p263 的
+role_x **搬进 nvmf_tgt**：target 完成握手导入（RA jetty + HBM 段）
+后，**立刻在同一进程内**用探针式自建 jetty 对导入段做一次手工
+READ。这一步通过 → 导入和坐标在 nvmf_tgt 内也有效，失败在 SPDK
+自身的 connect/post 流程（WR 构造/jetty 选择）；失败 → nvmf_tgt
+此前的 setup（device open/JFC/JFR/先前导入）即已毒化，逐项二分。
+
+**A.（核心判决）nvmf_tgt 内手工探针 READ**：
+```bash
+# 1) lib/nvmf/urma.c target 侧握手（导入 remote jetty/seg 之后）
+#    加 env 开关块 SPDK_NDS_INPROC_PROBE=1：
+#    - 用 raw urma_create_jfc/jfr/jetty（CCDK 值：jfc depth=4096 ×2、
+#      jfr depth=16、jetty depth=16、TM_RM、prio=2、token=0xACFE、
+#      share_jfr=1——P2-62 证明与 CCDK 等价，且小 depth 不影响）在
+#      nvmf_tgt 进程内自建一个独立 jetty
+#    - 对刚导入的 remote jetty + HBM seg（va/len 取 capsule）post
+#      READ 到 scratch host buffer（64KB），poll send JFC，打印
+#      NDS-INPROC-PROBE: post=%d cr.status=%d mismatched=%d
+#    - 用后 destroy 自建资源，不影响原流程
+# 2) 编译（CCDK 兼容头照旧），跑 -M npu（advertising ON）：
+#    - NDS-INPROC-PROBE cr.status=0 → 🎯 导入在 nvmf_tgt 内也有效，
+#      失败在 SPDK connect/post 流程 → 转 B
+#    - 非 0 / post 失败 → nvmf_tgt 早期 setup 毒化 → 转 C
+# 3) 对照（应保持原样）：同 run 的 SPDK 流程仍按 advON 形态失败
+#    （connect -5 ×2 + status=4 ×2）——证明自检块未改变行为
+```
+
+**B.（A 通过时）SPDK 实际 post 的 WR 字节取证**：
+```bash
+# nvmf_urma_post_data 的 post 调用前 dump 原始字节（NDS-PULL 行）：
+# wr 结构（含 opcode/tjetty 句柄/user_ctx/flag）+ rw.src/dst 各自
+# sge（addr/len/tseg）+ 所用 self jetty 句柄；advOFF 形态跑一次
+# （数据面 status=9 的 pull WR）+ advON 形态能到 post 就跑。
+# 与 p263 探针的 WR（可同格式打印）逐字段 diff——第一个不一致字段
+# 即根因。注意句柄值本身不可比，比字段语义值。
+```
+
+**C.（A 失败时）setup 二分**：
+```bash
+# 在自检块里逐项退掉 nvmf_tgt 已做的 setup 再 READ：
+# ① 换用独立新 urma context（urma_open_device 再开一次）建探针
+#    jetty → 通 = device context 毒化；
+# ② ①仍败则查导入的 target_seg/remote jetty 句柄在本 context 的
+#    状态（urma_admin show dev <dev> jetty / tp 前后 dump diff）。
+# 定位到具体 setup 项即止，其余记录带回。
+```
+
+**D. 还原**：临时自检块用后回填（urma.c md5 复原 0b0c913b…），
+clean 重编 nvmf_tgt（90348d82…）；常规清单照旧。
+
+**回传**：A 判据结果（+B/C 按条件），注明「批次 P2-64 完毕」。
