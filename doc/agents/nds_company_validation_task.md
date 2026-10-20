@@ -8657,3 +8657,61 @@ dual-jetty wire v4"），已 push。
 
 **回传**：A 的 md5 核对结果 + B 的二进制 md5 + C 三组结果，注明
 「批次 P2-81 完毕」。
+
+### 回执导入 2026-10-19 #P281（批次 P2-81 回执，用户带回）—— A/B ✅ 闭环；C ⚠️ 环境资源受阻
+
+**判定：A ✅ 从仓库 nds_v2@d7960b921 archive 取码，4 文件 md5
+与指令给定值完全一致；另做全目录强一致核对（56 个 .c/.h 与
+archive 逐一 diff = 0 差异，排除工作树残留 hack）。B ✅ make
+clean + 全量重编成功（nvmf_tgt=47569864…、urma_perf=2b6e8aa2…、
+libspdk_nvme.a=040f1aeb…、libspdk_nvmf.a=021877e0…）。C ❌ 三格
+回归全部握手失败 `handshake failed rc=-5`（含 -M cpu 对照），
+内核证据：`ubcore_get_tp_list_from_ops: get tp list failed ret=-2`
+→ `ubcore_create_tpid_priv: Failed to query/select tpid, ret=-28`
+(ENOSPC) → `uburma_cmd_import_jetty_ex: ubcore_import_jetty failed`。
+根因 = 同机同事的 nbd-ramdisk（09:51 启动，--real-urma
+--urma-workers 32 --netlink-workers 32）持续占用 32 个共享
+URMA jetty/TP，P2-80 成功时（09:24）该进程不存在。D ✅ 我方进程
+零残留、大页释放、同事进程与共享 TP 原样未动。**
+
+- **结论**：P2-81 的 A/B/D 已完成闭环「仓库代码 = 已验证重编
+  代码」；C 为环境资源竞争（设备 ENOSPC），非代码缺陷。
+- **等待项**：同事 zly 的 nbd-ramdisk 释放共享 TP 资源后重跑
+  C 三格。借用机纪律：**不得杀他人进程、不得暴露使用痕迹**。
+
+### 指令 2026-10-19 #115：批次 P2-82（环境恢复后重跑 C 三格回归）
+
+**背景**：P2-81 的 C 被共享 TP 资源耗尽阻塞（ENOSPC），A/B 已
+闭环。本批只做一件事：**资源可用时重跑三格回归**。
+
+**A.（资源探测，先做）**：
+```bash
+# 1) 确认阻塞进程仍在：ps -p <nbd-ramdisk pid> -o pid,cmd
+# 2) 观察共享资源：
+#    urma_admin show dev udmac1d1e2 tp   （tpid_list 数量）
+#    dmesg 时间戳窗口内是否仍有 create_tpid -28 / get tp list -2
+# 3) 判据：若 nbd-ramdisk 已退出且 TP 表回落 → 进入 B；
+#    否则等待（每 15~30 分钟探测一次，最多 4 小时）
+```
+
+**B.（重跑三格，两侧 chip1、无任何 NDS env hack、仓库
+d7960b921 重编二进制）**：
+```bash
+# 1) -M npu -T 1 -b 8 -o 4096 -t 20 ：errors=0、预检通过
+# 2) -M npu -T 1 -b 1 -o 4096 -t 10 ：errors=0
+# 3) -M cpu -T 1 -b 8 -o 4096 -t 10 ：errors=0
+# 记录 completed/errors/带宽/IOPS/avg+p99；连接 -125/-5 计数
+```
+
+**C.（4 小时仍未释放）**：
+```bash
+# 不杀进程、不干扰；带回：
+# - nbd-ramdisk 的 pid/启动时间/参数（如可见）
+# - TP 表当前数量与 dmesg 证据
+# - 建议协调对象（同事 zly）与建议口径
+```
+
+**D. 还原**：常规清单照旧；共享 TP 条目不删；不触碰他人进程。
+
+**回传**：A 探测结果 + B 三格数据（或 C 的阻塞证据），注明
+「批次 P2-82 完毕」。
