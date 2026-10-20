@@ -340,6 +340,10 @@ struct nvmf_urma_qpair {
 	struct spdk_urma_device *device;
 	urma_jetty_t **jettys;
 	urma_target_jetty_t **target_jettys;
+	/* P2-79 dual-jetty: peer SPDK jetty for non-RA (host-domain) segments. */
+	urma_target_jetty_t *host_tjetty;
+	urma_eid_t remote_eid;
+	bool remote_eid_valid;
 	urma_jfr_t **jfrs;
 	uint32_t jetty_count;
 	uint32_t next_jetty;
@@ -596,6 +600,10 @@ error:
 	}
 	free(uqpair->jfrs);
 	free(uqpair->jettys);
+		if (uqpair->host_tjetty != NULL) {
+			urma_unimport_jetty(uqpair->host_tjetty);
+			uqpair->host_tjetty = NULL;
+		}
 	free(uqpair->target_jettys);
 	uqpair->jfrs = NULL;
 	uqpair->jettys = NULL;
@@ -671,6 +679,17 @@ nvmf_urma_capsule_resources_fini(struct nvmf_urma_qpair *uqpair)
 	uqpair->capsule_rx_count = 0;
 }
 
+static bool
+nvmf_urma_eid_is_zero(const uint8_t *eid)
+{
+	for (int i = 0; i < 16; i++) {
+		if (eid[i] != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static int
 nvmf_urma_handshake(struct nvmf_urma_qpair *uqpair)
 {
@@ -682,6 +701,12 @@ nvmf_urma_handshake(struct nvmf_urma_qpair *uqpair)
 	int rc;
 
 	rc = nvmf_urma_read_full(uqpair->fd, &hdr, sizeof(hdr));
+	if (rc == 0 && hdr.magic == SPDK_URMA_WIRE_MAGIC &&
+	    hdr.version != SPDK_URMA_WIRE_VERSION) {
+		SPDK_ERRLOG("URMA wire version mismatch: local=%u remote=%u\n",
+			    SPDK_URMA_WIRE_VERSION, hdr.version);
+		return -EPROTONOSUPPORT;
+	}
 	if (rc != 0 || hdr.magic != SPDK_URMA_WIRE_MAGIC ||
 	    hdr.version != SPDK_URMA_WIRE_VERSION || hdr.type != SPDK_URMA_MSG_HELLO ||
 	    hdr.length != sizeof(remote)) {
@@ -740,6 +765,33 @@ nvmf_urma_handshake(struct nvmf_urma_qpair *uqpair)
 		}
 		status = urma_bind_jetty(uqpair->jettys[i], uqpair->target_jettys[i]);
 		if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+			return -EIO;
+		}
+	}
+	/* P2-79 dual-jetty: remember the peer RA eid for per-segment routing and
+	 * import the peer SPDK jetty for host-domain segments. When the peer
+	 * advertises the same jetty as the primary one (no NPU / -M cpu) skip
+	 * the second import and keep the legacy single-jetty path. */
+	memcpy(&uqpair->remote_eid, &remote.eid, sizeof(uqpair->remote_eid));
+	uqpair->remote_eid_valid = true;
+	uqpair->host_tjetty = NULL;
+	if (remote.host_jetty_id != 0 && !nvmf_urma_eid_is_zero(remote.host_eid) &&
+	    (memcmp(remote.host_eid, remote.eid.raw, 16) != 0 ||
+	     remote.host_jetty_id != remote.jetty_ids[0])) {
+		urma_token_t htoken = {.token = SPDK_URMA_DEFAULT_TOKEN};
+
+		memset(&rjetty, 0, sizeof(rjetty));
+		memcpy(&rjetty.jetty_id.eid.raw, remote.host_eid,
+		       sizeof(rjetty.jetty_id.eid.raw));
+		rjetty.jetty_id.uasid = 0;
+		rjetty.jetty_id.id = remote.host_jetty_id;
+		rjetty.trans_mode = remote.transport_mode;
+		rjetty.type = URMA_JETTY;
+		rjetty.tp_type = remote.tp_type;
+		uqpair->host_tjetty = urma_import_jetty(device->context, &rjetty, &htoken);
+		if (uqpair->host_tjetty == NULL) {
+			SPDK_ERRLOG("URMA handshake: import host jetty %u failed\n",
+				    remote.host_jetty_id);
 			return -EIO;
 		}
 	}
@@ -840,6 +892,10 @@ nvmf_urma_accept(void *arg)
 						urma_delete_jetty(uqpair->jettys[i]);
 					}
 				}
+	if (uqpair->host_tjetty != NULL) {
+		urma_unimport_jetty(uqpair->host_tjetty);
+		uqpair->host_tjetty = NULL;
+	}
 				free(uqpair->target_jettys);
 				free(uqpair->jettys);
 				for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
@@ -1510,7 +1566,16 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	wr.rw.dst.num_sge = 1;
 	wr.flag.bs.complete_enable = 1;
 	jetty_index = nvmf_urma_next_jetty(uqpair);
-	wr.tjetty = uqpair->target_jettys[jetty_index];
+	/* P2-79 dual-jetty: RA-domain segments (seg eid == peer RA eid) go to
+	 * the RA tjetty; every other segment (device / host iobuf) goes to
+	 * the peer SPDK jetty. host_tjetty == NULL keeps the legacy path. */
+	if (uqpair->host_tjetty != NULL && uqpair->remote_eid_valid &&
+	    memcmp(ureq->remote_data.seg.ubva.eid.raw, uqpair->remote_eid.raw,
+	           sizeof(uqpair->remote_eid.raw)) != 0) {
+		wr.tjetty = uqpair->host_tjetty;
+	} else {
+		wr.tjetty = uqpair->target_jettys[jetty_index];
+	}
 	ureq->state = push ? NVMF_URMA_REQ_PUSHING : NVMF_URMA_REQ_PULLING;
 	/* Modified By Yida(v3): W7 post WR; tick doubles as JFC wait start */
 	ureq->post_tick = spdk_get_ticks();

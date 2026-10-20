@@ -24,7 +24,7 @@
 #define SPDK_URMA_DEFAULT_TOKEN 0xACFE
 
 #define SPDK_URMA_WIRE_MAGIC 0x41524d55u /* "URMA", little endian */
-#define SPDK_URMA_WIRE_VERSION 3
+#define SPDK_URMA_WIRE_VERSION 4 /* P2-79: endpoint_desc carries host jetty */
 #define SPDK_URMA_MAX_JETTY_PER_EP 32
 #define SPDK_URMA_INVALID_CHIP_ID UINT8_MAX
 
@@ -60,6 +60,10 @@ struct spdk_urma_endpoint_desc {
 	uint32_t max_queue_depth;
 	uint32_t max_io_size;
 	uint32_t capsule_transport;
+	/* P2-79 dual-jetty: peer-visible SPDK (host-domain) jetty. All zero
+	 * means "same as the primary jetty above" (legacy/-M cpu behaviour). */
+	uint8_t host_eid[16];
+	uint32_t host_jetty_id;
 };
 
 struct spdk_urma_data_desc {

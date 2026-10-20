@@ -536,17 +536,32 @@ nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
 		if (spdk_nvme_urma_provider_get_ra_jetty_info(SPDK_NVME_URMA_MEM_NPU,
 				&ra) == 0) {
 			memcpy(&local.eid, ra.eid, sizeof(local.eid));
-			local.jetty_id = ra.jetty_id;
+			local.jetty_ids[0] = ra.jetty_id;
 			SPDK_NOTICELOG("NDS: advertising RA jetty %u as data-plane jetty\n",
 				       ra.jetty_id);
 		}
 	}
+	/* P2-79 dual-jetty: advertise the peer-visible SPDK jetty for
+	 * host-domain segments (iobuf / capsule). Kept separate from the
+	 * RA jetty above so the target can pick per segment domain. */
+	memcpy(local.host_eid, uqpair->device->eid.raw, sizeof(local.host_eid));
+	local.host_jetty_id = uqpair->jetty_count > 0 ?
+				 uqpair->jettys[0]->jetty_id.id : 0;
+	SPDK_NOTICELOG("NDS: advertising host jetty %u for host-domain segments\n",
+			       local.host_jetty_id);
+
 	rc = nvme_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
 	if (rc == 0) {
 		rc = nvme_urma_write_full(uqpair->fd, &local, sizeof(local));
 	}
 	if (rc == 0) {
 		rc = nvme_urma_read_full(uqpair->fd, &hdr, sizeof(hdr));
+	if (rc == 0 && hdr.magic == SPDK_URMA_WIRE_MAGIC &&
+	    hdr.version != SPDK_URMA_WIRE_VERSION) {
+		SPDK_ERRLOG("URMA wire version mismatch: local=%u remote=%u\n",
+			    SPDK_URMA_WIRE_VERSION, hdr.version);
+		return -EPROTONOSUPPORT;
+	}
 	}
 	if (rc == 0 && (hdr.magic != SPDK_URMA_WIRE_MAGIC ||
 			 hdr.version != SPDK_URMA_WIRE_VERSION ||

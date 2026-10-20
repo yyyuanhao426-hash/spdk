@@ -23,6 +23,7 @@
 #include "urma_perf_npu.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 
 /* HBM allocation alignment. CUDA uses 64KB; the NPU page granularity for
  * URMA peer-memory pinning is one of the Phase 2 verification items, keep
@@ -459,9 +460,17 @@ struct npu_alloc_entry {
 	void *addr;
 	size_t size;
 	bool used;
+	/* P2-79: whole-allocation registration reference count. */
+	int reg_ref;
+	void *lmem_handle;
+	uint32_t token_id;
+	bool token_valid;
 };
 
 static struct npu_alloc_entry g_npu_allocs[NPU_ALLOC_REGISTRY_SIZE];
+
+/* P2-79: protects reg_ref and the whole-allocation registration. */
+static pthread_mutex_t g_npu_reg_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct npu_pin_handle {
 	struct npu_alloc_entry *entry;
@@ -1003,6 +1012,9 @@ npu_alloc_buffer(struct npu_allocation *allocation, size_t size)
 	entry->addr = ptr;
 	entry->size = allocation->alloc_size;
 	entry->used = true;
+	entry->reg_ref = 0;
+	entry->lmem_handle = NULL;
+	entry->token_valid = false;
 	allocation->addr = ptr;
 	return 0;
 }
@@ -1019,6 +1031,9 @@ npu_free_buffer(void *addr)
 		if (g_npu_allocs[i].used && g_npu_allocs[i].addr == addr) {
 			g_npu_allocs[i].used = false;
 			g_npu_allocs[i].addr = NULL;
+			g_npu_allocs[i].reg_ref = 0;
+			g_npu_allocs[i].lmem_handle = NULL;
+			g_npu_allocs[i].token_valid = false;
 			break;
 		}
 	}
@@ -1084,12 +1099,22 @@ npu_provider_pin(void *provider_ctx, void *addr, size_t length, void **pin_handl
 	/* libnds full-stack path (preferred): nds_buf_register runs the
 	 * complete HBM registration inside the colleague_c stack. */
 	if (g_npu.nds_ready) {
-		ret = g_npu.nds_buf_register_cb(addr, length);
-		if (ret != 0) {
-			fprintf(stderr, "nds_buf_register failed: ret %d\n", ret);
-			free(handle);
-			return -EIO;
+		/* P2-79: register the WHOLE allocation once; every I/O pin just
+		 * bumps the reference so an early completion cannot deregister the
+		 * block while sibling I/Os are still in flight. */
+		pthread_mutex_lock(&g_npu_reg_mutex);
+		if (entry->reg_ref++ == 0) {
+			ret = g_npu.nds_buf_register_cb(entry->addr, entry->size);
+			if (ret != 0) {
+				entry->reg_ref--;
+				pthread_mutex_unlock(&g_npu_reg_mutex);
+				fprintf(stderr, "nds_buf_register(whole %zu) failed: ret %d\n",
+					entry->size, ret);
+				free(handle);
+				return -EIO;
+			}
 		}
+		pthread_mutex_unlock(&g_npu_reg_mutex);
 		handle->nds_registered = true;
 		*pin_handle = handle;
 		return 0;
@@ -1101,23 +1126,34 @@ npu_provider_pin(void *provider_ctx, void *addr, size_t length, void **pin_handl
 	 * udma.ko lacks (P2-8/P2-19). Only possible when the RA context was
 	 * initialized in npu_driver_init. */
 	if (g_npu.ra_ready) {
-		memset(&lmem, 0, sizeof(lmem));
-		lmem.in.mem.addr = (uint64_t)(uintptr_t)addr;
-		lmem.in.mem.size = length;
-		lmem.in.ub.flags.bs.token_policy = 0;		/* TOKEN_POLICY_NONE */
-		lmem.in.ub.flags.bs.cacheable = 0;		/* NON_CACHEABLE */
-		lmem.in.ub.flags.bs.access = 0xE;		/* READ|WRITE|ATOMIC */
-		lmem.in.ub.flags.bs.non_pin = 1;
-		lmem.in.ub.flags.bs.token_id_valid = 0;
-		ret = g_npu.ra_lmem_register(g_npu.ra_ctx_handle, &lmem,
-					     &handle->lmem_handle);
-		if (ret != 0) {
-			fprintf(stderr, "RaCtxLmemRegister failed: ret %d\n", ret);
-			free(handle);
-			return -EIO;
+		/* P2-79: same whole-allocation + refcount rule for the RA path. */
+		pthread_mutex_lock(&g_npu_reg_mutex);
+		if (entry->reg_ref++ == 0) {
+			memset(&lmem, 0, sizeof(lmem));
+			lmem.in.mem.addr = (uint64_t)(uintptr_t)entry->addr;
+			lmem.in.mem.size = entry->size;
+			lmem.in.ub.flags.bs.token_policy = 0;		/* TOKEN_POLICY_NONE */
+			lmem.in.ub.flags.bs.cacheable = 0;		/* NON_CACHEABLE */
+			lmem.in.ub.flags.bs.access = 0xE;		/* READ|WRITE|ATOMIC */
+			lmem.in.ub.flags.bs.non_pin = 1;
+			lmem.in.ub.flags.bs.token_id_valid = 0;
+			ret = g_npu.ra_lmem_register(g_npu.ra_ctx_handle, &lmem,
+						     &entry->lmem_handle);
+			if (ret != 0) {
+				entry->reg_ref--;
+				pthread_mutex_unlock(&g_npu_reg_mutex);
+				fprintf(stderr, "RaCtxLmemRegister(whole %zu) failed: ret %d\n",
+					entry->size, ret);
+				free(handle);
+				return -EIO;
+			}
+			entry->token_id = lmem.out.ub.token_id;
+			entry->token_valid = true;
 		}
-		handle->token_id = lmem.out.ub.token_id;
-		handle->token_id_valid = true;
+		pthread_mutex_unlock(&g_npu_reg_mutex);
+		handle->lmem_handle = entry->lmem_handle;
+		handle->token_id = entry->token_id;
+		handle->token_id_valid = entry->token_valid;
 	}
 	*pin_handle = handle;
 	return 0;
@@ -1190,7 +1226,7 @@ npu_provider_get_segment_info(void *provider_ctx, void *pin_handle,
 	memcpy(info->eid, g_npu.ra_seg_eid, sizeof(info->eid));
 	info->uasid = g_npu.ra_uasid;
 	info->va = (uint64_t)(uintptr_t)handle->entry->addr;
-	info->token_id = handle->token_id;
+	info->token_id = handle->entry->token_id;
 	info->len = handle->entry->size;
 	return 0;
 }
@@ -1199,19 +1235,26 @@ static void
 npu_provider_unpin(void *provider_ctx, void *pin_handle)
 {
 	struct npu_pin_handle *handle = pin_handle;
+	struct npu_alloc_entry *entry;
 
 	(void)provider_ctx;
 	if (handle == NULL) {
 		return;
 	}
-	if (handle->nds_registered && g_npu.nds_buf_deregister_cb != NULL) {
-		g_npu.nds_buf_deregister_cb(handle->entry->addr);
-		free(handle);
-		return;
+	entry = handle->entry;
+	pthread_mutex_lock(&g_npu_reg_mutex);
+	if (handle->nds_registered) {
+		if (entry != NULL && entry->reg_ref > 0 && --entry->reg_ref == 0 &&
+		    g_npu.nds_buf_deregister_cb != NULL) {
+			g_npu.nds_buf_deregister_cb(entry->addr);
+		}
+	} else if (entry != NULL && entry->reg_ref > 0 && --entry->reg_ref == 0 &&
+		   entry->lmem_handle != NULL) {
+		g_npu.ra_lmem_unregister(g_npu.ra_ctx_handle, entry->lmem_handle);
+		entry->lmem_handle = NULL;
+		entry->token_valid = false;
 	}
-	if (g_npu.ra_ready && handle->lmem_handle != NULL) {
-		g_npu.ra_lmem_unregister(g_npu.ra_ctx_handle, handle->lmem_handle);
-	}
+	pthread_mutex_unlock(&g_npu_reg_mutex);
 	free(handle);
 }
 
