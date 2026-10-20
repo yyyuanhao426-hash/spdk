@@ -8610,3 +8610,50 @@ target completion error=0、wire mismatch=0。D ✅ 清理/重编/还原
 ```
 
 **其余 B/C/D 不变**（V3 快速矩阵、一页 md 汇总、环境还原）。
+
+### 交付导入 2026-10-19 #D280（V2 补丁已入库并推送）
+
+**交付方式**：测试 agent 以 base64 回传 V2_all.diff（355 行），外部解码应用。
+**校验链（全部通过）**：
+- V2_all.diff.b64 md5 = `035c8b940d8c6750fe28d1ff6eb5bf27` ✅
+- V2_all.diff    md5 = `62f572fa9c3299b672ca90323efd3fd2` ✅（355 行）
+- `git apply --check` ✅ → 应用后 4 文件 md5 与 133 交付件逐字节一致：
+  `38f05de5…` / `79c10531…` / `913267ca…` / `d2f686da…` ✅
+- 敏感串扫描（password/secret/内网 IP/代理）无命中 ✅
+
+**入库**：nds_v2 分支 commit **`d7960b921`**
+（"urma: V2 NDS direct path — whole-allocation NPU registration,
+dual-jetty wire v4"），已 push。
+改动 4 文件，+159/−32。
+
+### 指令 2026-10-19 #114：批次 P2-81（V2 最终回归——从仓库代码重编验证）
+
+**背景**：V2 代码已进入 nds_v2（d7960b921）。本批从**仓库代码**
+重新构建并验证，闭环"仓库里的代码 = 验证过的代码"。
+
+**A.（一致性核对）**：
+```bash
+# 取 nds_v2 @ d7960b921（git fetch / archive + scp 方式照旧），
+# 在干净工作树核对 4 文件 md5：
+#   examples/nvme/urma_perf/urma_perf_npu.c  = 38f05de5…
+#   lib/nvme/nvme_urma.c                    = 79c10531…
+#   lib/nvme/nvme_urma_internal.h           = 913267ca…
+#   lib/nvmf/urma.c                         = d2f686da…
+# 不一致 → 停止并报回（不要继续）。
+```
+
+**B.（从零重编）**：clean 重编 lib/nvme、lib/nvmf、nvmf_tgt、urma_perf
+（CCDK 兼容头照旧），记录二进制 md5。
+
+**C.（最终回归）**：两侧 chip1、**无任何 NDS env hack**：
+```bash
+# 1) -M npu -T 1 -b 8 -o 4096 -t 20 ：errors=0、数据预检通过
+# 2) -M npu -T 1 -b 1 -o 4096 -t 10 ：errors=0
+# 3) -M cpu -T 1 -b 8 -o 4096 -t 10 ：errors=0
+# 4) 记录 completed/errors/带宽/IOPS/avg+p99
+```
+
+**D. 还原**：常规清单照旧；共享 TP 条目不删。
+
+**回传**：A 的 md5 核对结果 + B 的二进制 md5 + C 三组结果，注明
+「批次 P2-81 完毕」。
