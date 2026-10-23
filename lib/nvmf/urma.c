@@ -12,6 +12,7 @@
 #include "spdk/nvmf_transport.h"
 #include "spdk/string.h"
 #include "spdk/json.h"
+#include "spdk_internal/urma_lifetime.h"
 
 #include "nvmf_internal.h"
 #include "transport.h"
@@ -344,8 +345,8 @@ enum nvmf_urma_hs_state {
 #define NVMF_URMA_HANDSHAKE_TIMEOUT_S	5
 #define NVMF_URMA_HANDSHAKE_POLL_US	1000
 
-/* SE_Review #1: 断连排空期限。正常情况下 URMA WR 的 CR 由网卡 err_timeout
- * 兜底必然到达，10s 只是防挂死。 */
+/* A stalled drain is retried and reported every 10 seconds.  The qpair stays
+ * quarantined until URMA and software references actually reach zero. */
 #define NVMF_URMA_DRAIN_TIMEOUT_S	10
 #define NVMF_URMA_DRAIN_POLL_US		1000
 
@@ -377,6 +378,8 @@ struct nvmf_urma_qpair {
 	size_t hs_off1;
 	uint64_t hs_deadline_tsc;
 	struct spdk_poller *hs_poller;
+	TAILQ_ENTRY(nvmf_urma_qpair) handshake_link;
+	bool handshake_linked;
 	struct spdk_urma_msg_hdr hs_hdr;
 	struct spdk_urma_endpoint_desc hs_remote;
 	struct {
@@ -391,9 +394,7 @@ struct nvmf_urma_qpair {
 	/* SE_Review #1: 断连排空状态机。qpair_fini 不再同步释放——等在途 WR 的
 	 * CR、已转发的完成消息、缓冲等待全部落地后再真正 teardown。 */
 	bool draining;
-	uint32_t pending_wr;	/* 已 post 未收到 CR 的数据 WR（pull/push） */
-	pthread_mutex_t drain_lock;
-	uint32_t pending_msgs;	/* 已转发到 owner thread 未执行的完成消息，drain_lock 保护 */
+	struct spdk_urma_lifetime lifetime;
 	uint64_t drain_deadline_tsc;
 	struct spdk_poller *drain_poller;
 	spdk_nvmf_transport_qpair_fini_cb fini_cb;	/* fini 回调在 free(uqpair) 之后触发，先存到这里 */
@@ -434,6 +435,8 @@ struct nvmf_urma_transport {
 	TAILQ_HEAD(, nvmf_urma_port) ports;
 	TAILQ_HEAD(, nvmf_urma_poll_group) poll_groups;
 	TAILQ_HEAD(, nvmf_urma_pool_region) pool_regions;
+	TAILQ_HEAD(, nvmf_urma_qpair) pending_handshakes;
+	bool destroying;
 	struct nvmf_urma_import_bucket import_cache[NVMF_URMA_IMPORT_BUCKETS];
 	pthread_rwlock_t import_cache_lock;
 	uint32_t next_worker_index;
@@ -642,12 +645,21 @@ error:
 static int
 nvmf_urma_post_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot)
 {
+	struct nvmf_urma_qpair *uqpair = slot->qpair;
 	urma_jfr_wr_t *bad_wr = NULL;
+	urma_status_t status;
 
-	return urma_post_jetty_recv_wr(slot->qpair->jettys[
-		       (uint32_t)(slot - slot->qpair->capsule_rx_slots) % slot->qpair->jetty_count],
-		       &slot->wr, &bad_wr) ==
-	       URMA_SUCCESS ? 0 : -EIO;
+	if (!spdk_urma_lifetime_try_get(&uqpair->lifetime)) {
+		return -ESHUTDOWN;
+	}
+	status = urma_post_jetty_recv_wr(uqpair->jettys[
+			 (uint32_t)(slot - uqpair->capsule_rx_slots) % uqpair->jetty_count],
+			 &slot->wr, &bad_wr);
+	if (status != URMA_SUCCESS) {
+		spdk_urma_lifetime_put(&uqpair->lifetime);
+		return -EIO;
+	}
+	return 0;
 }
 
 static int
@@ -897,9 +909,21 @@ nvmf_urma_handshake_progress(struct nvmf_urma_qpair *uqpair)
 }
 
 static void
+nvmf_urma_handshake_detach(struct nvmf_urma_qpair *uqpair)
+{
+	if (!uqpair->handshake_linked) {
+		return;
+	}
+	TAILQ_REMOVE(&uqpair->transport->pending_handshakes, uqpair, handshake_link);
+	uqpair->handshake_linked = false;
+}
+
+static void
 nvmf_urma_accept_reject(struct nvmf_urma_qpair *uqpair)
 {
 	uint32_t i;
+
+	nvmf_urma_handshake_detach(uqpair);
 
 	for (i = 0; i < uqpair->jetty_count; i++) {
 		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
@@ -925,7 +949,6 @@ nvmf_urma_accept_reject(struct nvmf_urma_qpair *uqpair)
 	if (uqpair->hs_poller != NULL) {
 		spdk_poller_unregister(&uqpair->hs_poller);
 	}
-	pthread_mutex_destroy(&uqpair->drain_lock);
 	spdk_urma_device_close(uqpair->device);
 	close(uqpair->fd);
 	free(uqpair);
@@ -935,6 +958,8 @@ static void
 nvmf_urma_handshake_complete(struct nvmf_urma_qpair *uqpair)
 {
 	int flags = fcntl(uqpair->fd, F_GETFL);
+
+	nvmf_urma_handshake_detach(uqpair);
 
 	/* SE_Review #3: 握手完成即恢复阻塞语义——TCP capsule 路径的
 	 * read_full/write_full 依赖阻塞 socket，残余阻塞由 accept 时设置的
@@ -1000,6 +1025,10 @@ nvmf_urma_accept(void *arg)
 	struct nvmf_urma_port *port;
 	int accepted = 0;
 
+	if (transport->destroying) {
+		return SPDK_POLLER_IDLE;
+	}
+
 	TAILQ_FOREACH(port, &transport->ports, link) {
 		while (accepted < 16) {
 			struct nvmf_urma_qpair *uqpair;
@@ -1035,12 +1064,14 @@ nvmf_urma_accept(void *arg)
 			uqpair->qpair.state = SPDK_NVMF_QPAIR_UNINITIALIZED;
 			uqpair->capsule_tx_cqe.type = NVMF_URMA_CQE_CAPSULE_TX;
 			uqpair->capsule_tx_cqe.owner = uqpair;
-			pthread_mutex_init(&uqpair->drain_lock, NULL);
+			spdk_urma_lifetime_init(&uqpair->lifetime);
 			TAILQ_INIT(&uqpair->free_reqs);
 			TAILQ_INIT(&uqpair->working_reqs);
 			/* Modified by Yin: 拆分 accept 复合条件为独立 rc，逐阶段打错误日志便于定位 */
 			uqpair->device = transport->device;
 			spdk_urma_device_get(uqpair->device);
+			TAILQ_INSERT_TAIL(&transport->pending_handshakes, uqpair, handshake_link);
+			uqpair->handshake_linked = true;
 			int rc_addr = nvmf_urma_get_socket_addresses(fd, uqpair);
 			int rc_jetty = rc_addr ? -1 : nvmf_urma_create_jetty(uqpair);
 			int rc_hs = 0;
@@ -1280,6 +1311,7 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	}
 	TAILQ_INIT(&transport->ports);
 	TAILQ_INIT(&transport->poll_groups);
+	TAILQ_INIT(&transport->pending_handshakes);
 	transport->accept_poller = SPDK_POLLER_REGISTER(nvmf_urma_accept, transport, 1000);
 	/* Modified By Yida(v3): optional periodic staged-latency dump, e.g.
 	 * SPDK_URMA_TARGET_DUMP_SEC=10 ./build/bin/nvmf_tgt ... */
@@ -1329,8 +1361,14 @@ nvmf_urma_destroy(struct spdk_nvmf_transport *base,
 {
 	struct nvmf_urma_transport *transport = SPDK_CONTAINEROF(base, struct nvmf_urma_transport, transport);
 	struct nvmf_urma_port *port, *tmp;
+	struct nvmf_urma_qpair *uqpair, *qtmp;
 
+	transport->destroying = true;
 	spdk_poller_unregister(&transport->accept_poller);
+	TAILQ_FOREACH_SAFE(uqpair, &transport->pending_handshakes, handshake_link, qtmp) {
+		nvmf_urma_accept_reject(uqpair);
+	}
+	assert(TAILQ_EMPTY(&transport->pending_handshakes));
 	/* Modified By Yida(v3): stop periodic dump and print final staged latencies */
 	spdk_poller_unregister(&transport->dump_poller);
 	nvmf_urma_timing_dump();
@@ -1510,20 +1548,15 @@ nvmf_urma_disconnect_qpair(struct nvmf_urma_qpair *uqpair)
 	}
 }
 
-/* SE_Review #1: 排空判定。pending_msgs 的增减与判定统一持 drain_lock，
- * 保证"消息已入 owner thread 队列但计数未落地"的窗口不会导致提前收口；
- * 其余计数只在 owner thread 修改，判定点也在 owner thread。 */
+/* Every completion-enabled WR owns a lifetime reference before it becomes
+ * visible to the device.  A polled CR keeps that same reference while it is in
+ * a stack batch or queued to the qpair thread, so neither window is invisible
+ * to this drain predicate. */
 static bool
 nvmf_urma_qpair_drained(struct nvmf_urma_qpair *uqpair)
 {
-	bool drained;
-
-	pthread_mutex_lock(&uqpair->drain_lock);
-	drained = TAILQ_EMPTY(&uqpair->working_reqs) &&
-		  __atomic_load_n(&uqpair->pending_wr, __ATOMIC_ACQUIRE) == 0 &&
-		  uqpair->pending_msgs == 0;
-	pthread_mutex_unlock(&uqpair->drain_lock);
-	return drained;
+	return TAILQ_EMPTY(&uqpair->working_reqs) &&
+	       spdk_urma_lifetime_refs(&uqpair->lifetime) == 0;
 }
 
 static int
@@ -1575,8 +1608,15 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 		wr.user_ctx = (uint64_t)&uqpair->capsule_tx_cqe;
 		wr.send.src.sge = &sge;
 		wr.send.src.num_sge = 1;
-		rc = urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr, &bad_wr) ==
-		     URMA_SUCCESS ? 0 : -EIO;
+		if (!spdk_urma_lifetime_try_get(&uqpair->lifetime)) {
+			rc = -ESHUTDOWN;
+		} else if (urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr,
+						    &bad_wr) != URMA_SUCCESS) {
+			spdk_urma_lifetime_put(&uqpair->lifetime);
+			rc = -EIO;
+		} else {
+			rc = 0;
+		}
 	} else {
 		uint8_t msg[sizeof(hdr) + sizeof(rsp)];
 
@@ -1758,6 +1798,9 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	ureq->state = push ? NVMF_URMA_REQ_PUSHING : NVMF_URMA_REQ_PULLING;
 	/* Modified By Yida(v3): W7 post WR; tick doubles as JFC wait start */
 	ureq->post_tick = spdk_get_ticks();
+	if (!spdk_urma_lifetime_try_get(&uqpair->lifetime)) {
+		return -ESHUTDOWN;
+	}
 	if (device->opts.numa_affinity && ureq->remote_data.chip_id != 0 &&
 	    ureq->remote_data.chip_id != SPDK_URMA_INVALID_CHIP_ID) {
 		affinity_wr.base = wr;
@@ -1766,10 +1809,12 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 		affinity_wr.dst_chip_id = ureq->remote_data.chip_id;
 		if (urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &affinity_wr.base,
 					     &bad_wr) != URMA_SUCCESS) {
+			spdk_urma_lifetime_put(&uqpair->lifetime);
 			return -EIO;
 		}
 	} else if (urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr, &bad_wr) !=
 		   URMA_SUCCESS) {
+		spdk_urma_lifetime_put(&uqpair->lifetime);
 		return -EIO;
 	}
 	{
@@ -1777,8 +1822,6 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 
 		NVMF_URMA_TGT_STAGE(post, t_post1 - ureq->post_tick);
 		ureq->post_tick = t_post1;
-		/* SE_Review #1: 在途 WR 计数，qpair_fini 的排空等它归零。 */
-		__atomic_add_fetch(&uqpair->pending_wr, 1, __ATOMIC_RELAXED);
 		return 0;
 	}
 }
@@ -1790,7 +1833,8 @@ nvmf_urma_buffers_ready(struct nvmf_urma_req *ureq)
 	if (ureq->start_tick != 0) {
 		NVMF_URMA_TGT_STAGE(buffer, spdk_get_ticks() - ureq->start_tick);
 	}
-	if (spdk_unlikely(nvmf_urma_qpair(ureq->req.qpair)->draining)) {
+	if (spdk_unlikely(spdk_urma_lifetime_is_closing(
+				  &nvmf_urma_qpair(ureq->req.qpair)->lifetime))) {
 		/* SE_Review #1: 排空期不再发起数据搬运或 exec，直接释放。 */
 		nvmf_urma_release_req(ureq);
 		return;
@@ -1962,7 +2006,7 @@ nvmf_urma_process_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot,
 	uint64_t t_parse0 = spdk_get_ticks();
 	int rc;
 
-	if (spdk_unlikely(uqpair->draining)) {
+	if (spdk_unlikely(spdk_urma_lifetime_is_closing(&uqpair->lifetime))) {
 		/* SE_Review #1: 排空期不再接收新命令，也不重发 RX slot——
 		 * 断连后连接作废，slot 随 qpair 一起销毁。 */
 		return 0;
@@ -1988,7 +2032,7 @@ nvmf_urma_process_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot,
 }
 
 static int
-nvmf_urma_handle_completion(const urma_cr_t *completion)
+nvmf_urma_handle_completion_inner(const urma_cr_t *completion)
 {
 	struct nvmf_urma_cqe_ctx *ctx;
 	struct nvmf_urma_qpair *uqpair;
@@ -2019,8 +2063,7 @@ nvmf_urma_handle_completion(const urma_cr_t *completion)
 			return 0;
 		}
 		ureq = ctx->owner;
-		__atomic_sub_fetch(&uqpair->pending_wr, 1, __ATOMIC_RELAXED);
-		if (spdk_unlikely(uqpair->draining)) {
+		if (spdk_unlikely(spdk_urma_lifetime_is_closing(&uqpair->lifetime))) {
 			/* SE_Review #1: 排空期只释放，不再回错误响应。 */
 			nvmf_urma_release_req(ureq);
 			return 0;
@@ -2048,8 +2091,7 @@ nvmf_urma_handle_completion(const urma_cr_t *completion)
 		return rc;
 	}
 	ureq = ctx->owner;
-	__atomic_sub_fetch(&uqpair->pending_wr, 1, __ATOMIC_RELAXED);
-	if (spdk_unlikely(uqpair->draining)) {
+	if (spdk_unlikely(spdk_urma_lifetime_is_closing(&uqpair->lifetime))) {
 		/* SE_Review #1: 排空期收到数据 CR 只释放，不 exec、不回包。 */
 		if (ureq->state == NVMF_URMA_REQ_PULLING || ureq->state == NVMF_URMA_REQ_PUSHING) {
 			nvmf_urma_release_req(ureq);
@@ -2073,6 +2115,34 @@ nvmf_urma_handle_completion(const urma_cr_t *completion)
 	return 1;
 }
 
+static int
+nvmf_urma_handle_completion(const urma_cr_t *completion)
+{
+	struct nvmf_urma_cqe_ctx *ctx;
+	struct nvmf_urma_qpair *uqpair;
+	int rc;
+
+	if (spdk_urma_cr_is_fake(completion)) {
+		return 0;
+	}
+	ctx = (void *)completion->user_ctx;
+	if (ctx == NULL) {
+		return 0;
+	}
+	if (ctx->type == NVMF_URMA_CQE_CAPSULE_TX) {
+		uqpair = ctx->owner;
+	} else if (ctx->type == NVMF_URMA_CQE_CAPSULE_RX) {
+		uqpair = ((struct nvmf_urma_cmd_rx_slot *)ctx->owner)->qpair;
+	} else if (ctx->type == NVMF_URMA_CQE_DATA) {
+		uqpair = nvmf_urma_qpair(((struct nvmf_urma_req *)ctx->owner)->req.qpair);
+	} else {
+		return -EPROTO;
+	}
+	rc = nvmf_urma_handle_completion_inner(completion);
+	spdk_urma_lifetime_put(&uqpair->lifetime);
+	return rc;
+}
+
 struct nvmf_urma_completion_msg {
 	urma_cr_t completion;
 };
@@ -2082,24 +2152,7 @@ nvmf_urma_completion_msg_fn(void *ctx)
 {
 	struct nvmf_urma_completion_msg *msg = ctx;
 	const urma_cr_t *completion = &msg->completion;
-	struct nvmf_urma_cqe_ctx *cctx = (void *)completion->user_ctx;
-	struct nvmf_urma_qpair *uqpair = NULL;
 
-	if (cctx != NULL) {
-		if (cctx->type == NVMF_URMA_CQE_CAPSULE_TX) {
-			uqpair = cctx->owner;
-		} else if (cctx->type == NVMF_URMA_CQE_CAPSULE_RX) {
-			uqpair = ((struct nvmf_urma_cmd_rx_slot *)cctx->owner)->qpair;
-		} else if (cctx->type == NVMF_URMA_CQE_DATA) {
-			uqpair = nvmf_urma_qpair(((struct nvmf_urma_req *)cctx->owner)->req.qpair);
-		}
-	}
-	if (uqpair != NULL) {
-		/* SE_Review #1: 排空判定依赖这个计数在消息执行前落地。 */
-		pthread_mutex_lock(&uqpair->drain_lock);
-		uqpair->pending_msgs--;
-		pthread_mutex_unlock(&uqpair->drain_lock);
-	}
 	(void)nvmf_urma_handle_completion(completion);
 	free(msg);
 }
@@ -2136,18 +2189,16 @@ nvmf_urma_process_completion(const urma_cr_t *completion)
 		return -ENOMEM;
 	}
 	msg->completion = *completion;
-	/* SE_Review #1: 计数在入队前落地（与 msg_fn 的递减、drain 判定同锁），
-	 * 保证排空判定不会漏掉在途消息。 */
-	pthread_mutex_lock(&uqpair->drain_lock);
-	uqpair->pending_msgs++;
 	if (spdk_thread_send_msg(uqpair->thread, nvmf_urma_completion_msg_fn, msg) != 0) {
-		uqpair->pending_msgs--;
-		pthread_mutex_unlock(&uqpair->drain_lock);
 		free(msg);
+		/* The WR reference deliberately remains held.  The owner thread is no
+		 * longer accepting work, so quarantining this qpair is safer than
+		 * freeing memory still named by the completion context. */
+		SPDK_ERRLOG("qpair qid=%u completion handoff failed; quarantining\n",
+			    uqpair->qpair.qid);
 		nvmf_urma_disconnect_qpair(uqpair);
 		return -EIO;
 	}
-	pthread_mutex_unlock(&uqpair->drain_lock);
 	return 0;
 }
 
@@ -2278,11 +2329,16 @@ nvmf_urma_req_complete(struct spdk_nvmf_request *req)
 {
 	struct nvmf_urma_req *ureq = nvmf_urma_req(req);
 	struct spdk_nvmf_qpair *qpair = req->qpair;
+	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(qpair);
 
 	/* Modified By Yida(v3): W9 — spdk_nvmf_request_exec -> completion (bdev/SSD) */
 	if (ureq->exec_tick != 0) {
 		NVMF_URMA_TGT_STAGE(exec, spdk_get_ticks() - ureq->exec_tick);
 		ureq->exec_tick = 0;
+	}
+	if (spdk_unlikely(spdk_urma_lifetime_is_closing(&uqpair->lifetime))) {
+		nvmf_urma_release_req(ureq);
+		return;
 	}
 
 	ureq->rsp.nvme_cpl.cid = ureq->cmd.nvme_cmd.cid;
@@ -2300,13 +2356,38 @@ nvmf_urma_req_complete(struct spdk_nvmf_request *req)
 		ureq->rsp.nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
 	if (nvmf_urma_send_response(ureq) != 0) {
-		nvmf_urma_disconnect_qpair(nvmf_urma_qpair(qpair));
+		nvmf_urma_disconnect_qpair(uqpair);
 	}
 }
 
-/* Modified By Yida(v8): 真正的 teardown 收尾。只有 drained() 为真（或排水超时强制
- * 收尾）才会走到这里：此时在途 WR 的 CR 已被消费、已转发的完成消息已执行，
- * working_reqs 不再会被任何回调触碰，归还 buffer / 销毁队列 / 释放 qpair 才安全。 */
+static void
+nvmf_urma_qpair_flush(struct nvmf_urma_qpair *uqpair)
+{
+	urma_jetty_attr_t attr = {
+		.mask = JETTY_STATE,
+		.state = URMA_JETTY_STATE_ERROR,
+	};
+	urma_cr_t completions[64];
+
+	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
+		int count;
+
+		if (uqpair->jettys == NULL || uqpair->jettys[i] == NULL) {
+			continue;
+		}
+		(void)urma_modify_jetty(uqpair->jettys[i], &attr);
+		do {
+			count = urma_flush_jetty(uqpair->jettys[i], SPDK_COUNTOF(completions),
+						 completions);
+			for (int j = 0; j < count; j++) {
+				(void)nvmf_urma_process_completion(&completions[j]);
+			}
+		} while (count == SPDK_COUNTOF(completions));
+	}
+}
+
+/* Teardown is legal only after every posted WR completion has finished and
+ * every framework request has returned. */
 static void
 nvmf_urma_qpair_drain_finish(struct nvmf_urma_qpair *uqpair)
 {
@@ -2317,16 +2398,7 @@ nvmf_urma_qpair_drain_finish(struct nvmf_urma_qpair *uqpair)
 		spdk_poller_unregister(&uqpair->drain_poller);
 	}
 
-	/* 正常路径 working_reqs 已空；只有排水超时的强制收尾才会剩下请求。
-	 * 强制归还可能命中仍在途 WR 将要写入的 buffer，仅作为不挂死的兜底。 */
-	if (!TAILQ_EMPTY(&uqpair->working_reqs)) {
-		struct nvmf_urma_req *ureq, *tmp;
-		SPDK_ERRLOG("qpair qid=%u drain timeout, force-releasing %u remaining reqs\n",
-			    uqpair->qpair.qid, uqpair->qpair.queue_depth);
-		TAILQ_FOREACH_SAFE(ureq, &uqpair->working_reqs, link, tmp) {
-			nvmf_urma_release_req(ureq);
-		}
-	}
+	assert(nvmf_urma_qpair_drained(uqpair));
 
 	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
 		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
@@ -2361,7 +2433,6 @@ nvmf_urma_qpair_drain_finish(struct nvmf_urma_qpair *uqpair)
 		close(uqpair->fd);
 	}
 	free(uqpair->reqs);
-	pthread_mutex_destroy(&uqpair->drain_lock);
 	free(uqpair);
 	if (cb_fn != NULL) {
 		cb_fn(cb_arg);
@@ -2378,13 +2449,13 @@ nvmf_urma_drain_poll(void *arg)
 		return SPDK_POLLER_BUSY;
 	}
 	if (spdk_get_ticks() >= uqpair->drain_deadline_tsc) {
-		/* 在途计数没有归零（JFC 不再上报 CR、消息被 owner thread 丢失等）。
-		 * 与其让 qpair 和 iobuf 永远挂着，不如强制收尾并明确报错。 */
-		SPDK_ERRLOG("qpair qid=%u drain deadline exceeded: pending_wr=%u pending_msgs=%u\n",
-			    uqpair->qpair.qid, __atomic_load_n(&uqpair->pending_wr, __ATOMIC_ACQUIRE),
-			    uqpair->pending_msgs);
-		nvmf_urma_qpair_drain_finish(uqpair);
-		return SPDK_POLLER_BUSY;
+		SPDK_ERRLOG("qpair qid=%u remains quarantined: refs=%" PRIu64
+			    " working_reqs=%u; retrying jetty flush\n",
+			    uqpair->qpair.qid, spdk_urma_lifetime_refs(&uqpair->lifetime),
+			    uqpair->qpair.queue_depth);
+		nvmf_urma_qpair_flush(uqpair);
+		uqpair->drain_deadline_tsc = spdk_get_ticks() +
+					     NVMF_URMA_DRAIN_TIMEOUT_S * spdk_get_ticks_hz();
 	}
 	return SPDK_POLLER_BUSY;
 }
@@ -2407,6 +2478,8 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 	uqpair->fini_cb = cb_fn;
 	uqpair->fini_arg = cb_arg;
 	uqpair->draining = true;
+	spdk_urma_lifetime_close(&uqpair->lifetime);
+	nvmf_urma_qpair_flush(uqpair);
 	uqpair->drain_deadline_tsc = spdk_get_ticks() +
 				     NVMF_URMA_DRAIN_TIMEOUT_S * spdk_get_ticks_hz();
 
