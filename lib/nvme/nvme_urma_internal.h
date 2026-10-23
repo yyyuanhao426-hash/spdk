@@ -24,7 +24,7 @@
 #define SPDK_URMA_DEFAULT_TOKEN 0xACFE
 
 #define SPDK_URMA_WIRE_MAGIC 0x41524d55u /* "URMA", little endian */
-#define SPDK_URMA_WIRE_VERSION 3
+#define SPDK_URMA_WIRE_VERSION 4
 #define SPDK_URMA_MAX_JETTY_PER_EP 32
 #define SPDK_URMA_INVALID_CHIP_ID UINT8_MAX
 
@@ -39,6 +39,11 @@ enum spdk_urma_msg_type {
 	SPDK_URMA_MSG_CAPSULE_CMD,
 	SPDK_URMA_MSG_CAPSULE_RSP,
 	SPDK_URMA_MSG_DISCONNECT,
+};
+
+enum spdk_urma_stage_trace_flags {
+	SPDK_URMA_STAGE_TRACE_REQUESTED = 1u << 0,
+	SPDK_URMA_STAGE_TRACE_COMPLETE = 1u << 1,
 };
 
 #pragma pack(push, 1)
@@ -73,10 +78,30 @@ struct spdk_urma_data_desc {
 struct spdk_urma_capsule_cmd {
 	struct spdk_nvme_cmd cmd;
 	struct spdk_urma_data_desc data;
+	uint64_t trace_seq;
+	uint32_t trace_flags;
+	uint32_t reserved;
+};
+
+/* Target-local ticks returned with the completion.  The timestamps are only
+ * populated when the initiator requests stage tracing.  Durations within this
+ * structure use target_ticks_hz and never require cross-host clock sync. */
+struct spdk_urma_stage_trace {
+	uint64_t trace_seq;
+	uint64_t target_ticks_hz;
+	uint64_t rx_tick;
+	uint64_t buffer_tick;
+	uint64_t exec_tick;
+	uint64_t bdev_cpl_tick;
+	uint64_t data_post_tick;
+	uint64_t data_cpl_tick;
+	uint32_t target_lcore;
+	uint32_t flags;
 };
 
 struct spdk_urma_capsule_rsp {
 	struct spdk_nvme_cpl cpl;
+	struct spdk_urma_stage_trace stage;
 };
 
 struct spdk_urma_capsule_cmd_frame {

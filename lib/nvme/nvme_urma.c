@@ -53,6 +53,7 @@ struct nvme_urma_tx_trace {
 #define NVME_URMA_TX_TRACE_SIZE 8192
 static struct nvme_urma_tx_trace g_tx_trace[NVME_URMA_TX_TRACE_SIZE];
 static uint64_t g_tx_trace_idx;
+static uint64_t g_stage_trace_seq;
 
 /* Modified By Yida(v6): per-I/O tx trace CSV 默认关闭（每轮最多 8192 行，刷屏）；
  * SPDK_URMA_TRACE=1 时才采集并 dump，聚合 breakdown 不受影响。 */
@@ -67,6 +68,43 @@ nvme_urma_trace_enabled(void)
 		enabled = (v != NULL && v[0] == '1');
 	}
 	return enabled;
+}
+
+/* Round 7 request/response stage telemetry.  A zero threshold keeps both the
+ * timestamp reads and slow-line logging off. */
+static uint64_t
+nvme_urma_stage_trace_threshold_ticks(void)
+{
+	static uint64_t threshold_ticks = UINT64_MAX;
+
+	if (threshold_ticks == UINT64_MAX) {
+		const char *value = getenv("SPDK_URMA_STAGE_TRACE_US");
+		char *end = NULL;
+		uint64_t threshold_us = value == NULL ? 0 : strtoull(value, &end, 10);
+
+		if (value == NULL || value[0] == '\0' || end == value || *end != '\0' ||
+		    threshold_us == 0) {
+			threshold_ticks = 0;
+		} else {
+			uint64_t hz = spdk_get_ticks_hz();
+
+			threshold_ticks = threshold_us / 1000000ULL * hz +
+					  (threshold_us % 1000000ULL) * hz / 1000000ULL;
+			if (threshold_ticks == 0) {
+				threshold_ticks = 1;
+			}
+		}
+	}
+	return threshold_ticks;
+}
+
+static uint64_t
+nvme_urma_ticks_to_us(uint64_t ticks, uint64_t hz)
+{
+	if (hz == 0) {
+		return 0;
+	}
+	return ticks / hz * 1000000ULL + (ticks % hz) * 1000000ULL / hz;
 }
 
 static void
@@ -181,6 +219,7 @@ struct nvme_urma_req {
 	bool region_external;
 	uint64_t submit_tick;   /* 总往返计时起点 */
 	uint64_t send_start;    /* send 阶段计时起点 */
+	uint64_t trace_seq;     /* Round 7 wire-stable request identity */
 	TAILQ_ENTRY(nvme_urma_req) link;
 };
 
@@ -434,7 +473,9 @@ static int
 nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 {
 	urma_jfs_cfg_t jfs = {};
-	uint32_t capsule_inline_size = sizeof(struct spdk_urma_capsule_cmd_frame);
+	uint32_t capsule_inline_size = spdk_max(
+		(uint32_t)sizeof(struct spdk_urma_capsule_cmd_frame),
+		(uint32_t)sizeof(struct spdk_urma_capsule_rsp_frame));
 	uint32_t i;
 
 	uqpair->jetty_count = spdk_min(uqpair->device->opts.num_jetty_per_ep,
@@ -778,6 +819,9 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	}
 	ureq->req = req;
 	ureq->submit_tick = spdk_get_ticks();  /* total round-trip start */
+	if (nvme_urma_stage_trace_threshold_ticks() != 0) {
+		ureq->trace_seq = __atomic_add_fetch(&g_stage_trace_seq, 1, __ATOMIC_RELAXED);
+	}
 	/* Modified by Yin: submit 前分配唯一 cid，防 completion 匹配到错误 request。
 	 * Modified By Yida (v3): 改用位图分配器保证 outstanding 的 cid 唯一。 */
 	req->cmd.cid = nvme_urma_cid_alloc(uqpair);
@@ -786,6 +830,10 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		return -EAGAIN;
 	}
 	capsule.cmd = req->cmd;
+	capsule.trace_seq = ureq->trace_seq;
+	if (ureq->trace_seq != 0) {
+		capsule.trace_flags = SPDK_URMA_STAGE_TRACE_REQUESTED;
+	}
 	if (req->payload.size != 0) {
 		capsule.cmd.dptr.sgl1.address = 0;
 		capsule.cmd.dptr.sgl1.unkeyed.length = req->payload.size;
@@ -906,6 +954,7 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 	struct spdk_nvme_qpair *qpair = &uqpair->qpair;
 	struct nvme_urma_req *ureq;
 	uint64_t t_rel0, t_rel1, t_total1;
+	uint64_t roundtrip_ticks, threshold_ticks;
 
 	TAILQ_FOREACH(ureq, &uqpair->outstanding, link) {
 		if (ureq->req->cmd.cid == rsp->cpl.cid) {
@@ -930,8 +979,58 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 	__atomic_add_fetch(&g_timing.release_ticks, t_rel1 - t_rel0, __ATOMIC_RELAXED);
 	__atomic_add_fetch(&g_timing.release_count, 1, __ATOMIC_RELAXED);
 	t_total1 = spdk_get_ticks();
-	__atomic_add_fetch(&g_timing.total_ticks, t_total1 - ureq->submit_tick, __ATOMIC_RELAXED);
+	roundtrip_ticks = t_total1 - ureq->submit_tick;
+	__atomic_add_fetch(&g_timing.total_ticks, roundtrip_ticks, __ATOMIC_RELAXED);
 	__atomic_add_fetch(&g_timing.total_count, 1, __ATOMIC_RELAXED);
+	threshold_ticks = nvme_urma_stage_trace_threshold_ticks();
+	if (ureq->trace_seq != 0 && roundtrip_ticks >= threshold_ticks) {
+		const struct spdk_urma_stage_trace *stage = &rsp->stage;
+		const struct spdk_nvme_cmd *cmd = &ureq->req->cmd;
+		uint64_t roundtrip_us = nvme_urma_ticks_to_us(roundtrip_ticks,
+					  spdk_get_ticks_hz());
+		uint64_t target_us = 0, rx_buffer_us = 0, buffer_exec_us = 0;
+		uint64_t bdev_us = 0, bdev_post_us = 0, data_us = 0;
+		uint64_t residual_us = roundtrip_us;
+		/* Host-built command; cdw10/cdw11 are adjacent little-endian dwords. */
+		uint64_t lba = (uint64_t)cmd->cdw10 | ((uint64_t)cmd->cdw11 << 32);
+		uint32_t blocks = (cmd->cdw12 & 0xffffu) + 1;
+		bool valid = stage->trace_seq == ureq->trace_seq &&
+			     (stage->flags & SPDK_URMA_STAGE_TRACE_COMPLETE) != 0 &&
+			     stage->target_ticks_hz != 0 &&
+			     stage->rx_tick <= stage->buffer_tick &&
+			     stage->buffer_tick <= stage->exec_tick &&
+			     stage->exec_tick <= stage->bdev_cpl_tick &&
+			     stage->bdev_cpl_tick <= stage->data_post_tick &&
+			     stage->data_post_tick <= stage->data_cpl_tick;
+
+		if (valid) {
+			target_us = nvme_urma_ticks_to_us(stage->data_cpl_tick - stage->rx_tick,
+						       stage->target_ticks_hz);
+			rx_buffer_us = nvme_urma_ticks_to_us(stage->buffer_tick - stage->rx_tick,
+							  stage->target_ticks_hz);
+			buffer_exec_us = nvme_urma_ticks_to_us(stage->exec_tick - stage->buffer_tick,
+							      stage->target_ticks_hz);
+			bdev_us = nvme_urma_ticks_to_us(stage->bdev_cpl_tick - stage->exec_tick,
+						      stage->target_ticks_hz);
+			bdev_post_us = nvme_urma_ticks_to_us(stage->data_post_tick -
+							 stage->bdev_cpl_tick,
+							 stage->target_ticks_hz);
+			data_us = nvme_urma_ticks_to_us(stage->data_cpl_tick - stage->data_post_tick,
+						      stage->target_ticks_hz);
+			residual_us = roundtrip_us > target_us ? roundtrip_us - target_us : 0;
+		}
+		printf("URMA_SLOW_IO trace_seq=%" PRIu64 " qid=%u cid=%u opcode=%u "
+		       "lba=%" PRIu64 " blocks=%u roundtrip_us=%" PRIu64 " "
+		       "target_valid=%u target_lcore=%u target_us=%" PRIu64 " "
+		       "rx_buffer_us=%" PRIu64 " buffer_exec_us=%" PRIu64 " "
+		       "bdev_us=%" PRIu64 " bdev_post_us=%" PRIu64 " "
+		       "data_us=%" PRIu64 " residual_us=%" PRIu64 "\n",
+		       ureq->trace_seq, uqpair->qpair.id, cmd->cid, cmd->opc, lba, blocks,
+		       roundtrip_us, valid ? 1u : 0u, stage->target_lcore, target_us,
+		       rx_buffer_us, buffer_exec_us, bdev_us, bdev_post_us, data_us,
+		       residual_us);
+		fflush(stdout);
+	}
 	nvme_complete_request(ureq->req->cb_fn, ureq->req->cb_arg, qpair, ureq->req, &rsp->cpl);
 	free(ureq);
 	return 1;

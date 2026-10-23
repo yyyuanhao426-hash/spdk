@@ -328,6 +328,8 @@ struct nvmf_urma_req {
 	uint64_t start_tick;   /* capsule parsed; 0 = not a timed data request */
 	uint64_t post_tick;    /* data WR posted (JFC wait start) */
 	uint64_t exec_tick;    /* spdk_nvmf_request_exec called; 0 = not timed */
+	/* Round 7 target stages echoed in the response. */
+	struct spdk_urma_stage_trace stage_trace;
 	/* Modified By Yida(v4): index into g_rx_trace for this I/O's per-I/O record */
 	uint32_t trace_idx;
 	TAILQ_ENTRY(nvmf_urma_req) link;
@@ -569,7 +571,9 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 {
 	struct spdk_urma_device *device = uqpair->device;
 	urma_jfs_cfg_t jfs = {};
-	uint32_t capsule_inline_size = sizeof(struct spdk_urma_capsule_cmd_frame);
+	uint32_t capsule_inline_size = spdk_max(
+		(uint32_t)sizeof(struct spdk_urma_capsule_cmd_frame),
+		(uint32_t)sizeof(struct spdk_urma_capsule_rsp_frame));
 	uint32_t i;
 
 	uqpair->jetty_count = spdk_min(device->opts.num_jetty_per_ep,
@@ -1564,7 +1568,10 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 {
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
 	struct spdk_urma_msg_hdr hdr = {};
-	struct spdk_urma_capsule_rsp rsp = {.cpl = ureq->rsp.nvme_cpl};
+	struct spdk_urma_capsule_rsp rsp = {
+		.cpl = ureq->rsp.nvme_cpl,
+		.stage = ureq->stage_trace,
+	};
 	int rc;
 	uint64_t t_rsp0 = spdk_get_ticks(); /* Modified By Yida(v3): W10 start */
 
@@ -1822,6 +1829,9 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 
 		NVMF_URMA_TGT_STAGE(post, t_post1 - ureq->post_tick);
 		ureq->post_tick = t_post1;
+		if (ureq->stage_trace.flags & SPDK_URMA_STAGE_TRACE_REQUESTED) {
+			ureq->stage_trace.data_post_tick = t_post1;
+		}
 		return 0;
 	}
 }
@@ -1829,9 +1839,14 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 static void
 nvmf_urma_buffers_ready(struct nvmf_urma_req *ureq)
 {
+	uint64_t now = spdk_get_ticks();
+
 	/* Modified By Yida(v3): W4b — capsule parsed -> buffers ready */
 	if (ureq->start_tick != 0) {
-		NVMF_URMA_TGT_STAGE(buffer, spdk_get_ticks() - ureq->start_tick);
+		NVMF_URMA_TGT_STAGE(buffer, now - ureq->start_tick);
+	}
+	if (ureq->stage_trace.flags & SPDK_URMA_STAGE_TRACE_REQUESTED) {
+		ureq->stage_trace.buffer_tick = now;
 	}
 	if (spdk_unlikely(spdk_urma_lifetime_is_closing(
 				  &nvmf_urma_qpair(ureq->req.qpair)->lifetime))) {
@@ -1852,6 +1867,9 @@ nvmf_urma_buffers_ready(struct nvmf_urma_req *ureq)
 	} else {
 		ureq->state = NVMF_URMA_REQ_EXECUTING;
 		ureq->exec_tick = spdk_get_ticks(); /* Modified By Yida(v3): W9 start (C2H, no pull) */
+		if (ureq->stage_trace.flags & SPDK_URMA_STAGE_TRACE_REQUESTED) {
+			ureq->stage_trace.exec_tick = ureq->exec_tick;
+		}
 		spdk_nvmf_request_exec(&ureq->req);
 	}
 }
@@ -1883,6 +1901,15 @@ nvmf_urma_handle_capsule(struct nvmf_urma_qpair *uqpair,
 	ureq->start_tick = 0;
 	ureq->exec_tick = 0;
 	ureq->trace_idx = UINT32_MAX;
+	memset(&ureq->stage_trace, 0, sizeof(ureq->stage_trace));
+	if ((capsule->trace_flags & SPDK_URMA_STAGE_TRACE_REQUESTED) != 0 &&
+	    capsule->trace_seq != 0) {
+		ureq->stage_trace.trace_seq = capsule->trace_seq;
+		ureq->stage_trace.target_ticks_hz = spdk_get_ticks_hz();
+		ureq->stage_trace.rx_tick = t_parse0;
+		ureq->stage_trace.target_lcore = spdk_env_get_current_core();
+		ureq->stage_trace.flags = SPDK_URMA_STAGE_TRACE_REQUESTED;
+	}
 	NVMF_URMA_TGT_STAGE(peek_wait, t_parse0 - t_peek);
 	if (nvmf_urma_trace_enabled()) {
 		uint64_t idx = __atomic_fetch_add(&g_rx_trace_idx, 1, __ATOMIC_RELAXED) %
@@ -2103,11 +2130,20 @@ nvmf_urma_handle_completion_inner(const urma_cr_t *completion)
 		 * (includes poller scheduling latency) */
 		NVMF_URMA_TGT_STAGE(jfc, spdk_get_ticks() - ureq->post_tick);
 		ureq->exec_tick = spdk_get_ticks();
+		if (ureq->stage_trace.flags & SPDK_URMA_STAGE_TRACE_REQUESTED) {
+			ureq->stage_trace.exec_tick = ureq->exec_tick;
+		}
 		ureq->state = NVMF_URMA_REQ_EXECUTING;
 		spdk_nvmf_request_exec(&ureq->req);
 	} else if (ureq->state == NVMF_URMA_REQ_PUSHING) {
 		/* Modified By Yida(v3): C2H push — WR posted -> JFC completion */
-		NVMF_URMA_TGT_STAGE(push, spdk_get_ticks() - ureq->post_tick);
+		uint64_t now = spdk_get_ticks();
+
+		NVMF_URMA_TGT_STAGE(push, now - ureq->post_tick);
+		if (ureq->stage_trace.flags & SPDK_URMA_STAGE_TRACE_REQUESTED) {
+			ureq->stage_trace.data_cpl_tick = now;
+			ureq->stage_trace.flags |= SPDK_URMA_STAGE_TRACE_COMPLETE;
+		}
 		if (nvmf_urma_send_response(ureq) != 0) {
 			nvmf_urma_disconnect_qpair(uqpair);
 		}
@@ -2330,11 +2366,15 @@ nvmf_urma_req_complete(struct spdk_nvmf_request *req)
 	struct nvmf_urma_req *ureq = nvmf_urma_req(req);
 	struct spdk_nvmf_qpair *qpair = req->qpair;
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(qpair);
+	uint64_t now = spdk_get_ticks();
 
 	/* Modified By Yida(v3): W9 — spdk_nvmf_request_exec -> completion (bdev/SSD) */
 	if (ureq->exec_tick != 0) {
-		NVMF_URMA_TGT_STAGE(exec, spdk_get_ticks() - ureq->exec_tick);
+		NVMF_URMA_TGT_STAGE(exec, now - ureq->exec_tick);
 		ureq->exec_tick = 0;
+	}
+	if (ureq->stage_trace.flags & SPDK_URMA_STAGE_TRACE_REQUESTED) {
+		ureq->stage_trace.bdev_cpl_tick = now;
 	}
 	if (spdk_unlikely(spdk_urma_lifetime_is_closing(&uqpair->lifetime))) {
 		nvmf_urma_release_req(ureq);
