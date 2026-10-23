@@ -54,6 +54,8 @@ struct nvme_urma_tx_trace {
 static struct nvme_urma_tx_trace g_tx_trace[NVME_URMA_TX_TRACE_SIZE];
 static uint64_t g_tx_trace_idx;
 static uint64_t g_stage_trace_seq;
+static pthread_once_t g_stage_trace_once = PTHREAD_ONCE_INIT;
+static uint64_t g_stage_trace_threshold_ticks;
 
 /* Modified By Yida(v6): per-I/O tx trace CSV 默认关闭（每轮最多 8192 行，刷屏）；
  * SPDK_URMA_TRACE=1 时才采集并 dump，聚合 breakdown 不受影响。 */
@@ -70,32 +72,50 @@ nvme_urma_trace_enabled(void)
 	return enabled;
 }
 
+static void
+nvme_urma_stage_trace_init(void)
+{
+	const char *value = getenv("SPDK_URMA_STAGE_TRACE_US");
+	char *end = NULL;
+	unsigned long long threshold_us;
+	uint64_t hz;
+	__uint128_t ticks;
+
+	if (value == NULL || value[0] == '\0') {
+		return;
+	}
+	if (value[0] < '0' || value[0] > '9') {
+		SPDK_WARNLOG("invalid SPDK_URMA_STAGE_TRACE_US='%s'; stage trace disabled\n",
+			     value);
+		return;
+	}
+	errno = 0;
+	threshold_us = strtoull(value, &end, 10);
+	if (errno == ERANGE || end == value || *end != '\0' || threshold_us == 0) {
+		if (threshold_us != 0 || (value[0] != '0' || value[1] != '\0')) {
+			SPDK_WARNLOG("invalid SPDK_URMA_STAGE_TRACE_US='%s'; stage trace disabled\n",
+				     value);
+		}
+		return;
+	}
+	hz = spdk_get_ticks_hz();
+	ticks = (__uint128_t)threshold_us * hz / 1000000ULL;
+	if (ticks > UINT64_MAX) {
+		SPDK_WARNLOG("SPDK_URMA_STAGE_TRACE_US='%s' overflows tick range; "
+			     "stage trace disabled\n", value);
+		return;
+	}
+	g_stage_trace_threshold_ticks = ticks == 0 ? 1 : (uint64_t)ticks;
+}
+
 /* Round 7 request/response stage telemetry.  A zero threshold keeps both the
- * timestamp reads and slow-line logging off. */
+ * timestamp reads and slow-line logging off.  pthread_once makes the process-
+ * wide environment setting safe when several qpairs submit concurrently. */
 static uint64_t
 nvme_urma_stage_trace_threshold_ticks(void)
 {
-	static uint64_t threshold_ticks = UINT64_MAX;
-
-	if (threshold_ticks == UINT64_MAX) {
-		const char *value = getenv("SPDK_URMA_STAGE_TRACE_US");
-		char *end = NULL;
-		uint64_t threshold_us = value == NULL ? 0 : strtoull(value, &end, 10);
-
-		if (value == NULL || value[0] == '\0' || end == value || *end != '\0' ||
-		    threshold_us == 0) {
-			threshold_ticks = 0;
-		} else {
-			uint64_t hz = spdk_get_ticks_hz();
-
-			threshold_ticks = threshold_us / 1000000ULL * hz +
-					  (threshold_us % 1000000ULL) * hz / 1000000ULL;
-			if (threshold_ticks == 0) {
-				threshold_ticks = 1;
-			}
-		}
-	}
-	return threshold_ticks;
+	pthread_once(&g_stage_trace_once, nvme_urma_stage_trace_init);
+	return g_stage_trace_threshold_ticks;
 }
 
 static uint64_t
@@ -105,6 +125,17 @@ nvme_urma_ticks_to_us(uint64_t ticks, uint64_t hz)
 		return 0;
 	}
 	return ticks / hz * 1000000ULL + (ticks % hz) * 1000000ULL / hz;
+}
+
+static uint64_t
+nvme_urma_monotonic_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return 0;
+	}
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
 static void
@@ -986,11 +1017,17 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 	if (ureq->trace_seq != 0 && roundtrip_ticks >= threshold_ticks) {
 		const struct spdk_urma_stage_trace *stage = &rsp->stage;
 		const struct spdk_nvme_cmd *cmd = &ureq->req->cmd;
+		uint64_t initiator_hz = spdk_get_ticks_hz();
 		uint64_t roundtrip_us = nvme_urma_ticks_to_us(roundtrip_ticks,
-					  spdk_get_ticks_hz());
+					  initiator_hz);
 		uint64_t target_us = 0, rx_buffer_us = 0, buffer_exec_us = 0;
 		uint64_t bdev_us = 0, bdev_post_us = 0, data_us = 0;
 		uint64_t residual_us = roundtrip_us;
+		uint64_t pre_send_us = nvme_urma_ticks_to_us(
+					       ureq->send_start - ureq->submit_tick, initiator_hz);
+		uint64_t release_us = nvme_urma_ticks_to_us(t_rel1 - t_rel0, initiator_hz);
+		uint64_t outside_us = 0;
+		uint64_t completion_mono_ns = nvme_urma_monotonic_ns();
 		/* Host-built command; cdw10/cdw11 are adjacent little-endian dwords. */
 		uint64_t lba = (uint64_t)cmd->cdw10 | ((uint64_t)cmd->cdw11 << 32);
 		uint32_t blocks = (cmd->cdw12 & 0xffffu) + 1;
@@ -1018,18 +1055,26 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 			data_us = nvme_urma_ticks_to_us(stage->data_cpl_tick - stage->data_post_tick,
 						      stage->target_ticks_hz);
 			residual_us = roundtrip_us > target_us ? roundtrip_us - target_us : 0;
+			outside_us = residual_us > pre_send_us + release_us ?
+				     residual_us - pre_send_us - release_us : 0;
 		}
 		printf("URMA_SLOW_IO trace_seq=%" PRIu64 " qid=%u cid=%u opcode=%u "
 		       "lba=%" PRIu64 " blocks=%u roundtrip_us=%" PRIu64 " "
-		       "target_valid=%u target_lcore=%u target_us=%" PRIu64 " "
+		       "completion_mono_ns=%" PRIu64 " target_valid=%u target_lcore=%u "
+		       "target_ticks_hz=%" PRIu64 " target_rx_tick=%" PRIu64 " "
+		       "target_buffer_tick=%" PRIu64 " target_exec_tick=%" PRIu64 " "
+		       "target_bdev_cpl_tick=%" PRIu64 " target_data_post_tick=%" PRIu64 " "
+		       "target_data_cpl_tick=%" PRIu64 " target_us=%" PRIu64 " "
 		       "rx_buffer_us=%" PRIu64 " buffer_exec_us=%" PRIu64 " "
 		       "bdev_us=%" PRIu64 " bdev_post_us=%" PRIu64 " "
-		       "data_us=%" PRIu64 " residual_us=%" PRIu64 "\n",
+		       "data_us=%" PRIu64 " pre_send_us=%" PRIu64 " "
+		       "release_us=%" PRIu64 " outside_us=%" PRIu64 " residual_us=%" PRIu64 "\n",
 		       ureq->trace_seq, uqpair->qpair.id, cmd->cid, cmd->opc, lba, blocks,
-		       roundtrip_us, valid ? 1u : 0u, stage->target_lcore, target_us,
+		       roundtrip_us, completion_mono_ns, valid ? 1u : 0u, stage->target_lcore,
+		       stage->target_ticks_hz, stage->rx_tick, stage->buffer_tick, stage->exec_tick,
+		       stage->bdev_cpl_tick, stage->data_post_tick, stage->data_cpl_tick, target_us,
 		       rx_buffer_us, buffer_exec_us, bdev_us, bdev_post_us, data_us,
-		       residual_us);
-		fflush(stdout);
+		       pre_send_us, release_us, outside_us, residual_us);
 	}
 	nvme_complete_request(ureq->req->cb_fn, ureq->req->cb_arg, qpair, ureq->req, &rsp->cpl);
 	free(ureq);
@@ -1043,7 +1088,9 @@ nvme_urma_queue_response(struct nvme_urma_qpair *uqpair,
 	int rc = 0;
 
 	pthread_mutex_lock(&uqpair->pending_rsp_lock);
-	if (uqpair->pending_rsp_count == uqpair->capsule_rx_count) {
+	if (spdk_urma_lifetime_is_closing(&uqpair->lifetime)) {
+		rc = -ESHUTDOWN;
+	} else if (uqpair->pending_rsp_count == uqpair->capsule_rx_count) {
 		SPDK_ERRLOG("pending response queue full: qid=%u cid=%u count=%u\n",
 			    uqpair->qpair.id, rsp->cpl.cid, uqpair->pending_rsp_count);
 		rc = -ENOSPC;
@@ -1061,6 +1108,7 @@ nvme_urma_drain_queued_responses(struct nvme_urma_qpair *uqpair,
 				 uint32_t max_completions)
 {
 	uint32_t completed = 0;
+	int hard_err = 0;
 
 	while (completed < max_completions) {
 		struct spdk_urma_capsule_rsp rsp;
@@ -1080,12 +1128,32 @@ nvme_urma_drain_queued_responses(struct nvme_urma_qpair *uqpair,
 			break;
 		}
 		rc = nvme_urma_complete_response(uqpair, &rsp);
+		/* A response routed from a shared JFC transfers the original RX WR
+		 * lifetime reference to this queue entry.  Keep the qpair alive until
+		 * the owner has executed the completion handler. */
+		spdk_urma_lifetime_put(&uqpair->lifetime);
 		if (rc < 0) {
-			return rc;
+			hard_err = hard_err == 0 ? rc : hard_err;
+			continue;
 		}
 		completed += rc;
 	}
-	return completed;
+	return hard_err != 0 ? hard_err : (int)completed;
+}
+
+static void
+nvme_urma_lifetime_close(struct nvme_urma_qpair *uqpair)
+{
+	/* Serialize close with cross-poller response routing.  A response that is
+	 * already queued owns its RX WR reference; after the closing bit is set no
+	 * new queue entry can be created. */
+	if (uqpair->pending_rsp_lock_initialized) {
+		pthread_mutex_lock(&uqpair->pending_rsp_lock);
+	}
+	spdk_urma_lifetime_close(&uqpair->lifetime);
+	if (uqpair->pending_rsp_lock_initialized) {
+		pthread_mutex_unlock(&uqpair->pending_rsp_lock);
+	}
 }
 
 static struct nvme_urma_qpair *
@@ -1113,7 +1181,7 @@ nvme_urma_qpair_defer_error(struct nvme_urma_qpair *uqpair, int err)
 
 static int32_t
 nvme_urma_process_capsule_cr_inner(struct nvme_urma_qpair *poller, const urma_cr_t *cr,
-				   uint32_t *completed)
+				   uint32_t *completed, bool *reference_transferred)
 {
 	struct nvme_urma_cqe_ctx *ctx;
 	struct nvme_urma_qpair *owner;
@@ -1187,6 +1255,7 @@ nvme_urma_process_capsule_cr_inner(struct nvme_urma_qpair *poller, const urma_cr
 				nvme_urma_qpair_defer_error(owner, rc);
 				return 0;
 			}
+			*reference_transferred = true;
 			return rc;
 		}
 		rc = nvme_urma_complete_response(owner, &frame.capsule);
@@ -1205,6 +1274,7 @@ nvme_urma_process_capsule_cr(struct nvme_urma_qpair *poller, const urma_cr_t *cr
 {
 	struct nvme_urma_cqe_ctx *ctx;
 	struct nvme_urma_qpair *owner;
+	bool reference_transferred = false;
 	int32_t rc;
 
 	if (spdk_urma_cr_is_fake(cr)) {
@@ -1218,8 +1288,11 @@ nvme_urma_process_capsule_cr(struct nvme_urma_qpair *poller, const urma_cr_t *cr
 	if (owner == NULL) {
 		return -EPROTO;
 	}
-	rc = nvme_urma_process_capsule_cr_inner(poller, cr, completed);
-	spdk_urma_lifetime_put(&owner->lifetime);
+	rc = nvme_urma_process_capsule_cr_inner(poller, cr, completed,
+					       &reference_transferred);
+	if (!reference_transferred) {
+		spdk_urma_lifetime_put(&owner->lifetime);
+	}
 	return rc;
 }
 
@@ -1634,7 +1707,7 @@ nvme_urma_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qp
 	return 0;
 
 fail:
-	spdk_urma_lifetime_close(&uqpair->lifetime);
+	nvme_urma_lifetime_close(uqpair);
 	nvme_urma_qpair_flush(uqpair);
 	if (spdk_urma_lifetime_refs(&uqpair->lifetime) == 0) {
 		nvme_urma_qpair_release_transport(uqpair);
@@ -1650,7 +1723,8 @@ nvme_urma_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 {
 	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
 
-	spdk_urma_lifetime_close(&uqpair->lifetime);
+	nvme_urma_lifetime_close(uqpair);
+	(void)nvme_urma_drain_queued_responses(uqpair, UINT32_MAX);
 	nvme_urma_qpair_abort_reqs(qpair, qpair->abort_dnr);
 	nvme_urma_qpair_flush(uqpair);
 	nvme_urma_qpair_try_disconnect_done(uqpair);
@@ -1661,7 +1735,8 @@ nvme_urma_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 {
 	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
 
-	spdk_urma_lifetime_close(&uqpair->lifetime);
+	nvme_urma_lifetime_close(uqpair);
+	(void)nvme_urma_drain_queued_responses(uqpair, UINT32_MAX);
 	nvme_urma_qpair_abort_reqs(qpair, qpair->abort_dnr);
 	nvme_urma_qpair_flush(uqpair);
 	if (spdk_urma_lifetime_refs(&uqpair->lifetime) != 0) {
