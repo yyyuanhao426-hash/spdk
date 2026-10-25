@@ -22,6 +22,7 @@
 #define SPDK_URMA_DEFAULT_RNR_RETRY 7
 #define SPDK_URMA_DEFAULT_ERR_TIMEOUT 17
 #define SPDK_URMA_DEFAULT_TOKEN 0xACFE
+#define SPDK_URMA_RX_QUIESCE_BUDGET 4096
 
 #define SPDK_URMA_WIRE_MAGIC 0x41524d55u /* "URMA", little endian */
 #define SPDK_URMA_WIRE_VERSION 4
@@ -161,6 +162,8 @@ struct spdk_urma_device {
 	struct spdk_memory_domain *memory_domain;
 };
 
+typedef bool (*spdk_urma_recv_cr_prepare_cb)(urma_cr_t *cr, void *ctx);
+
 /* UMDK constructs these queue-state notification CRs without a valid
  * user_ctx.  They must be consumed before any transport context lookup. */
 static inline bool
@@ -183,7 +186,13 @@ uint32_t spdk_urma_device_next_jfr(struct spdk_urma_device *device);
 int spdk_urma_device_poll_send_jfc(struct spdk_urma_device *device, uint32_t index,
 				   int max_cr, urma_cr_t *cr);
 int spdk_urma_device_poll_recv_jfc(struct spdk_urma_device *device, uint32_t index,
-				   int max_cr, urma_cr_t *cr);
+				   int max_cr, urma_cr_t *cr,
+				   spdk_urma_recv_cr_prepare_cb prepare_cb, void *prepare_ctx);
+int spdk_urma_device_poll_recv_jfc_locked(struct spdk_urma_device *device, uint32_t index,
+					  int max_cr, urma_cr_t *cr,
+					  spdk_urma_recv_cr_prepare_cb prepare_cb, void *prepare_ctx);
+void spdk_urma_device_lock_recv_jfcs(struct spdk_urma_device *device);
+void spdk_urma_device_unlock_recv_jfcs(struct spdk_urma_device *device);
 uint8_t spdk_urma_memory_chip_id(const void *addr);
 urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 	struct spdk_nvme_urma_memory_region *region);

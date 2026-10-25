@@ -19,6 +19,22 @@ struct spdk_urma_lifetime {
 	uint64_t state;
 };
 
+/*
+ * Receive WRs are different from ordinary completion-enabled WRs: a qpair
+ * keeps one receive posted for every capsule slot for its whole lifetime.
+ * Some providers (including udma) only return send WRs from flush_jetty(), so
+ * these references must be retired after the receive queue has been destroyed.
+ *
+ * A true posted bit means the lifetime reference still belongs to the receive
+ * queue.  Polling atomically claims that bit before the CR leaves the JFC lock;
+ * the same reference then belongs to the completion handler.  Consequently a
+ * queue teardown can retire only unclaimed receives without stealing a
+ * reference from a handler which is already using the qpair.
+ */
+struct spdk_urma_rx_ref {
+	bool posted;
+};
+
 static inline void
 spdk_urma_lifetime_init(struct spdk_urma_lifetime *lifetime)
 {
@@ -81,6 +97,51 @@ spdk_urma_lifetime_refs(const struct spdk_urma_lifetime *lifetime)
 {
 	return __atomic_load_n(&lifetime->state, __ATOMIC_ACQUIRE) &
 	       SPDK_URMA_LIFETIME_REFS_MASK;
+}
+
+static inline bool
+spdk_urma_rx_ref_post_begin(struct spdk_urma_rx_ref *rx_ref,
+			    struct spdk_urma_lifetime *lifetime)
+{
+	if (!spdk_urma_lifetime_try_get(lifetime)) {
+		return false;
+	}
+	assert(!__atomic_load_n(&rx_ref->posted, __ATOMIC_ACQUIRE));
+	__atomic_store_n(&rx_ref->posted, true, __ATOMIC_RELEASE);
+	return true;
+}
+
+static inline bool
+spdk_urma_rx_ref_claim(struct spdk_urma_rx_ref *rx_ref)
+{
+	return __atomic_exchange_n(&rx_ref->posted, false, __ATOMIC_ACQ_REL);
+}
+
+static inline void
+spdk_urma_rx_ref_post_failed(struct spdk_urma_rx_ref *rx_ref,
+			     struct spdk_urma_lifetime *lifetime)
+{
+	bool posted = spdk_urma_rx_ref_claim(rx_ref);
+
+	assert(posted);
+	spdk_urma_lifetime_put(lifetime);
+}
+
+static inline bool
+spdk_urma_rx_ref_is_posted(const struct spdk_urma_rx_ref *rx_ref)
+{
+	return __atomic_load_n(&rx_ref->posted, __ATOMIC_ACQUIRE);
+}
+
+static inline bool
+spdk_urma_rx_ref_retire(struct spdk_urma_rx_ref *rx_ref,
+			struct spdk_urma_lifetime *lifetime)
+{
+	if (!spdk_urma_rx_ref_claim(rx_ref)) {
+		return false;
+	}
+	spdk_urma_lifetime_put(lifetime);
+	return true;
 }
 
 #endif /* SPDK_INTERNAL_URMA_LIFETIME_H */

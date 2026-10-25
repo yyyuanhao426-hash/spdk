@@ -630,8 +630,34 @@ spdk_urma_device_poll_send_jfc(struct spdk_urma_device *device, uint32_t index,
 }
 
 int
+spdk_urma_device_poll_recv_jfc_locked(struct spdk_urma_device *device, uint32_t index,
+				      int max_cr, urma_cr_t *cr,
+				      spdk_urma_recv_cr_prepare_cb prepare_cb, void *prepare_ctx)
+{
+	int count, prepared = 0;
+
+	if (index >= device->recv_jfc_count) {
+		return -EINVAL;
+	}
+	count = urma_poll_jfc(device->recv_jfcs[index], max_cr, cr);
+	if (count <= 0 || prepare_cb == NULL) {
+		return count;
+	}
+	for (int i = 0; i < count; i++) {
+		if (prepare_cb(&cr[i], prepare_ctx)) {
+			if (prepared != i) {
+				cr[prepared] = cr[i];
+			}
+			prepared++;
+		}
+	}
+	return prepared;
+}
+
+int
 spdk_urma_device_poll_recv_jfc(struct spdk_urma_device *device, uint32_t index,
-			       int max_cr, urma_cr_t *cr)
+			       int max_cr, urma_cr_t *cr,
+			       spdk_urma_recv_cr_prepare_cb prepare_cb, void *prepare_ctx)
 {
 	int rc;
 
@@ -639,9 +665,26 @@ spdk_urma_device_poll_recv_jfc(struct spdk_urma_device *device, uint32_t index,
 	    pthread_mutex_trylock(&device->recv_jfc_poll_locks[index]) != 0) {
 		return 0;
 	}
-	rc = urma_poll_jfc(device->recv_jfcs[index], max_cr, cr);
+	rc = spdk_urma_device_poll_recv_jfc_locked(device, index, max_cr, cr,
+			prepare_cb, prepare_ctx);
 	pthread_mutex_unlock(&device->recv_jfc_poll_locks[index]);
 	return rc;
+}
+
+void
+spdk_urma_device_lock_recv_jfcs(struct spdk_urma_device *device)
+{
+	for (uint32_t i = 0; i < device->recv_jfc_poll_lock_count; i++) {
+		pthread_mutex_lock(&device->recv_jfc_poll_locks[i]);
+	}
+}
+
+void
+spdk_urma_device_unlock_recv_jfcs(struct spdk_urma_device *device)
+{
+	for (uint32_t i = device->recv_jfc_poll_lock_count; i > 0; i--) {
+		pthread_mutex_unlock(&device->recv_jfc_poll_locks[i - 1]);
+	}
 }
 
 static int

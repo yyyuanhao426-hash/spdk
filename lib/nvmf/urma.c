@@ -305,6 +305,7 @@ struct nvmf_urma_cqe_ctx {
 struct nvmf_urma_cmd_rx_slot {
 	struct nvmf_urma_cqe_ctx cqe;
 	struct nvmf_urma_qpair *qpair;
+	struct spdk_urma_rx_ref rx_ref;
 	struct spdk_urma_capsule_cmd_frame frame;
 	urma_sge_t sge;
 	urma_jfr_wr_t wr;
@@ -653,14 +654,14 @@ nvmf_urma_post_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot)
 	urma_jfr_wr_t *bad_wr = NULL;
 	urma_status_t status;
 
-	if (!spdk_urma_lifetime_try_get(&uqpair->lifetime)) {
+	if (!spdk_urma_rx_ref_post_begin(&slot->rx_ref, &uqpair->lifetime)) {
 		return -ESHUTDOWN;
 	}
 	status = urma_post_jetty_recv_wr(uqpair->jettys[
 			 (uint32_t)(slot - uqpair->capsule_rx_slots) % uqpair->jetty_count],
 			 &slot->wr, &bad_wr);
 	if (status != URMA_SUCCESS) {
-		spdk_urma_lifetime_put(&uqpair->lifetime);
+		spdk_urma_rx_ref_post_failed(&slot->rx_ref, &uqpair->lifetime);
 		return -EIO;
 	}
 	return 0;
@@ -2193,6 +2194,32 @@ nvmf_urma_completion_msg_fn(void *ctx)
 	free(msg);
 }
 
+/* Claim the posted RX reference before the CR leaves the shared JFC lock.
+ * The reference then protects either the direct handler or its cross-thread
+ * completion message until nvmf_urma_handle_completion() returns. */
+static bool
+nvmf_urma_prepare_recv_cr(urma_cr_t *completion, void *ctx_arg)
+{
+	struct nvmf_urma_cqe_ctx *ctx;
+	struct nvmf_urma_cmd_rx_slot *slot;
+
+	(void)ctx_arg;
+	if (spdk_urma_cr_is_fake(completion)) {
+		return true;
+	}
+	ctx = (void *)completion->user_ctx;
+	if (ctx == NULL || ctx->type != NVMF_URMA_CQE_CAPSULE_RX) {
+		return true;
+	}
+	slot = ctx->owner;
+	if (!spdk_urma_rx_ref_claim(&slot->rx_ref)) {
+		SPDK_ERRLOG("dropping duplicate/stale capsule receive CR user_ctx=%p\n",
+			    (void *)completion->user_ctx);
+		return false;
+	}
+	return true;
+}
+
 static int
 nvmf_urma_process_completion(const urma_cr_t *completion)
 {
@@ -2270,7 +2297,8 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 	}
 	for (uint32_t j = group->worker_index; j < transport->device->recv_jfc_count && hard_err == 0; j += stride) {
 		int count = spdk_urma_device_poll_recv_jfc(transport->device, j,
-				SPDK_COUNTOF(completions), completions);
+				SPDK_COUNTOF(completions), completions,
+				nvmf_urma_prepare_recv_cr, NULL);
 		if (count < 0) {
 			hard_err = hard_err != 0 ? hard_err : -EIO;
 			break;
@@ -2400,6 +2428,39 @@ nvmf_urma_req_complete(struct spdk_nvmf_request *req)
 	}
 }
 
+static bool
+nvmf_urma_qpair_destroy_endpoints(struct nvmf_urma_qpair *uqpair)
+{
+	bool destroyed = true;
+
+	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
+		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
+			if (uqpair->device != NULL &&
+			    uqpair->device->opts.transport_mode == URMA_TM_RC &&
+			    uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
+				(void)urma_unbind_jetty(uqpair->jettys[i]);
+			}
+			(void)urma_unimport_jetty(uqpair->target_jettys[i]);
+			uqpair->target_jettys[i] = NULL;
+		}
+		if (uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
+			if (urma_delete_jetty(uqpair->jettys[i]) != URMA_SUCCESS) {
+				destroyed = false;
+				continue;
+			}
+			uqpair->jettys[i] = NULL;
+		}
+		if (uqpair->jfrs != NULL && uqpair->jfrs[i] != NULL) {
+			if (urma_delete_jfr(uqpair->jfrs[i]) != URMA_SUCCESS) {
+				destroyed = false;
+				continue;
+			}
+			uqpair->jfrs[i] = NULL;
+		}
+	}
+	return destroyed;
+}
+
 static void
 nvmf_urma_qpair_flush(struct nvmf_urma_qpair *uqpair)
 {
@@ -2426,6 +2487,61 @@ nvmf_urma_qpair_flush(struct nvmf_urma_qpair *uqpair)
 	}
 }
 
+static bool
+nvmf_urma_qpair_quiesce_receives(struct nvmf_urma_qpair *uqpair)
+{
+	urma_cr_t completions[64];
+	uint32_t polled = 0;
+	uint64_t posted = 0;
+
+	if (uqpair->capsule_transport != SPDK_URMA_CAPSULE_TRANSPORT_URMA ||
+	    uqpair->device == NULL || uqpair->capsule_rx_slots == NULL) {
+		return nvmf_urma_qpair_drained(uqpair);
+	}
+
+	for (;;) {
+		int count = 0;
+
+		spdk_urma_device_lock_recv_jfcs(uqpair->device);
+		for (uint32_t i = 0; i < uqpair->device->recv_jfc_count && count == 0; i++) {
+			count = spdk_urma_device_poll_recv_jfc_locked(uqpair->device, i,
+					SPDK_COUNTOF(completions), completions,
+					nvmf_urma_prepare_recv_cr, NULL);
+		}
+		if (count == 0) {
+			break;
+		}
+		spdk_urma_device_unlock_recv_jfcs(uqpair->device);
+		for (int i = 0; i < count; i++) {
+			(void)nvmf_urma_process_completion(&completions[i]);
+		}
+		polled += count;
+		if (polled >= SPDK_URMA_RX_QUIESCE_BUDGET) {
+			return false;
+		}
+	}
+
+	for (uint32_t i = 0; i < uqpair->capsule_rx_count; i++) {
+		posted += spdk_urma_rx_ref_is_posted(&uqpair->capsule_rx_slots[i].rx_ref);
+	}
+	if (!TAILQ_EMPTY(&uqpair->working_reqs) ||
+	    spdk_urma_lifetime_refs(&uqpair->lifetime) != posted) {
+		spdk_urma_device_unlock_recv_jfcs(uqpair->device);
+		return false;
+	}
+
+	if (!nvmf_urma_qpair_destroy_endpoints(uqpair)) {
+		spdk_urma_device_unlock_recv_jfcs(uqpair->device);
+		return false;
+	}
+	for (uint32_t i = 0; i < uqpair->capsule_rx_count; i++) {
+		(void)spdk_urma_rx_ref_retire(&uqpair->capsule_rx_slots[i].rx_ref,
+					      &uqpair->lifetime);
+	}
+	spdk_urma_device_unlock_recv_jfcs(uqpair->device);
+	return nvmf_urma_qpair_drained(uqpair);
+}
+
 /* Teardown is legal only after every posted WR completion has finished and
  * every framework request has returned. */
 static void
@@ -2440,21 +2556,7 @@ nvmf_urma_qpair_drain_finish(struct nvmf_urma_qpair *uqpair)
 
 	assert(nvmf_urma_qpair_drained(uqpair));
 
-	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
-		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
-			if (uqpair->device != NULL &&
-			    uqpair->device->opts.transport_mode == URMA_TM_RC) {
-				urma_unbind_jetty(uqpair->jettys[i]);
-			}
-			urma_unimport_jetty(uqpair->target_jettys[i]);
-		}
-		if (uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
-			urma_delete_jetty(uqpair->jettys[i]);
-		}
-		if (uqpair->jfrs != NULL && uqpair->jfrs[i] != NULL) {
-			urma_delete_jfr(uqpair->jfrs[i]);
-		}
-	}
+	(void)nvmf_urma_qpair_destroy_endpoints(uqpair);
 	free(uqpair->target_jettys);
 	free(uqpair->jettys);
 	free(uqpair->jfrs);
@@ -2484,6 +2586,7 @@ nvmf_urma_drain_poll(void *arg)
 {
 	struct nvmf_urma_qpair *uqpair = arg;
 
+	(void)nvmf_urma_qpair_quiesce_receives(uqpair);
 	if (nvmf_urma_qpair_drained(uqpair)) {
 		nvmf_urma_qpair_drain_finish(uqpair);
 		return SPDK_POLLER_BUSY;
@@ -2520,6 +2623,7 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 	uqpair->draining = true;
 	spdk_urma_lifetime_close(&uqpair->lifetime);
 	nvmf_urma_qpair_flush(uqpair);
+	(void)nvmf_urma_qpair_quiesce_receives(uqpair);
 	uqpair->drain_deadline_tsc = spdk_get_ticks() +
 				     NVMF_URMA_DRAIN_TIMEOUT_S * spdk_get_ticks_hz();
 

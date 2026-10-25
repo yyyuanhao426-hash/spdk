@@ -236,6 +236,7 @@ struct nvme_urma_qpair;
 struct nvme_urma_rsp_rx_slot {
 	struct nvme_urma_cqe_ctx cqe;
 	struct nvme_urma_qpair *qpair;
+	struct spdk_urma_rx_ref rx_ref;
 	struct spdk_urma_capsule_rsp_frame frame;
 	urma_sge_t sge;
 	urma_jfr_wr_t wr;
@@ -680,14 +681,14 @@ nvme_urma_post_rsp_receive(struct nvme_urma_rsp_rx_slot *slot)
 	urma_jfr_wr_t *bad_wr = NULL;
 	urma_status_t status;
 
-	if (!spdk_urma_lifetime_try_get(&uqpair->lifetime)) {
+	if (!spdk_urma_rx_ref_post_begin(&slot->rx_ref, &uqpair->lifetime)) {
 		return -ESHUTDOWN;
 	}
 	status = urma_post_jetty_recv_wr(uqpair->jettys[
 			 (uint32_t)(slot - uqpair->capsule_rx_slots) % uqpair->jetty_count],
 			 &slot->wr, &bad_wr);
 	if (status != URMA_SUCCESS) {
-		spdk_urma_lifetime_put(&uqpair->lifetime);
+		spdk_urma_rx_ref_post_failed(&slot->rx_ref, &uqpair->lifetime);
 		return -EIO;
 	}
 	return 0;
@@ -1296,6 +1297,32 @@ nvme_urma_process_capsule_cr(struct nvme_urma_qpair *poller, const urma_cr_t *cr
 	return rc;
 }
 
+/* Called while the shared receive-JFC lock is still held.  Claiming here
+ * closes the otherwise unsafe window between removing a CR from the JFC and
+ * transferring its lifetime reference to the completion handler. */
+static bool
+nvme_urma_prepare_recv_cr(urma_cr_t *cr, void *ctx_arg)
+{
+	struct nvme_urma_cqe_ctx *ctx;
+	struct nvme_urma_rsp_rx_slot *slot;
+
+	(void)ctx_arg;
+	if (spdk_urma_cr_is_fake(cr)) {
+		return true;
+	}
+	ctx = (void *)cr->user_ctx;
+	if (ctx == NULL || ctx->type != NVME_URMA_CQE_CAPSULE_RX) {
+		return true;
+	}
+	slot = ctx->owner;
+	if (!spdk_urma_rx_ref_claim(&slot->rx_ref)) {
+		SPDK_ERRLOG("dropping duplicate/stale capsule receive CR user_ctx=%p\n",
+			    (void *)cr->user_ctx);
+		return false;
+	}
+	return true;
+}
+
 static int32_t
 nvme_urma_process_capsule_completions(struct nvme_urma_qpair *uqpair,
 				       uint32_t max_completions)
@@ -1333,7 +1360,8 @@ nvme_urma_process_capsule_completions(struct nvme_urma_qpair *uqpair,
 	     hard_err == 0; j++) {
 		uint32_t remaining = max_completions - completed;
 		uint32_t recv_budget = spdk_min(budget, remaining);
-		int count = spdk_urma_device_poll_recv_jfc(uqpair->device, j, recv_budget, cr);
+		int count = spdk_urma_device_poll_recv_jfc(uqpair->device, j, recv_budget, cr,
+				nvme_urma_prepare_recv_cr, NULL);
 		if (count < 0) {
 			hard_err = -EIO;
 			break;
@@ -1563,23 +1591,42 @@ nvme_urma_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 					   opts->io_queue_requests, opts->async_mode);
 }
 
+static bool
+nvme_urma_qpair_destroy_endpoints(struct nvme_urma_qpair *uqpair)
+{
+	bool destroyed = true;
+
+	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
+		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
+			if (uqpair->device != NULL && uqpair->device->opts.transport_mode == URMA_TM_RC &&
+			    uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
+				(void)urma_unbind_jetty(uqpair->jettys[i]);
+			}
+			(void)urma_unimport_jetty(uqpair->target_jettys[i]);
+			uqpair->target_jettys[i] = NULL;
+		}
+		if (uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
+			if (urma_delete_jetty(uqpair->jettys[i]) != URMA_SUCCESS) {
+				destroyed = false;
+				continue;
+			}
+			uqpair->jettys[i] = NULL;
+		}
+		if (uqpair->jfrs != NULL && uqpair->jfrs[i] != NULL) {
+			if (urma_delete_jfr(uqpair->jfrs[i]) != URMA_SUCCESS) {
+				destroyed = false;
+				continue;
+			}
+			uqpair->jfrs[i] = NULL;
+		}
+	}
+	return destroyed;
+}
+
 static void
 nvme_urma_qpair_release_transport(struct nvme_urma_qpair *uqpair)
 {
-	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
-		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
-			if (uqpair->device != NULL && uqpair->device->opts.transport_mode == URMA_TM_RC) {
-				urma_unbind_jetty(uqpair->jettys[i]);
-			}
-			urma_unimport_jetty(uqpair->target_jettys[i]);
-		}
-		if (uqpair->jettys != NULL && uqpair->jettys[i] != NULL) {
-			urma_delete_jetty(uqpair->jettys[i]);
-		}
-		if (uqpair->jfrs != NULL && uqpair->jfrs[i] != NULL) {
-			urma_delete_jfr(uqpair->jfrs[i]);
-		}
-	}
+	(void)nvme_urma_qpair_destroy_endpoints(uqpair);
 	free(uqpair->target_jettys);
 	free(uqpair->jettys);
 	free(uqpair->jfrs);
@@ -1639,13 +1686,78 @@ nvme_urma_qpair_flush(struct nvme_urma_qpair *uqpair)
 	}
 }
 
+/*
+ * udma's urma_flush_jetty() drains only the send queue.  Capsule receive WRs
+ * therefore keep one lifetime reference per posted slot until their JFR is
+ * destroyed.  Serialize with every shared receive-JFC poller, consume CRs
+ * which were already queued, and destroy the endpoint only when the remaining
+ * references are exactly those still owned by posted receive slots.
+ */
+static bool
+nvme_urma_qpair_quiesce_receives(struct nvme_urma_qpair *uqpair)
+{
+	urma_cr_t completions[64];
+	uint32_t completed = 0;
+	uint32_t polled = 0;
+	uint64_t posted = 0;
+
+	if (uqpair->capsule_transport != SPDK_URMA_CAPSULE_TRANSPORT_URMA ||
+	    uqpair->device == NULL || uqpair->capsule_rx_slots == NULL) {
+		return spdk_urma_lifetime_refs(&uqpair->lifetime) == 0;
+	}
+
+	for (;;) {
+		int count = 0;
+
+		spdk_urma_device_lock_recv_jfcs(uqpair->device);
+		for (uint32_t i = 0; i < uqpair->device->recv_jfc_count && count == 0; i++) {
+			count = spdk_urma_device_poll_recv_jfc_locked(uqpair->device, i,
+					SPDK_COUNTOF(completions), completions,
+					nvme_urma_prepare_recv_cr, NULL);
+		}
+		if (count == 0) {
+			break;
+		}
+		spdk_urma_device_unlock_recv_jfcs(uqpair->device);
+		for (int i = 0; i < count; i++) {
+			(void)nvme_urma_process_capsule_cr(uqpair, &completions[i], &completed);
+		}
+		polled += count;
+		if (polled >= SPDK_URMA_RX_QUIESCE_BUDGET) {
+			return false;
+		}
+	}
+
+	for (uint32_t i = 0; i < uqpair->capsule_rx_count; i++) {
+		posted += spdk_urma_rx_ref_is_posted(&uqpair->capsule_rx_slots[i].rx_ref);
+	}
+	if (!TAILQ_EMPTY(&uqpair->outstanding) ||
+	    spdk_urma_lifetime_refs(&uqpair->lifetime) != posted) {
+		spdk_urma_device_unlock_recv_jfcs(uqpair->device);
+		return false;
+	}
+
+	/* delete_jfr() synchronously removes this qpair's receive queue.  Only now
+	 * may its never-completed receive references be retired. */
+	if (!nvme_urma_qpair_destroy_endpoints(uqpair)) {
+		spdk_urma_device_unlock_recv_jfcs(uqpair->device);
+		return false;
+	}
+	for (uint32_t i = 0; i < uqpair->capsule_rx_count; i++) {
+		(void)spdk_urma_rx_ref_retire(&uqpair->capsule_rx_slots[i].rx_ref,
+					      &uqpair->lifetime);
+	}
+	spdk_urma_device_unlock_recv_jfcs(uqpair->device);
+	return spdk_urma_lifetime_refs(&uqpair->lifetime) == 0;
+}
+
 static void
 nvme_urma_qpair_try_disconnect_done(struct nvme_urma_qpair *uqpair)
 {
 	struct spdk_nvme_qpair *qpair = &uqpair->qpair;
 
 	if (nvme_qpair_get_state(qpair) != NVME_QPAIR_DISCONNECTING ||
-	    spdk_urma_lifetime_refs(&uqpair->lifetime) != 0) {
+	    !nvme_urma_qpair_quiesce_receives(uqpair)) {
 		return;
 	}
 	nvme_urma_qpair_release_transport(uqpair);
@@ -1709,7 +1821,7 @@ nvme_urma_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qp
 fail:
 	nvme_urma_lifetime_close(uqpair);
 	nvme_urma_qpair_flush(uqpair);
-	if (spdk_urma_lifetime_refs(&uqpair->lifetime) == 0) {
+	if (nvme_urma_qpair_quiesce_receives(uqpair)) {
 		nvme_urma_qpair_release_transport(uqpair);
 	} else {
 		SPDK_ERRLOG("qpair %u connect cleanup quarantined with refs=%" PRIu64 "\n",
@@ -1739,7 +1851,7 @@ nvme_urma_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 	(void)nvme_urma_drain_queued_responses(uqpair, UINT32_MAX);
 	nvme_urma_qpair_abort_reqs(qpair, qpair->abort_dnr);
 	nvme_urma_qpair_flush(uqpair);
-	if (spdk_urma_lifetime_refs(&uqpair->lifetime) != 0) {
+	if (!nvme_urma_qpair_quiesce_receives(uqpair)) {
 		SPDK_ERRLOG("refusing to delete qpair %u with refs=%" PRIu64 "\n",
 			    qpair->id, spdk_urma_lifetime_refs(&uqpair->lifetime));
 		return -EBUSY;
