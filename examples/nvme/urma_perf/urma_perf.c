@@ -463,8 +463,9 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	(void)cb_ctx;
 	(void)trid;
 	opts->num_io_queues = g_num_workers;
-	opts->io_queue_size = g_batch_size + 1;
-	opts->io_queue_requests = spdk_max(g_batch_size * 2, 32U);
+	/* Keep SPDK's defaults so controller initialization can clamp the queue
+	 * limits to the target's MQES. Worker qpairs are sized for namespace
+	 * splitting after identify data is available. */
 	opts->keep_alive_timeout_ms = 0;
 	return true;
 }
@@ -777,12 +778,56 @@ worker_next_lba(struct worker *worker)
 	return lba;
 }
 
+static uint32_t
+max_children_per_io(void)
+{
+	uint64_t lba_count = g_io_size / spdk_nvme_ns_get_sector_size(g_ns);
+	uint64_t stripe_lbas = spdk_nvme_ns_get_optimal_io_boundary(g_ns);
+
+	if (stripe_lbas == 0) {
+		return 1;
+	}
+
+	/* Account for the worst-case starting offset within a stripe. */
+	return (uint32_t)((lba_count + 2 * stripe_lbas - 2) / stripe_lbas);
+}
+
+static int
+configure_io_qpair_opts(struct spdk_nvme_io_qpair_opts *opts, uint32_t *max_children)
+{
+	uint64_t desired_queue_size, request_count;
+
+	*max_children = max_children_per_io();
+	desired_queue_size = (uint64_t)g_batch_size * *max_children + 1;
+	request_count = (uint64_t)g_batch_size * (*max_children + 1U);
+
+	/* io_queue_size includes one entry that the URMA transport reserves. */
+	if (desired_queue_size > UINT32_MAX || request_count > UINT32_MAX) {
+		fprintf(stderr, "Requested batch and I/O split require too many qpair resources: "
+			"entries=%" PRIu64 " requests=%" PRIu64 "\n",
+			desired_queue_size, request_count);
+		return -ERANGE;
+	}
+
+	/* Preserve the controller/target queue limit learned during attach. */
+	opts->io_queue_size = (uint32_t)spdk_min(desired_queue_size,
+				(uint64_t)opts->io_queue_size);
+	if (opts->io_queue_size <= *max_children) {
+		fprintf(stderr, "Controller queue limit %u cannot hold all %u child requests "
+			"of one split I/O\n", opts->io_queue_size, *max_children);
+		return -ERANGE;
+	}
+	/* A split I/O consumes one parent request plus one request per child. */
+	opts->io_queue_requests = (uint32_t)spdk_max(request_count, 32U);
+	return 0;
+}
+
 static int
 work_fn(void *arg)
 {
 	struct worker *worker = arg;
 	struct spdk_nvme_io_qpair_opts qpair_opts;
-	uint32_t i;
+	uint32_t i, max_children;
 
 	/* Modified By Yida: posix(新语义) 的 worker 线程做 cuMemcpy，先把 CUDA
 	 * context 设为当前线程的（多线程共享同一 context，driver 内部串行化） */
@@ -796,9 +841,15 @@ work_fn(void *arg)
 	}
 
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(g_ctrlr, &qpair_opts, sizeof(qpair_opts));
-	qpair_opts.io_queue_size = g_batch_size + 1;
-	qpair_opts.io_queue_requests = spdk_max(g_batch_size * 2, 32U);
-	worker->qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ctrlr, &qpair_opts, sizeof(qpair_opts));
+	if (configure_io_qpair_opts(&qpair_opts, &max_children) == 0) {
+		printf("Worker %u: qpair entries=%u requests=%u max_children_per_io=%u\n",
+		       worker->id, qpair_opts.io_queue_size, qpair_opts.io_queue_requests,
+		       max_children);
+		worker->qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ctrlr, &qpair_opts,
+				sizeof(qpair_opts));
+	} else {
+		atomic_store_explicit(&g_failed, true, memory_order_release);
+	}
 	if (worker->qpair == NULL) {
 		fprintf(stderr, "Worker %u could not allocate an I/O qpair\n", worker->id);
 		atomic_store_explicit(&g_failed, true, memory_order_release);
