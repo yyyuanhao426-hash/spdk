@@ -6,6 +6,9 @@
 #ifndef __NVME_PCIE_INTERNAL_H__
 #define __NVME_PCIE_INTERNAL_H__
 
+#include "spdk/trace.h"
+#include "spdk_internal/trace_defs.h"
+
 /*
  * Number of completion queue entries to process before ringing the
  *  completion queue doorbell.
@@ -200,6 +203,10 @@ struct nvme_pcie_qpair {
 
 	struct spdk_nvme_cmd *sq_vaddr;
 	struct spdk_nvme_cpl *cq_vaddr;
+
+	/* P99 diagnostics, updated only while CQ observation tracing is enabled. */
+	uint64_t p99_last_empty_tick;
+	uint64_t p99_last_poll_end_tick;
 };
 
 static inline struct nvme_pcie_qpair *
@@ -272,6 +279,8 @@ nvme_pcie_qpair_ring_sq_doorbell(struct spdk_nvme_qpair *qpair)
 		spdk_mmio_write_4(pqpair->sq_tdbl, pqpair->sq_tail);
 		g_thread_mmio_ctrlr = NULL;
 	}
+	spdk_trace_record(TRACE_NVME_PCIE_SQ_RING, 0, 0, 0,
+			  (uintptr_t)qpair, (uint32_t)pqpair->sq_tail, (uint32_t)need_mmio);
 }
 
 static inline void

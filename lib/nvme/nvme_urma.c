@@ -1061,7 +1061,8 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 		}
 		printf("URMA_SLOW_IO trace_seq=%" PRIu64 " qid=%u cid=%u opcode=%u "
 		       "lba=%" PRIu64 " blocks=%u roundtrip_us=%" PRIu64 " "
-		       "completion_mono_ns=%" PRIu64 " target_valid=%u target_lcore=%u "
+		       "completion_mono_ns=%" PRIu64 " initiator_submit_tick=%" PRIu64 " "
+		       "initiator_complete_tick=%" PRIu64 " target_valid=%u target_lcore=%u "
 		       "target_ticks_hz=%" PRIu64 " target_rx_tick=%" PRIu64 " "
 		       "target_buffer_tick=%" PRIu64 " target_exec_tick=%" PRIu64 " "
 		       "target_bdev_cpl_tick=%" PRIu64 " target_data_post_tick=%" PRIu64 " "
@@ -1071,7 +1072,8 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 		       "data_us=%" PRIu64 " pre_send_us=%" PRIu64 " "
 		       "release_us=%" PRIu64 " outside_us=%" PRIu64 " residual_us=%" PRIu64 "\n",
 		       ureq->trace_seq, uqpair->qpair.id, cmd->cid, cmd->opc, lba, blocks,
-		       roundtrip_us, completion_mono_ns, valid ? 1u : 0u, stage->target_lcore,
+		       roundtrip_us, completion_mono_ns, ureq->submit_tick, t_total1,
+		       valid ? 1u : 0u, stage->target_lcore,
 		       stage->target_ticks_hz, stage->rx_tick, stage->buffer_tick, stage->exec_tick,
 		       stage->bdev_cpl_tick, stage->data_post_tick, stage->data_cpl_tick, target_us,
 		       rx_buffer_us, buffer_exec_us, bdev_us, bdev_post_us, data_us,

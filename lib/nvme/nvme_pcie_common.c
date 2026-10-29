@@ -676,7 +676,7 @@ nvme_pcie_qpair_submit_tracker(struct spdk_nvme_qpair *qpair, struct nvme_tracke
 	spdk_trace_record(TRACE_NVME_PCIE_SUBMIT, qpair->id, 0, (uintptr_t)req, req->cb_arg,
 			  (uint32_t)req->cmd.cid, (uint32_t)req->cmd.opc,
 			  req->cmd.cdw10, req->cmd.cdw11, req->cmd.cdw12,
-			  pqpair->qpair.queue_depth);
+			  pqpair->qpair.queue_depth, (uintptr_t)qpair);
 
 	if (req->cmd.fuse) {
 		/*
@@ -721,7 +721,8 @@ nvme_pcie_qpair_complete_tracker(struct spdk_nvme_qpair *qpair, struct nvme_trac
 	req = tr->req;
 
 	spdk_trace_record(TRACE_NVME_PCIE_COMPLETE, qpair->id, 0, (uintptr_t)req, req->cb_arg,
-			  (uint32_t)req->cmd.cid, (uint32_t)cpl->status_raw, pqpair->qpair.queue_depth);
+			  (uint32_t)req->cmd.cid, (uint32_t)cpl->status_raw, pqpair->qpair.queue_depth,
+			  (uintptr_t)qpair);
 
 	assert(req != NULL);
 
@@ -881,6 +882,8 @@ nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	uint8_t			 next_phase;
 	bool			 next_is_valid = false;
 	int			 rc;
+	bool p99_trace = spdk_trace_tpoint_enabled(TRACE_NVME_PCIE_CQ_OBSERVE);
+	uint64_t p99_poll_enter = p99_trace ? spdk_get_ticks() : 0;
 
 	if (spdk_unlikely(pqpair->pcie_state == NVME_PCIE_QPAIR_FAILED)) {
 		return -ENXIO;
@@ -924,12 +927,24 @@ nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		max_completions = pqpair->max_completions_cap;
 	}
 
+	if (p99_trace && pqpair->p99_last_poll_end_tick != 0 && qpair->queue_depth != 0 &&
+	    p99_poll_enter - pqpair->p99_last_poll_end_tick >= spdk_get_ticks_hz() / 20000) {
+		spdk_trace_record_tsc(p99_poll_enter, TRACE_NVME_PCIE_POLL_GAP, 0, 0, 0,
+				      (uintptr_t)qpair, pqpair->p99_last_poll_end_tick,
+				      p99_poll_enter, qpair->queue_depth);
+	}
 	pqpair->stat->polls++;
 
 	while (1) {
 		cpl = &pqpair->cpl[pqpair->cq_head];
 
+		uint64_t p99_check_tick = p99_trace ? spdk_get_ticks() : 0;
+
 		if (!next_is_valid && cpl->status.p != pqpair->flags.phase) {
+			if (p99_trace) {
+				/* Stamp before the phase load: preemption must not move an empty observation later. */
+				pqpair->p99_last_empty_tick = p99_check_tick;
+			}
 			break;
 		}
 
@@ -966,6 +981,10 @@ nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		pqpair->sq_head = cpl->sqhd;
 
 		if (tr->req) {
+			spdk_trace_record(TRACE_NVME_PCIE_CQ_OBSERVE, 0, 0, 0,
+					  (uintptr_t)tr->req, (uintptr_t)qpair, (uint32_t)cpl->cid,
+					  pqpair->p99_last_empty_tick, p99_poll_enter,
+					  pqpair->p99_last_poll_end_tick);
 			/* Prefetch the req's STAILQ_ENTRY since we'll need to access it
 			 * as part of putting the req back on the qpair's free list.
 			 */
@@ -1033,6 +1052,12 @@ nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		pqpair->flags.has_pending_vtophys_failures = 0;
 	}
 
+	if (p99_trace) {
+		pqpair->p99_last_poll_end_tick = spdk_get_ticks();
+	} else {
+		pqpair->p99_last_poll_end_tick = 0;
+		pqpair->p99_last_empty_tick = 0;
+	}
 	return num_completions;
 }
 
@@ -1915,6 +1940,9 @@ nvme_pcie_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	tr = TAILQ_FIRST(&pqpair->free_tr);
 
 	if (tr == NULL) {
+		spdk_trace_record(TRACE_NVME_PCIE_REQ_QUEUED, 0, 0, 0,
+				  (uintptr_t)req, (uintptr_t)qpair, (uintptr_t)req->cb_arg,
+				  qpair->queue_depth);
 		pqpair->stat->queued_requests++;
 		/* Inform the upper layer to try again later. */
 		rc = -EAGAIN;
@@ -2090,7 +2118,8 @@ nvme_pcie_trace(void)
 				{ "dw10", SPDK_TRACE_ARG_TYPE_PTR, 4 },
 				{ "dw11", SPDK_TRACE_ARG_TYPE_PTR, 4 },
 				{ "dw12", SPDK_TRACE_ARG_TYPE_PTR, 4 },
-				{ "qd", SPDK_TRACE_ARG_TYPE_INT, 4 }
+				{ "qd", SPDK_TRACE_ARG_TYPE_INT, 4 },
+				{ "qpair", SPDK_TRACE_ARG_TYPE_PTR, 8 }
 			}
 		},
 		{
@@ -2099,11 +2128,29 @@ nvme_pcie_trace(void)
 			{	{ "ctx", SPDK_TRACE_ARG_TYPE_PTR, 8 },
 				{ "cid", SPDK_TRACE_ARG_TYPE_INT, 4 },
 				{ "cpl", SPDK_TRACE_ARG_TYPE_PTR, 4 },
-				{ "qd", SPDK_TRACE_ARG_TYPE_INT, 4 }
+				{ "qd", SPDK_TRACE_ARG_TYPE_INT, 4 },
+				{ "qpair", SPDK_TRACE_ARG_TYPE_PTR, 8 }
 			}
 		},
 	};
 
+	struct spdk_trace_tpoint_opts p99_opts[] = {
+		{ "NVME_PCIE_SQ_RING", TRACE_NVME_PCIE_SQ_RING, OWNER_TYPE_NONE, OBJECT_NONE, 0,
+		  {{ "qpair", SPDK_TRACE_ARG_TYPE_PTR, 8 }, { "tail", SPDK_TRACE_ARG_TYPE_INT, 4 },
+		   { "mmio", SPDK_TRACE_ARG_TYPE_INT, 4 }} },
+		{ "NVME_PCIE_CQ_OBSERVE", TRACE_NVME_PCIE_CQ_OBSERVE, OWNER_TYPE_NONE, OBJECT_NONE, 0,
+		  {{ "req", SPDK_TRACE_ARG_TYPE_PTR, 8 }, { "qpair", SPDK_TRACE_ARG_TYPE_PTR, 8 },
+		   { "cid", SPDK_TRACE_ARG_TYPE_INT, 4 }, { "last_empty", SPDK_TRACE_ARG_TYPE_INT, 8 },
+		   { "poll_enter", SPDK_TRACE_ARG_TYPE_INT, 8 }, { "prev_poll_end", SPDK_TRACE_ARG_TYPE_INT, 8 }} },
+		{ "NVME_PCIE_POLL_GAP", TRACE_NVME_PCIE_POLL_GAP, OWNER_TYPE_NONE, OBJECT_NONE, 0,
+		  {{ "qpair", SPDK_TRACE_ARG_TYPE_PTR, 8 }, { "prev_end", SPDK_TRACE_ARG_TYPE_INT, 8 },
+		   { "enter", SPDK_TRACE_ARG_TYPE_INT, 8 }, { "qd", SPDK_TRACE_ARG_TYPE_INT, 4 }} },
+		{ "NVME_PCIE_REQ_QUEUED", TRACE_NVME_PCIE_REQ_QUEUED, OWNER_TYPE_NONE, OBJECT_NONE, 0,
+		  {{ "req", SPDK_TRACE_ARG_TYPE_PTR, 8 }, { "qpair", SPDK_TRACE_ARG_TYPE_PTR, 8 },
+		   { "ctx", SPDK_TRACE_ARG_TYPE_PTR, 8 }, { "qd", SPDK_TRACE_ARG_TYPE_INT, 4 }} },
+	};
+
+	spdk_trace_register_description_ext(p99_opts, SPDK_COUNTOF(p99_opts));
 	spdk_trace_register_object(OBJECT_NVME_PCIE_REQ, 'p');
 	spdk_trace_register_owner_type(OWNER_TYPE_NVME_PCIE_QP, 'q');
 	spdk_trace_register_description_ext(opts, SPDK_COUNTOF(opts));

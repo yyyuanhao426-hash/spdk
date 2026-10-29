@@ -77,10 +77,18 @@ struct gpu_allocation {
 
 struct worker;
 
+#define URMA_PARENT_TRACE_CAPACITY (1U << 20)
+struct parent_trace_record {
+	uint64_t lba;
+	uint64_t submit_tick;
+	uint64_t complete_tick;
+};
+
 struct io_task {
 	struct worker *worker;
 	void *buf;
 	uint64_t submit_tsc;
+	uint64_t lba;
 	bool write;
 	bool in_flight;
 	struct spdk_nvme_ns_cmd_ext_io_opts io_opts;
@@ -114,6 +122,10 @@ struct worker {
 	uint64_t finish_tsc;
 	uint32_t outstanding;
 	bool measuring;
+	struct parent_trace_record *parent_trace;
+	uint64_t parent_trace_count;
+	uint64_t parent_trace_dropped;
+	uint16_t parent_trace_qid;
 };
 
 struct cuda_pin_handle {
@@ -529,7 +541,8 @@ io_complete(void *arg, const struct spdk_nvme_cpl *completion)
 {
 	struct io_task *task = arg;
 	struct worker *worker = task->worker;
-	uint64_t latency = spdk_get_ticks() - task->submit_tsc;
+	uint64_t complete_tick = spdk_get_ticks();
+	uint64_t latency = complete_tick - task->submit_tsc;
 
 	if (spdk_nvme_cpl_is_error(completion)) {
 		spdk_nvme_qpair_print_completion_ext(worker->qpair, completion,
@@ -544,6 +557,17 @@ io_complete(void *arg, const struct spdk_nvme_cpl *completion)
 			atomic_store_explicit(&g_failed, true, memory_order_release);
 		}
 		if (worker->measuring) {
+			if (worker->parent_trace != NULL) {
+				if (worker->parent_trace_count < URMA_PARENT_TRACE_CAPACITY) {
+					struct parent_trace_record *rec = &worker->parent_trace[worker->parent_trace_count++];
+
+					rec->lba = task->lba;
+					rec->submit_tick = task->submit_tsc;
+					rec->complete_tick = complete_tick;
+				} else {
+					worker->parent_trace_dropped++;
+				}
+			}
 			worker->completed++;
 			worker->latency_tsc += latency;
 			worker->min_latency_tsc = spdk_min(worker->min_latency_tsc, latency);
@@ -567,6 +591,7 @@ submit_io(struct worker *worker, struct io_task *task, bool write, uint64_t lba)
 		return -EIO;
 	}
 	task->write = write;
+	task->lba = lba;
 	task->submit_tsc = spdk_get_ticks();
 	task->in_flight = true;
 	worker->outstanding++;
@@ -953,6 +978,7 @@ out:
 		worker->region = NULL;
 	}
 	if (worker->qpair != NULL) {
+		worker->parent_trace_qid = spdk_nvme_qpair_get_id(worker->qpair);
 		spdk_nvme_ctrlr_free_io_qpair(worker->qpair);
 		worker->qpair = NULL;
 	}
@@ -1293,6 +1319,19 @@ prepare_workers(void)
 		worker->min_latency_tsc = UINT64_MAX;
 		worker->tasks = calloc(g_batch_size, sizeof(*worker->tasks));
 		worker->histogram = spdk_histogram_data_alloc();
+		if (getenv("URMA_PERF_PARENT_TRACE") != NULL &&
+		    strcmp(getenv("URMA_PERF_PARENT_TRACE"), "1") == 0) {
+			size_t bytes = URMA_PARENT_TRACE_CAPACITY * sizeof(*worker->parent_trace);
+
+			worker->parent_trace = calloc(1, bytes);
+			if (worker->parent_trace == NULL) {
+				return -ENOMEM;
+			}
+			/* Prefault before measurement; avoid faults in the completion path. */
+			for (size_t page = 0; page < bytes; page += 4096) {
+				((volatile uint8_t *)worker->parent_trace)[page] = 0;
+			}
+		}
 		if (worker->tasks == NULL || worker->histogram == NULL) {
 			return -ENOMEM;
 		}
@@ -1404,9 +1443,34 @@ cleanup_workers(void)
 		}
 		spdk_histogram_data_free(g_workers[i].histogram);
 		free(g_workers[i].tasks);
+		free(g_workers[i].parent_trace);
 	}
 	free(g_workers);
 	g_workers = NULL;
+}
+
+static void
+dump_parent_trace(void)
+{
+	uint32_t blocks = g_io_size / spdk_nvme_ns_get_sector_size(g_ns);
+
+	for (uint32_t i = 0; i < g_num_workers; i++) {
+		struct worker *worker = &g_workers[i];
+		uint16_t qid = worker->parent_trace_qid;
+
+		if (worker->parent_trace == NULL) {
+			continue;
+		}
+		printf("URMA_PARENT_META worker=%u qid=%u count=%" PRIu64 " dropped=%" PRIu64 " ticks_hz=%" PRIu64 "\n",
+		       i, qid, worker->parent_trace_count, worker->parent_trace_dropped, spdk_get_ticks_hz());
+		for (uint64_t j = 0; j < worker->parent_trace_count; j++) {
+			const struct parent_trace_record *rec = &worker->parent_trace[j];
+
+			printf("URMA_PARENT_IO worker=%u qid=%u seq=%" PRIu64 " lba=%" PRIu64 " blocks=%u "
+			       "submit_tick=%" PRIu64 " complete_tick=%" PRIu64 "\n",
+			       i, qid, j + 1, rec->lba, blocks, rec->submit_tick, rec->complete_tick);
+		}
+	}
 }
 
 static int
@@ -1483,6 +1547,7 @@ main(int argc, char **argv)
 	if (g_start_tsc != 0) {
 		print_results();
 	}
+	dump_parent_trace();
 	/* Modified By Yida: dump per-phase timing breakdown for diagnosis */
 	spdk_nvme_urma_dump_timing();
 	spdk_nvme_urma_get_memory_stats(&memory_stats);

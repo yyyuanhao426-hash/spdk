@@ -574,6 +574,13 @@ info "LD_LIBRARY_PATH=$LIBDIR  SPDK_URMA_DEV_NAME=$DEVNAME  core mask=$COREMASK$
 # -I 需要在子系统初始化前设 iobuf 池（iobuf_set_options 仅 SPDK_RPC_STARTUP 可调），
 # 所以先以 --wait-for-rpc 启动，RPC 配完池子再 framework_start_init
 TGT_ARGS=(-m "$COREMASK")
+if [ -n "${SPDK_URMA_TRACE_ENTRIES:-}" ]; then
+    case "$SPDK_URMA_TRACE_ENTRIES" in *[!0-9]*|'') abort "invalid SPDK_URMA_TRACE_ENTRIES" ;; esac
+    [ "$SPDK_URMA_TRACE_ENTRIES" -gt 0 ] && \
+        [ $((SPDK_URMA_TRACE_ENTRIES & (SPDK_URMA_TRACE_ENTRIES - 1))) -eq 0 ] \
+        || abort "SPDK_URMA_TRACE_ENTRIES must be a positive power of two"
+    TGT_ARGS+=(--num-trace-entries "$SPDK_URMA_TRACE_ENTRIES")
+fi
 [ -n "$IOBUF_SPEC" ] && TGT_ARGS+=(--wait-for-rpc)
 nohup env $( [ -n "$DUMP_SEC" ] && echo "SPDK_URMA_TARGET_DUMP_SEC=$DUMP_SEC" ) \
     ./build/bin/nvmf_tgt "${TGT_ARGS[@]}" > "$TGT_LOG" 2>&1 &

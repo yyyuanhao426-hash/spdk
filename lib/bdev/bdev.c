@@ -1010,6 +1010,8 @@ bdev_queue_nomem_io_head(struct spdk_bdev_shared_resource *shared_resource,
 					   (int64_t)shared_resource->io_outstanding - NOMEM_THRESHOLD_COUNT);
 
 	assert(state != BDEV_IO_RETRY_STATE_INVALID);
+	spdk_trace_record(TRACE_BDEV_IO_NOMEM, bdev_io->internal.ch->trace_id,
+			  0, (uintptr_t)bdev_io, (uint32_t)state, (uint64_t)shared_resource->io_outstanding);
 	bdev_io->internal.retry_state = state;
 	TAILQ_INSERT_HEAD(&shared_resource->nomem_io, bdev_io, internal.link);
 }
@@ -1023,6 +1025,8 @@ bdev_queue_nomem_io_tail(struct spdk_bdev_shared_resource *shared_resource,
 	assert(!TAILQ_EMPTY(&shared_resource->nomem_io));
 
 	assert(state != BDEV_IO_RETRY_STATE_INVALID);
+	spdk_trace_record(TRACE_BDEV_IO_NOMEM, bdev_io->internal.ch->trace_id,
+			  0, (uintptr_t)bdev_io, (uint32_t)state, (uint64_t)shared_resource->io_outstanding);
 	bdev_io->internal.retry_state = state;
 	TAILQ_INSERT_TAIL(&shared_resource->nomem_io, bdev_io, internal.link);
 }
@@ -11591,6 +11595,12 @@ bdev_trace(void)
 	};
 
 
+	struct spdk_trace_tpoint_opts p99_opts[] = {
+		{ "BDEV_IO_NOMEM", TRACE_BDEV_IO_NOMEM, OWNER_TYPE_BDEV, OBJECT_BDEV_IO, 0,
+		  {{ "state", SPDK_TRACE_ARG_TYPE_INT, 4 }, { "outstanding", SPDK_TRACE_ARG_TYPE_INT, 8 }} },
+	};
+
+	spdk_trace_register_description_ext(p99_opts, SPDK_COUNTOF(p99_opts));
 	spdk_trace_register_owner_type(OWNER_TYPE_BDEV, 'b');
 	spdk_trace_register_object(OBJECT_BDEV_IO, 'i');
 	spdk_trace_register_description_ext(opts, SPDK_COUNTOF(opts));

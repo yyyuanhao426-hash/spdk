@@ -12,6 +12,8 @@
 #include "spdk/nvmf_transport.h"
 #include "spdk/string.h"
 #include "spdk/json.h"
+#include "spdk/trace.h"
+#include "spdk_internal/trace_defs.h"
 #include "spdk_internal/urma_lifetime.h"
 
 #include "nvmf_internal.h"
@@ -1935,6 +1937,27 @@ nvmf_urma_handle_capsule(struct nvmf_urma_qpair *uqpair,
 		rec->opcode = capsule->cmd.opc;
 		ureq->trace_idx = idx;
 	}
+	if (spdk_trace_tpoint_enabled(TRACE_URMA_P99_BEGIN) &&
+	    capsule->cmd.opc == SPDK_NVME_OPC_READ && ureq->stage_trace.trace_seq != 0) {
+		static __thread uint64_t last_clock_tick;
+		uint64_t lba = (uint64_t)capsule->cmd.cdw10 | ((uint64_t)capsule->cmd.cdw11 << 32);
+
+		spdk_trace_record_tsc(t_parse0, TRACE_URMA_P99_BEGIN, 0, 0, 0,
+				      (uintptr_t)&ureq->req, capsule->trace_seq, hdr->qid,
+				      (uint32_t)capsule->cmd.cid, lba,
+				      (capsule->cmd.cdw12 & 0xffffu) + 1);
+		if (t_parse0 - last_clock_tick >= spdk_get_ticks_hz() / 10) {
+			struct timespec mono;
+			uint64_t before = spdk_get_ticks(), after;
+
+			clock_gettime(CLOCK_MONOTONIC, &mono);
+			after = spdk_get_ticks();
+			spdk_trace_record_tsc(before + (after - before) / 2, TRACE_URMA_P99_CLOCK,
+					      0, 0, 0, (uint64_t)mono.tv_sec * 1000000000 + mono.tv_nsec,
+					      after - before);
+			last_clock_tick = after;
+		}
+	}
 	ureq->cmd.nvme_cmd = capsule->cmd;
 	ureq->remote_data = capsule->data;
 	ureq->req.raw = 0;
@@ -2368,6 +2391,11 @@ nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 	const struct spdk_nvmf_request *req = &ureq->req;
 	uint64_t hz = stage->target_ticks_hz;
 
+	if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ && req->p99_trace_enabled) {
+		spdk_trace_record(TRACE_URMA_P99_END, 0, 0, 0,
+				  (uintptr_t)req, stage->trace_seq, stage->flags);
+	}
+
 	/* Log after data completion, outside this request's measured bdev/data path.
 	 * These durations include SPDK scheduling; they are not pure SSD service time. */
 	if (req->p99_trace_enabled && req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ &&
@@ -2442,6 +2470,10 @@ nvmf_urma_req_complete(struct spdk_nvmf_request *req)
 	}
 	if (ureq->stage_trace.flags & SPDK_URMA_STAGE_TRACE_REQUESTED) {
 		ureq->stage_trace.bdev_cpl_tick = now;
+		if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ) {
+			spdk_trace_record_tsc(now, TRACE_URMA_P99_BDEV_DONE, 0, 0, 0,
+					      (uintptr_t)req, ureq->stage_trace.trace_seq);
+		}
 	}
 	if (spdk_unlikely(spdk_urma_lifetime_is_closing(&uqpair->lifetime))) {
 		nvmf_urma_release_req(ureq);
@@ -2751,3 +2783,24 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_urma = {
 
 SPDK_NVMF_TRANSPORT_REGISTER(urma, &spdk_nvmf_transport_urma);
 SPDK_LOG_REGISTER_COMPONENT(nvmf_urma)
+
+static void
+nvmf_urma_p99_trace(void)
+{
+	struct spdk_trace_tpoint_opts opts[] = {
+		{ "URMA_P99_BEGIN", TRACE_URMA_P99_BEGIN, OWNER_TYPE_NONE, OBJECT_NONE, 0,
+		  {{ "req", SPDK_TRACE_ARG_TYPE_PTR, 8 }, { "seq", SPDK_TRACE_ARG_TYPE_INT, 8 },
+		   { "qid", SPDK_TRACE_ARG_TYPE_INT, 4 }, { "cid", SPDK_TRACE_ARG_TYPE_INT, 4 },
+		   { "lba", SPDK_TRACE_ARG_TYPE_INT, 8 }, { "blocks", SPDK_TRACE_ARG_TYPE_INT, 4 }} },
+		{ "URMA_P99_BDEV_DONE", TRACE_URMA_P99_BDEV_DONE, OWNER_TYPE_NONE, OBJECT_NONE, 0,
+		  {{ "req", SPDK_TRACE_ARG_TYPE_PTR, 8 }, { "seq", SPDK_TRACE_ARG_TYPE_INT, 8 }} },
+		{ "URMA_P99_END", TRACE_URMA_P99_END, OWNER_TYPE_NONE, OBJECT_NONE, 0,
+		  {{ "req", SPDK_TRACE_ARG_TYPE_PTR, 8 }, { "seq", SPDK_TRACE_ARG_TYPE_INT, 8 },
+		   { "flags", SPDK_TRACE_ARG_TYPE_INT, 4 }} },
+		{ "URMA_P99_CLOCK", TRACE_URMA_P99_CLOCK, OWNER_TYPE_NONE, OBJECT_NONE, 0,
+		  {{ "mono_ns", SPDK_TRACE_ARG_TYPE_INT, 8 }, { "bracket_ticks", SPDK_TRACE_ARG_TYPE_INT, 8 }} },
+	};
+
+	spdk_trace_register_description_ext(opts, SPDK_COUNTOF(opts));
+}
+SPDK_TRACE_REGISTER_FN(nvmf_urma_p99_trace, "urma_p99", TRACE_GROUP_URMA_P99)
