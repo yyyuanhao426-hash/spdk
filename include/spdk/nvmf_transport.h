@@ -116,8 +116,17 @@ struct spdk_nvmf_request {
 	uint64_t timeout_tsc;
 	uint32_t			orig_nsid;
 	STAILQ_ENTRY(spdk_nvmf_request)	reservation_link;
+	/* URMA P99 v2: target-local ticks for the read bdev path. */
+	uint64_t			p99_read_enter_tick;
+	uint64_t			p99_read_submit_tick;
+	uint64_t			p99_read_submit_return_tick;
+	uint64_t			p99_read_callback_tick;
+	uint64_t			p99_read_wait_start_tick;
+	uint64_t			p99_read_wait_ticks;
+	uint32_t			p99_read_enomem_count;
+	uint32_t			p99_trace_enabled;
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 752, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 808, "Incorrect size");
 
 enum spdk_nvmf_qpair_state {
 	SPDK_NVMF_QPAIR_UNINITIALIZED = 0,

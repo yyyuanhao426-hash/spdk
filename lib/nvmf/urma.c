@@ -1903,8 +1903,17 @@ nvmf_urma_handle_capsule(struct nvmf_urma_qpair *uqpair,
 	ureq->exec_tick = 0;
 	ureq->trace_idx = UINT32_MAX;
 	memset(&ureq->stage_trace, 0, sizeof(ureq->stage_trace));
+	ureq->req.p99_read_enter_tick = 0;
+	ureq->req.p99_read_submit_tick = 0;
+	ureq->req.p99_read_submit_return_tick = 0;
+	ureq->req.p99_read_callback_tick = 0;
+	ureq->req.p99_read_wait_start_tick = 0;
+	ureq->req.p99_read_wait_ticks = 0;
+	ureq->req.p99_read_enomem_count = 0;
+	ureq->req.p99_trace_enabled = 0;
 	if ((capsule->trace_flags & SPDK_URMA_STAGE_TRACE_REQUESTED) != 0 &&
 	    capsule->trace_seq != 0) {
+		ureq->req.p99_trace_enabled = 1;
 		ureq->stage_trace.trace_seq = capsule->trace_seq;
 		ureq->stage_trace.target_ticks_hz = spdk_get_ticks_hz();
 		ureq->stage_trace.rx_tick = t_parse0;
@@ -2355,6 +2364,36 @@ nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 {
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
 	uint64_t t_rel0 = spdk_get_ticks(); /* Modified By Yida(v3): release start */
+	const struct spdk_urma_stage_trace *stage = &ureq->stage_trace;
+	const struct spdk_nvmf_request *req = &ureq->req;
+	uint64_t hz = stage->target_ticks_hz;
+
+	/* Log after data completion, outside this request's measured bdev/data path.
+	 * These durations include SPDK scheduling; they are not pure SSD service time. */
+	if (req->p99_trace_enabled && req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ &&
+	    (stage->flags & SPDK_URMA_STAGE_TRACE_COMPLETE) && hz != 0 &&
+	    stage->exec_tick != 0 && req->p99_read_callback_tick != 0 &&
+	    stage->exec_tick <= req->p99_read_enter_tick &&
+	    req->p99_read_enter_tick <= req->p99_read_submit_tick &&
+	    req->p99_read_submit_tick <= req->p99_read_submit_return_tick &&
+	    req->p99_read_submit_tick <= req->p99_read_callback_tick &&
+	    req->p99_read_callback_tick <= stage->bdev_cpl_tick &&
+	    (stage->bdev_cpl_tick - stage->exec_tick) >= (hz / 2500)) {
+		fprintf(stderr, "URMA_BDEV_DETAIL trace_seq=%" PRIu64 " qid=%u cid=%u "
+		       "bdev_us=%" PRIu64 " exec_to_read_us=%" PRIu64 " "
+		       "read_to_submit_us=%" PRIu64 " submit_call_us=%" PRIu64 " "
+		       "submit_to_callback_us=%" PRIu64 " callback_to_complete_us=%" PRIu64 " "
+		       "enomem_wait_us=%" PRIu64 " enomem_count=%u\n",
+		       stage->trace_seq, uqpair->qpair.qid, req->cmd->nvme_cmd.cid,
+		       (stage->bdev_cpl_tick - stage->exec_tick) * 1000000 / hz,
+		       (req->p99_read_enter_tick - stage->exec_tick) * 1000000 / hz,
+		       (req->p99_read_submit_tick - req->p99_read_enter_tick) * 1000000 / hz,
+		       (req->p99_read_submit_return_tick - req->p99_read_submit_tick) * 1000000 / hz,
+		       (req->p99_read_callback_tick - req->p99_read_submit_tick) * 1000000 / hz,
+		       (stage->bdev_cpl_tick - req->p99_read_callback_tick) * 1000000 / hz,
+		       req->p99_read_wait_ticks * 1000000 / hz,
+		       req->p99_read_enomem_count);
+	}
 	/* Modified By Yida: if local_region was cached, keep it cached for future I/O reuse */
 	if (ureq->local_region != NULL && ureq->cache_entry == NULL &&
 	    !ureq->local_region_external) {

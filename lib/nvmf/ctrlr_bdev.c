@@ -23,6 +23,13 @@
 
 #include "spdk/log.h"
 
+static inline bool
+nvmf_bdev_p99_trace_enabled(struct spdk_nvmf_request *req)
+{
+	return req->qpair->transport->ops->type == SPDK_NVME_TRANSPORT_URMA &&
+	       req->p99_trace_enabled;
+}
+
 static bool
 nvmf_subsystem_bdev_io_type_supported(struct spdk_nvmf_subsystem *subsystem,
 				      enum spdk_bdev_io_type io_type)
@@ -75,6 +82,10 @@ nvmf_bdev_ctrlr_complete_cmd(struct spdk_bdev_io *bdev_io, bool success,
 	struct spdk_nvme_cpl		*response = &req->rsp->nvme_cpl;
 	int				sc = 0, sct = 0;
 	uint32_t			cdw0 = 0;
+
+	if (nvmf_bdev_p99_trace_enabled(req) && req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ) {
+		req->p99_read_callback_tick = spdk_get_ticks();
+	}
 
 	if (spdk_unlikely(req->first_fused)) {
 		struct spdk_nvmf_request	*first_req = req->first_fused_req;
@@ -374,6 +385,11 @@ nvmf_ctrlr_process_io_cmd_resubmit(void *arg)
 	struct spdk_nvmf_request *req = arg;
 	int rc;
 
+	if (nvmf_bdev_p99_trace_enabled(req) && req->p99_read_wait_start_tick != 0) {
+		req->p99_read_wait_ticks += spdk_get_ticks() - req->p99_read_wait_start_tick;
+		req->p99_read_wait_start_tick = 0;
+	}
+
 	/* The previous attempt may have rewritten nvme_cmd.nsid for passthrough.
 	 * Restore the host-supplied nsid so the namespace lookup at the top of
 	 * nvmf_ctrlr_process_io_cmd() picks the right ns (and so the rewrite on
@@ -406,6 +422,11 @@ nvmf_bdev_ctrl_queue_io(struct spdk_nvmf_request *req, struct spdk_bdev *bdev,
 			struct spdk_io_channel *ch, spdk_bdev_io_wait_cb cb_fn, void *cb_arg)
 {
 	int rc;
+
+	if (nvmf_bdev_p99_trace_enabled(req) && req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ) {
+		req->p99_read_wait_start_tick = spdk_get_ticks();
+		req->p99_read_enomem_count++;
+	}
 
 	req->bdev_io_wait.bdev = bdev;
 	req->bdev_io_wait.cb_fn = cb_fn;
@@ -442,6 +463,10 @@ nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 	uint64_t num_blocks;
 	int rc;
 
+	if (nvmf_bdev_p99_trace_enabled(req) && req->p99_read_enter_tick == 0) {
+		req->p99_read_enter_tick = spdk_get_ticks();
+	}
+
 	nvmf_bdev_ctrlr_get_rw_params(cmd, &start_lba, &num_blocks);
 	nvmf_bdev_ctrlr_get_rw_ext_params(cmd, &opts, !spdk_bdev_desc_hide_metadata(desc));
 
@@ -462,8 +487,14 @@ nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 
 	assert(!spdk_nvmf_request_using_zcopy(req));
 
+	if (nvmf_bdev_p99_trace_enabled(req)) {
+		req->p99_read_submit_tick = spdk_get_ticks();
+	}
 	rc = spdk_bdev_readv_blocks_ext(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 					nvmf_bdev_ctrlr_complete_cmd, req, &opts);
+	if (nvmf_bdev_p99_trace_enabled(req)) {
+		req->p99_read_submit_return_tick = spdk_get_ticks();
+	}
 	if (spdk_unlikely(rc)) {
 		if (rc == -ENOMEM) {
 			nvmf_bdev_ctrl_queue_io(req, bdev, ch, nvmf_ctrlr_process_io_cmd_resubmit, req);
