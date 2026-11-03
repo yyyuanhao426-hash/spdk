@@ -15,6 +15,8 @@
 #include "spdk/trace.h"
 #include "spdk_internal/trace_defs.h"
 #include "spdk_internal/urma_lifetime.h"
+#define URMA_STAGE_SIDE 2
+#include "spdk_internal/urma_stage_buffer.h"
 
 #include "nvmf_internal.h"
 #include "transport.h"
@@ -2406,21 +2408,40 @@ nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 	    req->p99_read_submit_tick <= req->p99_read_submit_return_tick &&
 	    req->p99_read_submit_tick <= req->p99_read_callback_tick &&
 	    req->p99_read_callback_tick <= stage->bdev_cpl_tick &&
-	    (stage->bdev_cpl_tick - stage->exec_tick) >= (hz / 2500)) {
-		fprintf(stderr, "URMA_BDEV_DETAIL trace_seq=%" PRIu64 " qid=%u cid=%u "
-		       "bdev_us=%" PRIu64 " exec_to_read_us=%" PRIu64 " "
-		       "read_to_submit_us=%" PRIu64 " submit_call_us=%" PRIu64 " "
-		       "submit_to_callback_us=%" PRIu64 " callback_to_complete_us=%" PRIu64 " "
-		       "enomem_wait_us=%" PRIu64 " enomem_count=%u\n",
-		       stage->trace_seq, uqpair->qpair.qid, req->cmd->nvme_cmd.cid,
-		       (stage->bdev_cpl_tick - stage->exec_tick) * 1000000 / hz,
-		       (req->p99_read_enter_tick - stage->exec_tick) * 1000000 / hz,
-		       (req->p99_read_submit_tick - req->p99_read_enter_tick) * 1000000 / hz,
-		       (req->p99_read_submit_return_tick - req->p99_read_submit_tick) * 1000000 / hz,
-		       (req->p99_read_callback_tick - req->p99_read_submit_tick) * 1000000 / hz,
-		       (stage->bdev_cpl_tick - req->p99_read_callback_tick) * 1000000 / hz,
-		       req->p99_read_wait_ticks * 1000000 / hz,
-		       req->p99_read_enomem_count);
+	    (urma_stage_mode() == URMA_STAGE_BUFFER ||
+	     (urma_stage_mode() == URMA_STAGE_LEGACY &&
+	      (stage->bdev_cpl_tick - stage->exec_tick) >= (hz / 2500)))) {
+		if (urma_stage_mode() == URMA_STAGE_LEGACY) {
+			fprintf(stderr, "URMA_BDEV_DETAIL trace_seq=%" PRIu64 " qid=%u cid=%u "
+			       "bdev_us=%" PRIu64 " exec_to_read_us=%" PRIu64 " "
+			       "read_to_submit_us=%" PRIu64 " submit_call_us=%" PRIu64 " "
+			       "submit_to_callback_us=%" PRIu64 " callback_to_complete_us=%" PRIu64 " "
+			       "enomem_wait_us=%" PRIu64 " enomem_count=%u\n",
+			       stage->trace_seq, uqpair->qpair.qid, req->cmd->nvme_cmd.cid,
+			       (stage->bdev_cpl_tick - stage->exec_tick) * 1000000 / hz,
+			       (req->p99_read_enter_tick - stage->exec_tick) * 1000000 / hz,
+			       (req->p99_read_submit_tick - req->p99_read_enter_tick) * 1000000 / hz,
+			       (req->p99_read_submit_return_tick - req->p99_read_submit_tick) * 1000000 / hz,
+			       (req->p99_read_callback_tick - req->p99_read_submit_tick) * 1000000 / hz,
+			       (stage->bdev_cpl_tick - req->p99_read_callback_tick) * 1000000 / hz,
+			       req->p99_read_wait_ticks * 1000000 / hz,
+			       req->p99_read_enomem_count);
+		} else {
+			const struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
+			const struct urma_stage_record record = { .v = {
+				stage->trace_seq, uqpair->qpair.qid, cmd->cid,
+				(uint64_t)cmd->cdw10 | ((uint64_t)cmd->cdw11 << 32),
+				(cmd->cdw12 & 0xffffu) + 1, hz, stage->exec_tick,
+				req->p99_read_enter_tick, req->p99_read_submit_tick,
+				req->p99_read_submit_return_tick, req->p99_read_callback_tick,
+				req->p99_read_wait_ticks, req->p99_read_enomem_count,
+				stage->rx_tick, stage->buffer_tick, stage->bdev_cpl_tick,
+				stage->data_post_tick, stage->data_cpl_tick, t_rel0,
+				stage->target_lcore, stage->flags, 0, 0, 0
+			} };
+			urma_stage_append(&record);
+		}
+
 	}
 	/* Modified By Yida: if local_region was cached, keep it cached for future I/O reuse */
 	if (ureq->local_region != NULL && ureq->cache_entry == NULL &&

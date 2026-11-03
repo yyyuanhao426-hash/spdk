@@ -17,6 +17,8 @@
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/ioctl.h>
+#define URMA_STAGE_SIDE 1
+#include "spdk_internal/urma_stage_buffer.h"
 
 /* Modified By Yida: rdtsc-style per-phase timing for performance diagnosis */
 struct nvme_urma_timing {
@@ -1015,7 +1017,8 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 	__atomic_add_fetch(&g_timing.total_ticks, roundtrip_ticks, __ATOMIC_RELAXED);
 	__atomic_add_fetch(&g_timing.total_count, 1, __ATOMIC_RELAXED);
 	threshold_ticks = nvme_urma_stage_trace_threshold_ticks();
-	if (ureq->trace_seq != 0 && roundtrip_ticks >= threshold_ticks) {
+	if (urma_stage_mode() == URMA_STAGE_LEGACY &&
+	    ureq->trace_seq != 0 && roundtrip_ticks >= threshold_ticks) {
 		const struct spdk_urma_stage_trace *stage = &rsp->stage;
 		const struct spdk_nvme_cmd *cmd = &ureq->req->cmd;
 		uint64_t initiator_hz = spdk_get_ticks_hz();
@@ -1079,6 +1082,22 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 		       rx_buffer_us, buffer_exec_us, bdev_us, bdev_post_us, data_us,
 		       pre_send_us, release_us, outside_us, residual_us);
 	}
+	if (urma_stage_mode() == URMA_STAGE_BUFFER && ureq->trace_seq != 0 &&
+	    ureq->req->cmd.opc == SPDK_NVME_OPC_READ) {
+		const struct spdk_urma_stage_trace *s = &rsp->stage;
+		const struct spdk_nvme_cmd *cmd = &ureq->req->cmd;
+		const struct urma_stage_record record = { .v = {
+			ureq->trace_seq, qpair->id, cmd->cid, cmd->opc,
+			(uint64_t)cmd->cdw10 | ((uint64_t)cmd->cdw11 << 32),
+			(cmd->cdw12 & 0xffffu) + 1, spdk_get_ticks_hz(),
+			ureq->submit_tick, ureq->send_start, t_rel0, t_rel1, t_total1,
+			nvme_urma_monotonic_ns(), s->flags, s->target_lcore,
+			s->target_ticks_hz, s->rx_tick, s->buffer_tick, s->exec_tick,
+			s->bdev_cpl_tick, s->data_post_tick, s->data_cpl_tick, s->trace_seq, 0
+		} };
+		urma_stage_append(&record);
+	}
+
 	nvme_complete_request(ureq->req->cb_fn, ureq->req->cb_arg, qpair, ureq->req, &rsp->cpl);
 	free(ureq);
 	return 1;

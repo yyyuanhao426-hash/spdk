@@ -27,6 +27,12 @@
    256MB=**65536 个 4K TLB 条目**（旧估 4096 低估 16×），2M 合并收益 **512×**；`core_matt.c:152-153`
    强制 `IOMMU_MMIO` 经项目侧确认为**刻意设计**（翻译对象是 GPU BAR 空间，不能 cacheable）——
    ③的属性带宽嫌疑降级为可选实验。
+5. **第四轮修正（2026-10-12 锁频实验，V100_peermem §4.1e）**："第二墙/footprint 256MB 塌缩"与
+   "IOTLB 容量假设"被推翻——真凶是 GPU P8/405MHz 空闲降频（vllm 挂载闲置所致）；锁频
+   （`nvidia-smi -lmc 10000`）后 T4b16（256MB）= 21929 MiB/s 不塌缩，write 4M 20.5~22.0、
+   1M T4 **25.1 GB/s 超 DtoH 24.2**——**目标 ≥20 已达成（原版内核跑出，debug 补丁不影响稳态）**。
+   read 方向惩罚锁频后 −40~56%（4M read 平台 ~13 GB/s、1M read 反而更低）= 最大未解（Q11）。
+   coalesce=2m 降级为 setup 税研究项。
 
 ---
 
@@ -111,12 +117,14 @@ SPDK spdk_nvme_urma_register_memory（4K 对齐，is_gpu_seg=1）
 
 ## 4. 差距分解（总账）
 
-24.2（链路天花板）− 16.6（当前最优）≈ **7.6 GB/s**，三个病灶：
+~~24.2（链路天花板）− 16.6（当前最优）≈ 7.6 GB/s~~ **2026-10-12：差距已闭合甚至反超**——
+锁频后 1M T4 = 25.1 > 24.2（DtoH 是 cudaMemcpy 单引擎数，非 P2P 硬天花板，真实 P2P 上限 ≥26.3）；
+4M 21.9 与上限间仅剩 read 方向与残差。历史三病灶框架保留存档：
 
 | 病灶 | 规模/表现 | 状态 | 解法 |
 |---|---|---|---|
 | ① 注册税（verify 调试 + printk + 逐 64KB 条目） | per-IO 路线争用税；整池路线 setup 内 0.06ms/entry | **两轮定位完成** | verify **注释保留（勿删）**/ 降 pr_debug + coalesce 条目数 ÷32 |
-| ② 第二墙（IOTLB/条目数） | inflight 256MB 塌到 9.8 GB/s | 机制为高置信推断；第三轮修正：4K granule 下 256MB=65536 个 4K TLB 条目，2M 合并收益 512×（audit §7.3） | bridge `coalesce=2m`（大奖，可行性只剩 GRAN 位一问） |
+| ~~② 第二墙（IOTLB/条目数）~~ **撤销（2026-10-12）** | ~~inflight 256MB 塌到 9.8~~ 锁频后 T4b16（256MB）= 21.9 不塌缩——塌缩是 GPU P8/405MHz 降频伪象（V100_peermem §4.1e） | ~~高置信推断~~ 已否定；PTE 数学（65536 条目/512×）保留为源码事实（audit §7.3） | ~~大奖~~ 降级：coalesce 仅剩 setup 税 ÷32 收益（研究项） |
 | ③ GPU 腿/读方向开销 | read −23%（12.82 vs 16.6） | 独立开放问题；`IOMMU_MMIO` 属刻意设计（翻译对象是 BAR 空间，audit §7.4-1），属性带宽嫌疑降级 | 先修①②再量；③仍在才试 Normal-NC（不可回 CACHE） |
 
 ---
@@ -128,7 +136,7 @@ SPDK spdk_nvme_urma_register_memory（4K 对齐，is_gpu_seg=1）
 | 1 | node1 `reset --hard` 对齐 + 重建，复跑整池 T4b8 | node1 | 0.5h | 16.6 从 git 库复现（P1=`8e852647c` 已推送） |
 | 2 | **内核 3 行改动**：`core_matt.c` verify 块**注释保留（勿删，他人可能需要）**或加模块参数默认跳过 + map entry/verify 两条 pr_info 注释/降 pr_debug → 重编 ummu → 重跑 per-IO T4b8 | node1 内核 | 1h | 量出 debug 税在 108ms/entry 争用税中的份额；T8b8 setup 143s 若大幅回落即 printk 实锤 |
 | 3 | **定粒度**（已降为 1 分钟）：旧 dmesg capture `grep "map begin"` 看 `pgsize_bitmap`，或 `cat /sys/.../pgsize_bitmap`（attribute.c:56 现成 sysfs）——`0x40201000`={4K,2M,1G}→coalesce=2m 可行；仅 {64K,512M}→改方案。第三轮已定案：domain bitmap=硬件 cap（audit §7.2），只剩 GRAN 位；`GPU-PTE ... lvl=` 佐证已装 PTE 层级 | node1 | 1min | coalesce 方案定稿 |
-| 4 | **bridge coalesce=2m（核心赌注）**：`udma_nv_build_phys_sgt` 把物理连续的 32×64KB 合并为 2MB 条目；模块参数 `coalesce=2m` 默认关（仿 `gpu_vendor` 风格）；前提 B 已过（源码证实收变长条目 + bitmap=硬件 cap，audit §7.1/7.2）；前提 A（VRAM 连续性）用 GPU-PTE 打点验证，能拼多少拼多少（iova 需 2M 对齐，CUDA VMM 2MB 粒度满足） | node1 `/home/tong/urma_driver` | 0.5~2d | 整池 setup ÷32（512→16 条）；TLB 条目 **65536→128（512×**，旧估 32× 低估 16×，audit §7.3）；T4b16/T8b8 若 9.8 → 爬升 = 第二墙消失、往 24.2 爬；若不动 = 铁证墙在 UMMU 内部，Q6 带数据外发。**两个结果都有价值** |
+| 4 | bridge coalesce=2m（~~核心赌注~~ **降级为研究项**——锁频实验撤销第二墙，仅剩 setup 税收益）：`udma_nv_build_phys_sgt` 把物理连续的 32×64KB 合并为 2MB 条目；模块参数 `coalesce=2m` 默认关（仿 `gpu_vendor` 风格）；前提 B 已过（源码证实收变长条目 + bitmap=硬件 cap，audit §7.1/7.2）；前提 A（VRAM 连续性）用 GPU-PTE 打点验证，能拼多少拼多少（iova 需 2M 对齐，CUDA VMM 2MB 粒度满足） | node1 `/home/tong/urma_driver` | 0.5~2d | 整池 setup ÷32（512→16 条）；TLB 条目 **65536→128（512×**，旧估 32× 低估 16×，audit §7.3）；T4b16/T8b8 若 9.8 → 爬升 = 第二墙消失、往 24.2 爬；若不动 = 铁证墙在 UMMU 内部，Q6 带数据外发。**两个结果都有价值** |
 | 5 | （可选，降级）`IOMMU_MMIO`→Normal-NC A/B（`core_matt.c:152-153`）——MMIO 属刻意设计（翻译对象是 GPU BAR 空间，不能 cacheable，2026-10-11 项目侧确认） | node1 内核 | 1h | 仅当①②修完、③读方向仍无解释时才做；须确认 BAR 窗口读无副作用，**不可回 CACHE** |
 | 6 | 复跑矩阵：per-IO T4b8（税）/ 整池 T2b8+T4b8（峰值）/ T4b16+T8b8（墙）/ 读方向 / cpu 注册条目粒度 | node1 | 1h | 全部结果回填本文档 + 附录 B |
 | 7 | 修《4090D_V100_peermem.md》乱码/勘误（含 3403 条 map 小账对平）→ 附录 B 瘦身版（Q1/Q4/Q5/Q6）发 UMDK/UB | 文档 | 1h | 外部排期开启 |
