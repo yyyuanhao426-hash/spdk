@@ -95,6 +95,12 @@ function usage() {
 	echo " --with-urma[=DIR]         Build the independent URMA transport for NVMf target and initiator."
 	echo "                           DIR may point to an installed UMDK prefix."
 	echo " --without-urma            Disable the URMA transport."
+	echo " --with-urma-peermem       Enable URMA accelerator peer-memory registration (default: disabled)."
+	echo "                           Requires --with-urma and UMDK headers with is_gpu_seg."
+	echo " --without-urma-peermem    Disable URMA peer-memory registration."
+	echo " --with-urma-dmabuf        Enable URMA DMA-BUF registration (default: disabled)."
+	echo "                           Requires --with-urma and liburma with urma_register_seg_dmabuf."
+	echo " --without-urma-dmabuf     Disable URMA DMA-BUF registration."
 	echo " --with-fc[=DIR]           Build FC transport for NVMf target."
 	echo " --without-fc              If an argument is provided, it is considered a directory containing"
 	echo "                           libufc.a and fc_lld.h. Otherwise the regular system paths will"
@@ -508,6 +514,18 @@ for i in "$@"; do
 			CONFIG[URMA]=n
 			CONFIG[URMA_DIR]=
 			;;
+		--with-urma-peermem)
+			CONFIG[URMA_PEERMEM]=y
+			;;
+		--without-urma-peermem)
+			CONFIG[URMA_PEERMEM]=n
+			;;
+		--with-urma-dmabuf)
+			CONFIG[URMA_DMABUF]=y
+			;;
+		--without-urma-dmabuf)
+			CONFIG[URMA_DMABUF]=n
+			;;
 		--with-fc=*)
 			CONFIG[FC]=y
 			CONFIG[FC_PATH]=$(readlink -f ${i#*=})
@@ -780,6 +798,12 @@ for i in "$@"; do
 	esac
 done
 
+if [[ "${CONFIG[URMA]}" != "y" &&
+	("${CONFIG[URMA_PEERMEM]}" == "y" || "${CONFIG[URMA_DMABUF]}" == "y") ]]; then
+	echo "--with-urma-peermem and --with-urma-dmabuf require --with-urma."
+	exit 1
+fi
+
 if [[ $arch == x86_64* ]]; then
 	BUILD_CMD=($CC -o /dev/null -x c $CPPFLAGS $CFLAGS $LDFLAGS "-march=native")
 else
@@ -1022,12 +1046,27 @@ if [ "${CONFIG[URMA]}" = "y" ]; then
 		urma_cflags+=("-I/usr/include/ub/umdk/urma")
 	fi
 	if ! echo -e '#include <urma_api.h>\n#include <urma_ubagg.h>\nint main(void) { return (int)urma_init(NULL); }\n' \
-		| "${BUILD_CMD[@]}" "${urma_cflags[@]}" "${urma_ldflags[@]}" -lurma - 2> /dev/null; then
+		| "${BUILD_CMD[@]}" "${urma_cflags[@]}" "${urma_ldflags[@]}" - -lurma 2> /dev/null; then
 		echo "--with-urma requires urma_api.h and liburma."
 		echo "Use --with-urma=/path/to/umdk-install if they are not installed system-wide."
 		exit 1
 	fi
-	echo "Using independent URMA transport"
+	if [[ "${CONFIG[URMA_PEERMEM]}" == "y" ]]; then
+		if ! echo -e '#include <urma_api.h>\nint main(void) { urma_seg_cfg_t cfg = {0}; cfg.is_gpu_seg = 1; return (int)cfg.is_gpu_seg; }\n' \
+			| "${BUILD_CMD[@]}" "${urma_cflags[@]}" -c - 2> /dev/null; then
+			echo "--with-urma-peermem requires urma_seg_cfg_t.is_gpu_seg in the selected UMDK headers."
+			exit 1
+		fi
+	fi
+	if [[ "${CONFIG[URMA_DMABUF]}" == "y" ]]; then
+		if ! echo -e '#include <urma_api.h>\nint main(void) { return urma_register_seg_dmabuf(NULL, NULL, -1, 0) != NULL; }\n' \
+			| "${BUILD_CMD[@]}" "${urma_cflags[@]}" "${urma_ldflags[@]}" \
+			-Werror=implicit-function-declaration - -lurma 2> /dev/null; then
+			echo "--with-urma-dmabuf requires a declaration and linkable urma_register_seg_dmabuf in the selected UMDK."
+			exit 1
+		fi
+	fi
+	echo "Using independent URMA transport (peermem=${CONFIG[URMA_PEERMEM]}, dmabuf=${CONFIG[URMA_DMABUF]})"
 fi
 
 if [[ "${CONFIG[FC]}" = "y" ]]; then

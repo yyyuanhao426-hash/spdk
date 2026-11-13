@@ -8,6 +8,11 @@ The JSON-RPC schema has been migrated from JSON (`schema/schema.json`) to YAML (
 
 ### nvme
 
+URMA accelerator memory registration is now opt-in through `--with-urma-peermem`
+and `--with-urma-dmabuf`, independently of the CUDA accel module. The default
+`--with-urma` build supports HOST memory without either GPU extension in UMDK.
+The `urma_perf` example now defaults to CPU memory; select GPU modes explicitly.
+
 Added initiator-side interrupt mode support for the RDMA transport. Applications can now enable
 interrupts on RDMA queue pairs using `spdk_nvme_qpair_get_fd()` to wait for completion events via
 a completion channel instead of continuously polling.

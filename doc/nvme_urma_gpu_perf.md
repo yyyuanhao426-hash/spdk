@@ -88,16 +88,25 @@ UMDK 安装在 `/opt/umdk` 时：
 ~~~bash
 cd /path/to/SPDK
 git submodule update --init
-./configure --with-urma=/opt/umdk
+./configure --with-urma=/opt/umdk --with-urma-peermem
 make -j$(nproc)
 ~~~
 
 UMDK 安装在系统默认 include/library 路径时使用：
 
 ~~~bash
-./configure --with-urma
+./configure --with-urma --with-urma-peermem
 make -j$(nproc)
 ~~~
+
+上述命令启用 peermem GPU 注册。仅测试 HOST/bonding 的 target 可省略
+`--with-urma-peermem`。要测试 DMA-BUF，改用 `--with-urma-dmabuf`；若还需要在
+DMA-BUF 不支持时降级到 peermem，可同时指定两个选项。仅导出 DMA-BUF stub 的
+SDK 不具备实际 DMA-BUF 注册能力。已有 `--with-cuda` 不控制这些 URMA 功能。
+
+`urma_perf` 默认 `-M cpu`，不初始化 CUDA。GPU 测试必须显式选择 `-M peermem`
+或 `-M dmabuf`；未编译所选机制会在初始化 SPDK/CUDA 前报错。`-M posix` 仍表示
+CUDA 显存和 HOST buffer 之间的 staging，不要求启用直接 GPU 注册。
 
 构建完成后应存在：
 
@@ -154,7 +163,7 @@ control-plane 命令依赖部署方式，不由 SPDK 测试程序创建。
 ~~~bash
 sudo ./build/examples/urma_perf \
   -r 'trtype:URMA adrfam:IPv4 traddr:192.0.2.10 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
-  -w write -o 4096 -T 4 -b 32 -t 30 -n 1 -g 0 -l 0
+  -M peermem -w write -o 4096 -T 4 -b 32 -t 30 -n 1 -g 0 -l 0
 ~~~
 
 ### 6.2 READ：远端 SSD 到 GPU
@@ -162,7 +171,7 @@ sudo ./build/examples/urma_perf \
 ~~~bash
 sudo ./build/examples/urma_perf \
   -r 'trtype:URMA adrfam:IPv4 traddr:192.0.2.10 trsvcid:4420 subnqn:nqn.2026-01.io.spdk:urma-gpu-test' \
-  -w read -o 131072 -T 4 -b 16 -t 30 -n 1 -g 0 -l 0
+  -M peermem -w read -o 131072 -T 4 -b 16 -t 30 -n 1 -g 0 -l 0
 ~~~
 
 参数含义：

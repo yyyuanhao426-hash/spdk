@@ -3,6 +3,7 @@
  */
 
 #include "spdk/stdinc.h"
+#include "spdk/config.h"
 
 /* Modified by Yin: urma_perf 用了 C11 原子类型，需显式 include */
 #include <stdatomic.h>
@@ -164,7 +165,7 @@ static bool g_require_dmabuf;
  *            host 暂存缓冲，host 暂存缓冲注册为 URMA segment。模拟无 GDR 时的
  *            "HBM → CPU 拷贝 → NIC DMA" 路线，拷贝耗时单独统计
  * - peermem: GPU memory via the nvidia_p2p peer-memory path (no dmabuf export)
- * - dmabuf:  GPU memory via cuMemGetHandleForAddressRange (default, legacy behavior) */
+ * - dmabuf:  GPU memory via cuMemGetHandleForAddressRange */
 enum urma_perf_mem_type {
 	URMA_PERF_MEM_DMABUF = 0,
 	URMA_PERF_MEM_PEERMEM,
@@ -172,7 +173,7 @@ enum urma_perf_mem_type {
 	URMA_PERF_MEM_CPU,
 };
 
-static enum urma_perf_mem_type g_mem_type;
+static enum urma_perf_mem_type g_mem_type = URMA_PERF_MEM_CPU;
 static bool g_core_mask_set;
 static char g_core_mask[32];
 static atomic_uint g_ready_workers;
@@ -1119,7 +1120,7 @@ usage(const char *program)
 	printf("  -l, --start-lba <lba>   first destructive test LBA (default: 0)\n");
 	printf("  -m, --core-mask <mask>  SPDK core mask; default selects the first T cores\n");
 	/* Modified By Yida: mem-type 四选一（-m 已被 core-mask 占用，故用 -M） */
-	printf("  -M, --mem-type <type>   posix, cpu, peermem or dmabuf (default: dmabuf)\n");
+	printf("  -M, --mem-type <type>   posix, cpu, peermem or dmabuf (default: cpu)\n");
 	printf("                          posix:   staged path, data in HBM copied to a host\n");
 	printf("                                   staging buffer per I/O (HBM->host->NIC);\n");
 	printf("                                   copy time printed separately\n");
@@ -1247,6 +1248,18 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		fprintf(stderr, "--require-dmabuf is only valid with -M dmabuf\n");
 		return -EINVAL;
 	}
+#ifndef SPDK_CONFIG_URMA_PEERMEM
+	if (g_mem_type == URMA_PERF_MEM_PEERMEM) {
+		fprintf(stderr, "peermem requires rebuilding SPDK with --with-urma-peermem\n");
+		return -ENOTSUP;
+	}
+#endif
+#ifndef SPDK_CONFIG_URMA_DMABUF
+	if (g_mem_type == URMA_PERF_MEM_DMABUF) {
+		fprintf(stderr, "dmabuf requires rebuilding SPDK with --with-urma-dmabuf\n");
+		return -ENOTSUP;
+	}
+#endif
 	if (!trid_set || g_trid.trtype != SPDK_NVME_TRANSPORT_URMA || g_trid.subnqn[0] == '\0') {
 		fprintf(stderr, "A URMA transport ID including subnqn is required\n");
 		return -EINVAL;

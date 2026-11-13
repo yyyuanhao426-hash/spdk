@@ -2,6 +2,7 @@
  *   Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
 
+#include "spdk/config.h"
 #include "nvme_urma_internal.h"
 
 #define SPDK_URMA_PROVIDER_COUNT (SPDK_NVME_URMA_MEM_XDS + 1)
@@ -31,6 +32,16 @@ static size_t g_numa_chip_id_count;
 
 #define SPDK_URMA_STAT_INC(member) \
 	__atomic_fetch_add(&g_memory_stats.member, 1, __ATOMIC_RELAXED)
+
+static bool
+spdk_urma_accel_memory_enabled(void)
+{
+#if defined(SPDK_CONFIG_URMA_PEERMEM) || defined(SPDK_CONFIG_URMA_DMABUF)
+	return true;
+#else
+	return false;
+#endif
+}
 
 static int
 spdk_urma_runtime_get(void)
@@ -230,6 +241,14 @@ spdk_nvme_urma_register_memory_provider(const struct spdk_nvme_urma_memory_provi
 	    provider->type >= SPDK_URMA_PROVIDER_COUNT) {
 		return -EINVAL;
 	}
+	if (!spdk_urma_accel_memory_enabled()) {
+		return -ENOTSUP;
+	}
+#ifndef SPDK_CONFIG_URMA_PEERMEM
+	if (provider->export_dmabuf == NULL) {
+		return -ENOTSUP;
+	}
+#endif
 	pthread_mutex_lock(&g_provider_mutex);
 	if (g_providers[provider->type] != NULL) {
 		rc = -EEXIST;
@@ -247,6 +266,9 @@ spdk_nvme_urma_unregister_memory_provider(enum spdk_nvme_urma_memory_type type)
 
 	if (type <= SPDK_NVME_URMA_MEM_HOST || type >= SPDK_URMA_PROVIDER_COUNT) {
 		return -EINVAL;
+	}
+	if (!spdk_urma_accel_memory_enabled()) {
+		return -ENOTSUP;
 	}
 	pthread_mutex_lock(&g_provider_mutex);
 	if (g_provider_refs[type] != 0) {
@@ -354,6 +376,10 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 	    type >= SPDK_URMA_PROVIDER_COUNT) {
 		return -EINVAL;
 	}
+	*region_out = NULL;
+	if (type != SPDK_NVME_URMA_MEM_HOST && !spdk_urma_accel_memory_enabled()) {
+		return -ENOTSUP;
+	}
 	region = calloc(1, sizeof(*region));
 	if (region == NULL) {
 		return -ENOMEM;
@@ -395,23 +421,39 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 	cfg.flag.bs.token_policy = URMA_TOKEN_NONE;
 	cfg.flag.bs.cacheable = URMA_NON_CACHEABLE;
 	cfg.flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+#ifdef SPDK_CONFIG_URMA_PEERMEM
 	cfg.is_gpu_seg = type == SPDK_NVME_URMA_MEM_HOST ? 0 : 1;
+#endif
 
+#ifdef SPDK_CONFIG_URMA_DMABUF
 	if (region->provider != NULL && region->provider->export_dmabuf != NULL) {
 		uint64_t offset = 0;
 		rc = region->provider->export_dmabuf(region->provider->provider_ctx,
 					     region->pin_handle, &region->dmabuf_fd, &offset);
 		if (rc == 0) {
+			errno = 0;
 			region->target_seg = urma_register_seg_dmabuf(urma_context, &cfg,
 								       region->dmabuf_fd, offset);
 			if (region->target_seg != NULL) {
 				SPDK_URMA_STAT_INC(dmabuf_registrations);
+			} else {
+				rc = errno != 0 ? -errno : -EIO;
 			}
 		}
+#ifndef SPDK_CONFIG_URMA_PEERMEM
+		if (rc != 0) {
+			goto fail_pin;
+		}
+#endif
 	}
-	/* The current UMDK gds branch uses is_gpu_seg for peer-memory pinning.
-	 * dma-buf registration may return ENOTSUP until the kernel provider lands. */
+#endif
 	if (region->target_seg == NULL) {
+#ifndef SPDK_CONFIG_URMA_PEERMEM
+		if (type != SPDK_NVME_URMA_MEM_HOST) {
+			rc = -ENOTSUP;
+			goto fail_pin;
+		}
+#endif
 		/* Modified By Yida (v3): UMMU Table mode 要求注册区间从 4K 对齐的
 		 * base 起始并覆盖完整页。应用 buffer 可能位于子页偏移（Mooncake
 		 * ClientBufferAllocator 仅保证 64B 对齐，torch tensor 是 caching
@@ -432,7 +474,6 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 		}
 	}
 	if (region->target_seg == NULL) {
-		SPDK_URMA_STAT_INC(registration_failures);
 		rc = -errno;
 		if (rc == 0) {
 			rc = -EIO;
@@ -443,6 +484,7 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 	return 0;
 
 fail_pin:
+	SPDK_URMA_STAT_INC(registration_failures);
 	if (region->provider != NULL && region->pin_handle != NULL) {
 		region->provider->unpin(region->provider->provider_ctx, region->pin_handle);
 	}

@@ -27,6 +27,9 @@ enum spdk_nvme_urma_memory_type {
  * accelerator SDK headers to SPDK.  pin() must keep the allocation alive until
  * unpin() is called.  export_dmabuf() is optional; a provider may instead rely
  * on URMA peer-memory registration of the returned device virtual address.
+ * Peer-memory and DMA-BUF registration are opt-in build features, independent
+ * of the CUDA accel module. See SPDK_CONFIG_URMA_PEERMEM and
+ * SPDK_CONFIG_URMA_DMABUF in the installed spdk/config.h.
  */
 struct spdk_nvme_urma_memory_provider {
 	const char *name;
@@ -49,7 +52,11 @@ struct spdk_nvme_urma_memory_stats {
 	uint64_t registration_failures;
 };
 
-/** Register an accelerator-memory provider. Providers are process-global. */
+/**
+ * Register an accelerator-memory provider. Providers are process-global.
+ * Returns -ENOTSUP when accelerator registration was disabled at build time,
+ * or when only DMA-BUF was enabled and export_dmabuf is NULL.
+ */
 int spdk_nvme_urma_register_memory_provider(
 	const struct spdk_nvme_urma_memory_provider *provider);
 
@@ -62,6 +69,9 @@ int spdk_nvme_urma_unregister_memory_provider(enum spdk_nvme_urma_memory_type ty
  * urma_context is an opaque urma_context_t pointer.  The returned region owns
  * provider pinning and URMA registration and must be released with
  * spdk_nvme_urma_unregister_memory().
+ * Non-HOST memory requires an enabled registration mechanism and a provider.
+ * DMA-BUF failure falls back to peer-memory only in builds enabling both.
+ * GPU virtual addresses are never registered through the HOST path.
  */
 int spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 				  enum spdk_nvme_urma_memory_type type,

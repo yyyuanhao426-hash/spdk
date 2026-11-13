@@ -27,6 +27,40 @@ make -j
 
 关闭该功能使用 `--without-urma`。配置项为 `CONFIG_URMA` 和 `CONFIG_URMA_DIR`，关闭时不会编译 URMA transport，也不会引入 `liburma`。
 
+`--with-urma` 默认仅启用 HOST 注册和基础 transport/bonding，不要求定制
+`is_gpu_seg` 字段、`urma_register_seg_dmabuf` 符号或 CUDA provider。异构内存注册
+通过两个默认关闭的独立选项开启，且均要求 `--with-urma`：
+
+| 配置选项 | 配置宏 | 选定 UMDK 的要求 |
+|---|---|---|
+| `--with-urma-peermem` | `SPDK_CONFIG_URMA_PEERMEM` | `urma_seg_cfg_t` 含 `is_gpu_seg` |
+| `--with-urma-dmabuf` | `SPDK_CONFIG_URMA_DMABUF` | 声明并导出 `urma_register_seg_dmabuf` |
+
+也可使用 `--without-urma-peermem`、`--without-urma-dmabuf` 显式关闭。
+peermem-only 构建不引用 DMA-BUF 注册符号；dmabuf-only 构建不访问 GPU 扩展字段，
+注册失败后不会把 GPU 地址当 HOST 注册。两者同时开启时保留 DMA-BUF 到 peermem
+的降级行为。configure 检查编译/链接条件，真实注册能力仍取决于运行时驱动；
+只有 stub 符号不能证明支持真实 DMA-BUF。
+
+这些选项不依赖 `--with-cuda`（该选项控制 CUDA accel module）。CUDA 的 allocation
+保活和可选 fd 导出继续由外部 memory provider 实现。未启用异构注册时，provider
+注册和非 HOST 内存注册返回 `-ENOTSUP`。当前 target 本地使用 HOST buffer，仍能
+import 远端 GPU 段，不要求 target 因此开启本地异构内存注册。
+
+从此前版本升级时，需要为 GPU initiator 显式添加上述选项。调用方可以检查安装的
+`spdk/config.h` 获取构建能力；Mooncake 的 `USE_NOF_GPU_DIRECT` 不会裁剪已经生成的
+SPDK archive，必须重新构建 SPDK 并重新链接调用方。同进程使用的 UMDK 头文件、
+core/provider 库及公开结构 ABI 仍必须兼容；这些开关不修复 bonding 拓扑 ABI。
+
+不依赖 GPU 硬件的构建/注册回归测试：
+
+~~~bash
+python3 test/urma/registration_build.py --umdk /path/to/gpu-capable/UMDK
+~~~
+
+该测试从指定 SDK 构造缺字段/缺符号的头文件版本，编译实际注册代码和测试工具，
+检查四种构建组合的符号依赖、注册/降级/资源清理，以及 configure 能力探针。
+
 ### 运行参数
 
 默认值参考 Mooncake 当前 URMA 实现：RM 模式、每块本地 NIC 共享 2 个发送 JFC 和 2 个接收 JFC、每个远端 NIC endpoint 1 个 Jetty、JFC 深度 4096、Jetty 深度 2048、max_sge 5、rnr_retry 7、err_timeout 17、token `0xACFE`，active port 默认自动选择。priority 默认根据设备 `priority_info` 自动选择 CTP 对应项。
