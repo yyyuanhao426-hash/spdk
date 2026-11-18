@@ -972,8 +972,19 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 	device->priority = (uint32_t)rc;
 	SPDK_NOTICELOG("URMA device %s selected priority %u for %s\n", selected->name,
 		       device->priority, opts->tp_type == URMA_CTP ? "CTP" : "RTP");
-	/* Modified by Yin: 仅 BALANCE/MULTIPATH 才调 SET_BONDING_MODE，STANDALONE 不调（防 jetty 野指针崩溃） */
-	if (opts->bonding_balance || opts->bonding_multipath) {
+	/* BONDP_USER_CTL_SET_BONDING_MODE is opcode 7, and its meaning is
+	 * provider-specific: the bondp provider reads the payload as a bonding
+	 * mode, while the plain UDMA provider interprets it as DELETE_JETTY_EX
+	 * and treats the payload bytes as a jetty pointer. Guard on the device
+	 * name prefix (same check as YLT / Mooncake 6c00c2ed) so a bare UDMA
+	 * device never receives this control, even when bonding options are
+	 * explicitly requested.
+	 *
+	 * Modified by Yin: only BALANCE/MULTIPATH issues SET_BONDING_MODE;
+	 * STANDALONE is left alone to avoid the jetty use-after-free crash.
+	 */
+	if ((opts->bonding_balance || opts->bonding_multipath) &&
+	    strncmp(selected->name, "bonding", 7) == 0) {
 		bondp_set_bonding_mode_in_t mode = {
 			/* Modified by Yin: bonding_mode 直接固定为 BALANCE（与上面守卫一致） */
 			.bonding_mode = BONDP_BONDING_MODE_BALANCE,
@@ -992,6 +1003,10 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			rc = -EIO;
 			goto fail;
 		}
+	} else if (opts->bonding_balance || opts->bonding_multipath) {
+		SPDK_WARNLOG("urma device open '%s': bonding mode requested on a non-bonding "
+			     "device, skipping SET_BONDING_MODE (opcode 7 is DELETE_JETTY_EX "
+			     "for the plain UDMA provider)\n", selected->name);
 	}
 	if (opts->active_port >= 0 && opts->active_port < MAX_PORT_CNT) {
 		device->active_port = opts->active_port;
