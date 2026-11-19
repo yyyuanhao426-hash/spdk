@@ -64,8 +64,8 @@
 #   NOF_TARGET_NULL_BDEV_NAME 在 Null 模式下指定 bdev 名称
 #   NOF_TARGET_HUGE_DIR 指定 pagesize=2M 的 hugetlbfs 挂载（默认 /dev/hugepages）
 #
-# 接管只操作本次 -d 声明的磁盘；全局 vfio 残留清理必须显式使用 -r，
-# 且 -r 在其他 SPDK 进程运行时拒绝执行。
+# 接管前会自动检测上一次运行残留（vfio-pci 占用或游离的 NVMe 盘）并还原回
+# nvme 驱动，确保本次是全新的 unbind + bind；-r 保留为手动补救入口。
 #
 # 运行时产物：日志 /tmp/nvmf_tgt.log，PID /var/tmp/nvmf_tgt.pid
 #             （停止：kill $(cat /var/tmp/nvmf_tgt.pid)；RPC 配置不持久化，重启后重跑本脚本）
@@ -106,6 +106,23 @@ TGT_PIDFILE="${NOF_TARGET_PIDFILE:-/var/tmp/nvmf_tgt.pid}"
 RPC_SOCKET="${NOF_TARGET_RPC_SOCKET:-/var/tmp/spdk.sock}"
 HUGE_DIR="${NOF_TARGET_HUGE_DIR:-/dev/hugepages}"
 HUGEPAGES_MODE="${NOF_HUGEPAGES_MODE:-allocate}"
+
+# 找正在运行的 SPDK target 进程。必须按 /proc/PID/exe 的真实可执行文件判断：
+#   pgrep -f 'bin/nvmf_tgt' 会匹配"命令行里含该字符串"的任何进程（包括
+#   run_exp.sh / 本脚本自身 / tail 日志的 shell），造成还原阶段误判自锁。
+spdk_tgt_pids() {
+    local p exe out=""
+    for p in $(pgrep -x nvmf_tgt; pgrep -x spdk_tgt); do
+        out="$out $p"
+    done
+    for p in $(pgrep -f 'bin/nvmf_tgt|bin/spdk_tgt' 2>/dev/null); do
+        exe="$(readlink -f "/proc/$p/exe" 2>/dev/null)" || continue
+        case "$exe" in
+            */bin/nvmf_tgt|*/bin/spdk_tgt) out="$out $p" ;;
+        esac
+    done
+    echo $out
+}
 
 usage() { awk 'NR==2{inhdr=1} inhdr && /^#/{sub(/^# ?/,""); print; next} inhdr{exit}' "$0"; exit 0; }
 
@@ -246,8 +263,9 @@ check_root_rw() {
     esac
 }
 
-# 显式 -r 模式还原残留：把 vfio-pci 占用或游离的 NVMe 控制器绑回 nvme。
-# 正常接管流程绝不调用，以免碰到其他 target 正在使用的盘。
+# 还原残留：把被 vfio-pci 占用、或游离（无驱动）的 NVMe 控制器全部绑回 nvme 驱动。
+# 上一次运行失败/中断会把盘留在 vfio-pci 或无驱动状态，接管前必须先还原，
+# 保证本次是全新的 unbind + bind。
 restore_vfio_nvme() {
     local devpath bdf cls drv vid_did st
     local -a restore_list=()
@@ -291,7 +309,7 @@ restore_vfio_nvme() {
 # （必须放在函数定义之后，bash 函数先定义后调用）
 if [ "$RESTORE_ONLY" = 1 ]; then
     echo "=== 还原模式：把 vfio-pci 占用/游离的 NVMe 盘还原回 nvme ==="
-    _pids="$(pgrep -x nvmf_tgt) $(pgrep -x spdk_tgt) $(pgrep -f 'bin/nvmf_tgt')"
+    _pids="$(spdk_tgt_pids)"
     if [ -n "${_pids// /}" ]; then
         abort "已有 SPDK 应用在运行 (PID: $_pids)，先 kill 再还原（否则残留盘被占用，unbind 会失败）"
     fi
@@ -418,9 +436,9 @@ echo
 
 if [ "$NULL_BDEV_MODE" = 1 ]; then
 echo "=== 3) Null bdev 模式：跳过 vfio-pci 接管 ==="
-_pids="$(pgrep -x nvmf_tgt) $(pgrep -x spdk_tgt) $(pgrep -f 'bin/nvmf_tgt')"
+_pids="$(spdk_tgt_pids)"
 if [ -n "${_pids// /}" ]; then
-    info "已有其他 SPDK 进程 (PID: $_pids)；Null 模式不会接管磁盘，继续检查本实例端口与 RPC socket"
+    abort "已有 SPDK 应用在运行 (PID: $_pids)，先 kill 再来"
 fi
 info "不会 unbind/bind 任何物理 NVMe；RPC 阶段将创建 $NULL_BDEV_NAME"
 else
@@ -445,12 +463,14 @@ else
     info "noiommu 模式已是 1（$NOIOMMU）"
 fi
 
-# 其他实例可能持有 vfio 盘；这里绝不执行全局还原。残留盘须由
-# 运维在确认所有 SPDK 进程停止后显式执行 -r 处理。
-_pids="$(pgrep -x nvmf_tgt) $(pgrep -x spdk_tgt) $(pgrep -f 'bin/nvmf_tgt')"
+# 上次运行失败会把盘留在 vfio-pci/游离状态：nvmf_tgt 必须先停（可能占着残留盘），
+# 再把残留盘还原回 nvme，确保本次是全新的 unbind + bind。
+# 注意旧实例不一定叫 nvmf_tgt（改名/别的 SPDK 应用也会占 core mask），多查几种
+_pids="$(spdk_tgt_pids)"
 if [ -n "${_pids// /}" ]; then
-    info "已有 SPDK 进程 (PID: $_pids)；只接管本次声明的 NVMe 盘"
+    abort "已有 SPDK 应用在运行 (PID: $_pids)，先 kill 再来（占着 core mask，且 RPC 配置不持久化）"
 fi
+restore_vfio_nvme
 check_root_rw
 
 # 逐盘 driver_override 接管（SPDK setup.sh 的标准做法，不依赖 new_id 动态 ID 表——
@@ -621,6 +641,7 @@ if [ -n "${SPDK_URMA_TRACE_ENTRIES:-}" ]; then
         || abort "SPDK_URMA_TRACE_ENTRIES must be a positive power of two"
     TGT_ARGS+=(--num-trace-entries "$SPDK_URMA_TRACE_ENTRIES")
 fi
+TGT_ARGS+=(-e "${SPDK_URMA_TRACE_GROUP:-nvme_pcie,urma_p99}")
 [ -n "$IOBUF_SPEC" ] && TGT_ARGS+=(--wait-for-rpc)
 nohup env $( [ -n "$DUMP_SEC" ] && echo "SPDK_URMA_TARGET_DUMP_SEC=$DUMP_SEC" ) \
     ./build/bin/nvmf_tgt "${TGT_ARGS[@]}" > "$TGT_LOG" 2>&1 &
