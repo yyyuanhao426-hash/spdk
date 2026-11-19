@@ -7,7 +7,7 @@
 #   2. 分析候选空闲盘；选定盘后【现查】其 BDF（nvmeXn1 每次开机重排，旧记录不可信）
 #   3. lspci -nns 显示 vendor:device，用该 BDF 执行 driver_override → unbind → bind
 #   4. 验证 vfio-pci 已接管 + 根分区仍是 rw（bind 错盘 = 根文件系统变 ro，实测过）
-#   5. 环境检查：liburma 与 liburma_common 成套、hugepages（按 iobuf 池自动上调）、无残留 nvmf_tgt
+#   5. 环境检查：liburma 与 liburma_common 成套、显式 2 MiB hugepages 池/挂载
 #   6. 后台启动 ./build/bin/nvmf_tgt -m <mask>（计时为可选开关 -s 秒数；
 #      给了 -I 时先以 --wait-for-rpc 启动，配好 iobuf 池再 framework_start_init）
 #   7. RPC 就绪后自动配置：attach controller（每盘一个）→ create transport
@@ -35,7 +35,7 @@
 #   -R <strip>   把所有接管盘合成一个 raid0 bdev（单 namespace 聚合带宽），
 #                <strip> 为 strip 大小 KB（如 128）；0 = 用 raid 模块默认 strip
 #   -I <四元组>  iobuf 池 "小池数量,小池buf,大池数量,大池buf"（字节），
-#                如 8192,8192,1024,4194304。启动时自动 hugepages 上调，
+#                如 8192,8192,1024,4194304。裸机 allocate 模式可上调 2 MiB 页池，
 #                并以 --wait-for-rpc 启动后调 iobuf_set_options（仅 STARTUP 期可用）
 #   -O <字节>    URMA transport max_io_size（2 的幂且 ≥8KB）。注意：urma 数据路径
 #                要求 iovcnt==1，大 I/O 必须配合 -I 把 large_bufsize 配到 ≥ 此值
@@ -57,9 +57,15 @@
 #   -r           还原模式：把 vfio-pci 占用/游离的 NVMe 盘还原回 nvme 驱动后退出
 #                （上次运行失败/中断后的补救）
 #   -y           跳过交互确认（配合 -d 用于自动化）
+# 环境变量：
+#   NOF_HUGEPAGES_MODE=verify 只校验 2 MiB 池（Kubernetes 使用，默认 allocate）
+#   NOF_TARGET_NQN / NOF_TARGET_PORT / NOF_TARGET_SUBSYS_SN 定义导出身份
+#   NOF_TARGET_RPC_SOCKET / NOF_TARGET_PIDFILE / NOF_TARGET_LOGFILE 隔离运行实例
+#   NOF_TARGET_NULL_BDEV_NAME 在 Null 模式下指定 bdev 名称
+#   NOF_TARGET_HUGE_DIR 指定 pagesize=2M 的 hugetlbfs 挂载（默认 /dev/hugepages）
 #
-# 接管前会自动检测上一次运行残留（vfio-pci 占用或游离的 NVMe 盘）并还原回
-# nvme 驱动，确保本次是全新的 unbind + bind。
+# 接管只操作本次 -d 声明的磁盘；全局 vfio 残留清理必须显式使用 -r，
+# 且 -r 在其他 SPDK 进程运行时拒绝执行。
 #
 # 运行时产物：日志 /tmp/nvmf_tgt.log，PID /var/tmp/nvmf_tgt.pid
 #             （停止：kill $(cat /var/tmp/nvmf_tgt.pid)；RPC 配置不持久化，重启后重跑本脚本）
@@ -87,16 +93,19 @@ LISTEN_IP=""
 RESTORE_ONLY=0
 ASSUME_YES=0
 NULL_BDEV_MODE=0
-NULL_BDEV_NAME="Null0"
+NULL_BDEV_NAME="${NOF_TARGET_NULL_BDEV_NAME:-Null0}"
 NULL_BDEV_SIZE_MB=1048576
 NULL_BDEV_BLOCK_SIZE=4096
 
-NQN="nqn.2026-01.io.spdk:urma-gpu-test"
-SUBSYS_SN="URMAGPU0001"
-LISTEN_PORT=4420
+NQN="${NOF_TARGET_NQN:-nqn.2026-01.io.spdk:urma-gpu-test}"
+SUBSYS_SN="${NOF_TARGET_SUBSYS_SN:-URMAGPU0001}"
+LISTEN_PORT="${NOF_TARGET_PORT:-4420}"
 RAID_NAME="URMA_RAID0"
-TGT_LOG="/tmp/nvmf_tgt.log"
-TGT_PIDFILE="/var/tmp/nvmf_tgt.pid"
+TGT_LOG="${NOF_TARGET_LOGFILE:-/tmp/nvmf_tgt.log}"
+TGT_PIDFILE="${NOF_TARGET_PIDFILE:-/var/tmp/nvmf_tgt.pid}"
+RPC_SOCKET="${NOF_TARGET_RPC_SOCKET:-/var/tmp/spdk.sock}"
+HUGE_DIR="${NOF_TARGET_HUGE_DIR:-/dev/hugepages}"
+HUGEPAGES_MODE="${NOF_HUGEPAGES_MODE:-allocate}"
 
 usage() { awk 'NR==2{inhdr=1} inhdr && /^#/{sub(/^# ?/,""); print; next} inhdr{exit}' "$0"; exit 0; }
 
@@ -143,6 +152,21 @@ fi
 case "$CAPSULE_TRANSPORT" in
     tcp|urma) ;;
     *) abort "-p capsule transport 只支持 tcp 或 urma，收到: $CAPSULE_TRANSPORT" ;;
+esac
+
+[[ "$LISTEN_PORT" =~ ^[0-9]+$ ]] || abort "NOF_TARGET_PORT 必须在 1..65535"
+LISTEN_PORT=$((10#$LISTEN_PORT))
+(( LISTEN_PORT >= 1 && LISTEN_PORT <= 65535 )) ||
+    abort "NOF_TARGET_PORT 必须在 1..65535"
+[[ "$NQN" =~ ^nqn\.[A-Za-z0-9.:-]+$ ]] || abort "NOF_TARGET_NQN 格式无效"
+[[ "$SUBSYS_SN" =~ ^[A-Za-z0-9._-]{1,20}$ ]] || abort "NOF_TARGET_SUBSYS_SN 格式无效"
+[[ "$COREMASK" =~ ^0x[0-9a-fA-F]+$ ]] || abort "-m core mask 必须是十六进制"
+for _path in "$TGT_LOG" "$TGT_PIDFILE" "$RPC_SOCKET" "$HUGE_DIR"; do
+    [[ "$_path" == /* ]] || abort "运行时路径必须是绝对路径: $_path"
+done
+case "$HUGEPAGES_MODE" in
+    allocate|verify) ;;
+    *) abort "NOF_HUGEPAGES_MODE 只能是 allocate 或 verify" ;;
 esac
 
 [ "$(id -u)" -eq 0 ] || abort "必须以 root 运行（sysfs 绑定 + hugepages + 启动 nvmf_tgt）"
@@ -222,9 +246,8 @@ check_root_rw() {
     esac
 }
 
-# 还原残留：把被 vfio-pci 占用、或游离（无驱动）的 NVMe 控制器全部绑回 nvme 驱动。
-# 上一次运行失败/中断会把盘留在 vfio-pci 或无驱动状态，接管前必须先还原，
-# 保证本次是全新的 unbind + bind。
+# 显式 -r 模式还原残留：把 vfio-pci 占用或游离的 NVMe 控制器绑回 nvme。
+# 正常接管流程绝不调用，以免碰到其他 target 正在使用的盘。
 restore_vfio_nvme() {
     local devpath bdf cls drv vid_did st
     local -a restore_list=()
@@ -397,7 +420,7 @@ if [ "$NULL_BDEV_MODE" = 1 ]; then
 echo "=== 3) Null bdev 模式：跳过 vfio-pci 接管 ==="
 _pids="$(pgrep -x nvmf_tgt) $(pgrep -x spdk_tgt) $(pgrep -f 'bin/nvmf_tgt')"
 if [ -n "${_pids// /}" ]; then
-    abort "已有 SPDK 应用在运行 (PID: $_pids)，先 kill 再来"
+    info "已有其他 SPDK 进程 (PID: $_pids)；Null 模式不会接管磁盘，继续检查本实例端口与 RPC socket"
 fi
 info "不会 unbind/bind 任何物理 NVMe；RPC 阶段将创建 $NULL_BDEV_NAME"
 else
@@ -422,14 +445,12 @@ else
     info "noiommu 模式已是 1（$NOIOMMU）"
 fi
 
-# 上次运行失败会把盘留在 vfio-pci/游离状态：nvmf_tgt 必须先停（可能占着残留盘），
-# 再把残留盘还原回 nvme，确保本次是全新的 unbind + bind。
-# 注意旧实例不一定叫 nvmf_tgt（改名/别的 SPDK 应用也会占 core mask），多查几种
+# 其他实例可能持有 vfio 盘；这里绝不执行全局还原。残留盘须由
+# 运维在确认所有 SPDK 进程停止后显式执行 -r 处理。
 _pids="$(pgrep -x nvmf_tgt) $(pgrep -x spdk_tgt) $(pgrep -f 'bin/nvmf_tgt')"
 if [ -n "${_pids// /}" ]; then
-    abort "已有 SPDK 应用在运行 (PID: $_pids)，先 kill 再来（占着 core mask，且 RPC 配置不持久化）"
+    info "已有 SPDK 进程 (PID: $_pids)；只接管本次声明的 NVMe 盘"
 fi
-restore_vfio_nvme
 check_root_rw
 
 # 逐盘 driver_override 接管（SPDK setup.sh 的标准做法，不依赖 new_id 动态 ID 表——
@@ -547,15 +568,25 @@ if [ "$MAX_IO_SIZE" -gt 0 ] && [ "$IB_LARGE_COUNT" -gt 0 ] && [ "$IB_LARGE_COUNT
     warn "-O 大 I/O 时 large_pool_count=$IB_LARGE_COUNT 偏小，建议 ≥256（-I 第 3 个字段）"
 fi
 
-TOTAL_HP=$(awk '/^HugePages_Total/{print $2}' /proc/meminfo)
-if [ "${TOTAL_HP:-0}" -lt "$HUGE_PAGES" ]; then
-    info "HugePages_Total=${TOTAL_HP:-0} < $HUGE_PAGES，尝试补齐"
-    echo "$HUGE_PAGES" > /proc/sys/vm/nr_hugepages 2>/dev/null || warn "写 nr_hugepages 失败"
-    TOTAL_HP=$(awk '/^HugePages_Total/{print $2}' /proc/meminfo)
-    [ "${TOTAL_HP:-0}" -ge "$HUGE_PAGES" ] || abort "HugePages 不足($TOTAL_HP)，nvmf_tgt 起不来"
-else
-    info "HugePages_Total=$TOTAL_HP 足够"
+HP_2M_DIR=/sys/kernel/mm/hugepages/hugepages-2048kB
+[ -r "$HP_2M_DIR/nr_hugepages" ] || abort "找不到 2 MiB hugepage 池: $HP_2M_DIR"
+HP_MOUNT_OPTS=$(awk -v path="$HUGE_DIR" '$2 == path && $3 == "hugetlbfs" {print $4; exit}' /proc/mounts)
+case ",$HP_MOUNT_OPTS," in
+    *,pagesize=2M,*) info "$HUGE_DIR 已按 2 MiB 挂载" ;;
+    *) abort "$HUGE_DIR 不是 pagesize=2M hugetlbfs（options=$HP_MOUNT_OPTS）" ;;
+esac
+TOTAL_HP=$(cat "$HP_2M_DIR/nr_hugepages")
+if [ "$TOTAL_HP" -lt "$HUGE_PAGES" ]; then
+    if [ "$HUGEPAGES_MODE" = verify ]; then
+        abort "2 MiB hugepages=$TOTAL_HP < $HUGE_PAGES；Kubernetes Pod 不应修改宿主机页池"
+    fi
+    info "2 MiB hugepages=$TOTAL_HP < $HUGE_PAGES，尝试补齐"
+    printf '%s\n' "$HUGE_PAGES" > "$HP_2M_DIR/nr_hugepages" || abort "写 2 MiB hugepage 池失败"
+    TOTAL_HP=$(cat "$HP_2M_DIR/nr_hugepages")
+    [ "$TOTAL_HP" -ge "$HUGE_PAGES" ] || abort "2 MiB hugepages 不足($TOTAL_HP)"
 fi
+HP_FREE=$(cat "$HP_2M_DIR/free_hugepages")
+[ "$HP_FREE" -ge "$HUGE_PAGES" ] || abort "空闲 2 MiB hugepages=$HP_FREE < $HUGE_PAGES"
 echo
 
 # listener IP：-i 优先，否则自动探测第一个全局 IPv4（多网卡机器务必用 -i 显式指定）
@@ -573,7 +604,16 @@ info "LD_LIBRARY_PATH=$LIBDIR  SPDK_URMA_DEV_NAME=$DEVNAME  core mask=$COREMASK$
 
 # -I 需要在子系统初始化前设 iobuf 池（iobuf_set_options 仅 SPDK_RPC_STARTUP 可调），
 # 所以先以 --wait-for-rpc 启动，RPC 配完池子再 framework_start_init
-TGT_ARGS=(-m "$COREMASK")
+if [ -f "$TGT_PIDFILE" ]; then
+    _old_pid=$(cat "$TGT_PIDFILE" 2>/dev/null || true)
+    if [[ "$_old_pid" =~ ^[0-9]+$ ]] && kill -0 "$_old_pid" 2>/dev/null; then
+        abort "本实例 PID 文件 $TGT_PIDFILE 指向仍在运行的进程 $_old_pid"
+    fi
+fi
+if "$SPDK_DIR/scripts/rpc.py" -s "$RPC_SOCKET" rpc_get_methods >/dev/null 2>&1; then
+    abort "本实例 RPC socket $RPC_SOCKET 已被其他 SPDK 进程占用"
+fi
+TGT_ARGS=(-m "$COREMASK" --huge-dir "$HUGE_DIR" -r "$RPC_SOCKET")
 if [ -n "${SPDK_URMA_TRACE_ENTRIES:-}" ]; then
     case "$SPDK_URMA_TRACE_ENTRIES" in *[!0-9]*|'') abort "invalid SPDK_URMA_TRACE_ENTRIES" ;; esac
     [ "$SPDK_URMA_TRACE_ENTRIES" -gt 0 ] && \
@@ -586,6 +626,14 @@ nohup env $( [ -n "$DUMP_SEC" ] && echo "SPDK_URMA_TARGET_DUMP_SEC=$DUMP_SEC" ) 
     ./build/bin/nvmf_tgt "${TGT_ARGS[@]}" > "$TGT_LOG" 2>&1 &
 TGT_PID=$!
 echo "$TGT_PID" > "$TGT_PIDFILE"
+TAKEOVER_COMPLETED=0
+cleanup_failed_target() {
+    if [ "$TAKEOVER_COMPLETED" = 0 ]; then
+        kill "$TGT_PID" 2>/dev/null || true
+        rm -f -- "$TGT_PIDFILE"
+    fi
+}
+trap cleanup_failed_target EXIT
 info "nvmf_tgt 已后台启动 PID=$TGT_PID（日志: $TGT_LOG；停止: kill \$(cat $TGT_PIDFILE)）"
 
 RPC="$SPDK_DIR/scripts/rpc.py"
@@ -604,7 +652,7 @@ for _ in $(seq 1 60); do
         fi
         abort "nvmf_tgt 进程退出，启动失败"
     fi
-    if "$RPC" rpc_get_methods >/dev/null 2>&1; then READY=1; break; fi
+    if "$RPC" -s "$RPC_SOCKET" rpc_get_methods >/dev/null 2>&1; then READY=1; break; fi
     sleep 0.5
 done
 [ "$READY" = 1 ] || { tail -n 30 "$TGT_LOG" >&2; abort "30s 内 RPC 未就绪"; }
@@ -612,7 +660,7 @@ ok "RPC 就绪（PID $TGT_PID）"
 
 run_rpc() {
     info "\$ rpc.py $*"
-    if ! "$RPC" "$@"; then
+    if ! "$RPC" -s "$RPC_SOCKET" "$@"; then
         echo "---- nvmf_tgt 日志尾部 ----" >&2
         tail -n 15 "$TGT_LOG" >&2
         abort "RPC 失败: $*"
@@ -723,3 +771,4 @@ if [ "$RAID0_STRIP" -lt 0 ] && [ "${#DISK_LIST[@]}" -gt 1 ]; then
     echo "  # 想单独压某个盘用 urma_perf 的 namespace 选择（或临时去掉其他 ns）"
 fi
 echo "================================================================"
+TAKEOVER_COMPLETED=1
