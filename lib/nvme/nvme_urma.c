@@ -507,6 +507,7 @@ static int
 nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 {
 	urma_jfs_cfg_t jfs = {};
+	const char *failed_stage = NULL;
 	uint32_t capsule_inline_size = spdk_max(
 		(uint32_t)sizeof(struct spdk_urma_capsule_cmd_frame),
 		(uint32_t)sizeof(struct spdk_urma_capsule_rsp_frame));
@@ -554,6 +555,7 @@ nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 		jfr_cfg.jfc = uqpair->device->recv_jfcs[jfr_index];
 		uqpair->jfrs[i] = urma_create_jfr(uqpair->device->context, &jfr_cfg);
 		if (uqpair->jfrs[i] == NULL) {
+			failed_stage = "urma_create_jfr";
 			goto error;
 		}
 		cfg.jfs_cfg = jfs;
@@ -562,12 +564,16 @@ nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 		cfg.shared.jfc = uqpair->device->recv_jfcs[jfr_index];
 		uqpair->jettys[i] = urma_create_jetty(uqpair->device->context, &cfg);
 		if (uqpair->jettys[i] == NULL) {
+			failed_stage = "urma_create_jetty";
 			goto error;
 		}
 	}
 	return 0;
 
 error:
+	SPDK_ERRLOG("URMA IO qpair %u on %s eid_index=%u jetty=%u: %s failed\n",
+		    uqpair->qpair.id, uqpair->device->dev_name,
+		    uqpair->device->eid_index, i, failed_stage);
 	for (uint32_t j = 0; j <= i; j++) {
 		if (uqpair->jettys[j] != NULL) {
 			urma_delete_jetty(uqpair->jettys[j]);
@@ -663,6 +669,10 @@ nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
 		rjetty.tp_type = remote.tp_type;
 		uqpair->target_jettys[i] = urma_import_jetty(uqpair->device->context, &rjetty, &token);
 		if (uqpair->target_jettys[i] == NULL) {
+			SPDK_ERRLOG("URMA IO qpair %u on %s eid_index=%u jetty=%u: "
+				    "urma_import_jetty failed (remote_jetty=%u)\n",
+				    uqpair->qpair.id, uqpair->device->dev_name,
+				    uqpair->device->eid_index, i, remote.jetty_ids[i]);
 			return -EIO;
 		}
 		if (uqpair->device->opts.transport_mode != URMA_TM_RC) {
@@ -670,6 +680,10 @@ nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
 		}
 		status = urma_bind_jetty(uqpair->jettys[i], uqpair->target_jettys[i]);
 		if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+			SPDK_ERRLOG("URMA IO qpair %u on %s eid_index=%u jetty=%u: "
+				    "urma_bind_jetty failed status=%d\n",
+				    uqpair->qpair.id, uqpair->device->dev_name,
+				    uqpair->device->eid_index, i, status);
 			return -EIO;
 		}
 	}

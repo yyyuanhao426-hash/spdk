@@ -576,6 +576,7 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 {
 	struct spdk_urma_device *device = uqpair->device;
 	urma_jfs_cfg_t jfs = {};
+	const char *failed_stage = NULL;
 	uint32_t capsule_inline_size = spdk_max(
 		(uint32_t)sizeof(struct spdk_urma_capsule_cmd_frame),
 		(uint32_t)sizeof(struct spdk_urma_capsule_rsp_frame));
@@ -620,6 +621,7 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 		jfr_cfg.jfc = device->recv_jfcs[jfr_index];
 		uqpair->jfrs[i] = urma_create_jfr(device->context, &jfr_cfg);
 		if (uqpair->jfrs[i] == NULL) {
+			failed_stage = "urma_create_jfr";
 			goto error;
 		}
 		cfg.jfs_cfg = jfs;
@@ -628,12 +630,15 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 		cfg.shared.jfc = device->recv_jfcs[jfr_index];
 		uqpair->jettys[i] = urma_create_jetty(device->context, &cfg);
 		if (uqpair->jettys[i] == NULL) {
+			failed_stage = "urma_create_jetty";
 			goto error;
 		}
 	}
 	return 0;
 
 error:
+	SPDK_ERRLOG("URMA target qpair %u on %s eid_index=%u jetty=%u: %s failed\n",
+		    uqpair->qpair.qid, device->dev_name, device->eid_index, i, failed_stage);
 	for (uint32_t j = 0; j <= i; j++) {
 		if (uqpair->jettys[j] != NULL) {
 			urma_delete_jetty(uqpair->jettys[j]);
