@@ -138,6 +138,7 @@ struct latency_percentiles {
 	uint64_t p50;
 	uint64_t p99;
 	uint64_t p999;
+	uint64_t p9999;
 };
 
 static struct cuda_driver g_cuda;
@@ -1006,6 +1007,12 @@ collect_percentiles(void *ctx, uint64_t start, uint64_t end, uint64_t count,
 	if (percentiles->p999 == 0 && so_far * 1000 >= total * 999) {
 		percentiles->p999 = end;
 	}
+	/* Round8: p99.99 分位。直方图为对数分桶（128 bucket/range，相对分辨率约 0.8%），
+	 * 桶内值有 ~0.8% 量化误差；低 IOPS 短测样本薄（第 ceil(N/10000) 慢样本），判读注意。
+	 * so_far*10000 无溢出风险（样本数 <1e10 时 <1e14，uint64 内）。 */
+	if (percentiles->p9999 == 0 && so_far * 10000 >= total * 9999) {
+		percentiles->p9999 = end;
+	}
 }
 
 static void
@@ -1062,12 +1069,14 @@ print_results(void)
 	printf("completed=%" PRIu64 " bandwidth=%.2f MiB/s IOPS=%.2f\n",
 	       total_ios, bandwidth_mib, iops);
 	if (total_ios != 0) {
-		printf("latency_us avg=%.3f min=%.3f p50=%.3f p99=%.3f p99.9=%.3f max=%.3f\n",
+		printf("latency_us avg=%.3f min=%.3f p50=%.3f p99=%.3f p99.9=%.3f "
+		       "p99.99=%.3f max=%.3f\n",
 		       total_latency * 1000000.0 / ticks_hz / total_ios,
 		       min_latency * 1000000.0 / ticks_hz,
 		       percentiles.p50 * 1000000.0 / ticks_hz,
 		       percentiles.p99 * 1000000.0 / ticks_hz,
 		       percentiles.p999 * 1000000.0 / ticks_hz,
+		       percentiles.p9999 * 1000000.0 / ticks_hz,
 		       max_latency * 1000000.0 / ticks_hz);
 	}
 	/* Modified By Yida: posix(新语义) 单独打印分级拷贝成本——它不计入上面的
