@@ -59,6 +59,7 @@
 #   -y           跳过交互确认（配合 -d 用于自动化）
 # 环境变量：
 #   NOF_HUGEPAGES_MODE=verify 只校验 2 MiB 池（Kubernetes 使用，默认 allocate）
+#   NOF_SKIP_VFIO_RESTORE=1 跳过自动恢复其他实例的 VFIO NVMe 盘；-r 仍可手动恢复
 #   NOF_TARGET_NQN / NOF_TARGET_PORT / NOF_TARGET_SUBSYS_SN 定义导出身份
 #   NOF_TARGET_RPC_SOCKET / NOF_TARGET_PIDFILE / NOF_TARGET_LOGFILE 隔离运行实例
 #   NOF_TARGET_NULL_BDEV_NAME 在 Null 模式下指定 bdev 名称
@@ -106,6 +107,7 @@ TGT_PIDFILE="${NOF_TARGET_PIDFILE:-/var/tmp/nvmf_tgt.pid}"
 RPC_SOCKET="${NOF_TARGET_RPC_SOCKET:-/var/tmp/spdk.sock}"
 HUGE_DIR="${NOF_TARGET_HUGE_DIR:-/dev/hugepages}"
 HUGEPAGES_MODE="${NOF_HUGEPAGES_MODE:-allocate}"
+SKIP_VFIO_RESTORE="${NOF_SKIP_VFIO_RESTORE:-0}"
 
 # 找正在运行的 SPDK target 进程。必须按 /proc/PID/exe 的真实可执行文件判断：
 #   pgrep -f 'bin/nvmf_tgt' 会匹配"命令行里含该字符串"的任何进程（包括
@@ -184,6 +186,10 @@ done
 case "$HUGEPAGES_MODE" in
     allocate|verify) ;;
     *) abort "NOF_HUGEPAGES_MODE 只能是 allocate 或 verify" ;;
+esac
+case "$SKIP_VFIO_RESTORE" in
+    0|1) ;;
+    *) abort "NOF_SKIP_VFIO_RESTORE 只能是 0 或 1" ;;
 esac
 
 [ "$(id -u)" -eq 0 ] || abort "必须以 root 运行（sysfs 绑定 + hugepages + 启动 nvmf_tgt）"
@@ -470,7 +476,13 @@ _pids="$(spdk_tgt_pids)"
 if [ -n "${_pids// /}" ]; then
     abort "已有 SPDK 应用在运行 (PID: $_pids)，先 kill 再来（占着 core mask，且 RPC 配置不持久化）"
 fi
-restore_vfio_nvme
+# Kubernetes 的多 Store Pod 共享宿主机 PCI 总线。自动全局恢复会把另一个
+# 正在运行的 target 所持有的盘解绑；由部署前磁盘选择器做残留检查。
+if [ "$SKIP_VFIO_RESTORE" = 1 ]; then
+    info "跳过全局 VFIO NVMe 恢复（NOF_SKIP_VFIO_RESTORE=1）"
+else
+    restore_vfio_nvme
+fi
 check_root_rw
 
 # 逐盘 driver_override 接管（SPDK setup.sh 的标准做法，不依赖 new_id 动态 ID 表——
