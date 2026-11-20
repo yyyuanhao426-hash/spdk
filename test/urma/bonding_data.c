@@ -6,6 +6,9 @@
 #include "spdk_internal/urma_lifetime.h"
 
 static unsigned registrations, context_exports, context_releases, imports;
+static char diagnostics[16384];
+static int repost_result;
+static unsigned disconnect_count;
 static uint8_t export_marker = 0xac, local_chip = 1;
 static bool require_context = true, use_cache = true, post_error;
 static uint64_t last_user_ctx, last_send_addr;
@@ -16,6 +19,11 @@ static unsigned char last_bytes[sizeof(struct spdk_urma_capsule_cmd_frame)];
 void
 spdk_log(enum spdk_log_level l, const char *f, const int n, const char *fn, const char *fmt, ...)
 {
+	va_list args;
+	size_t used = strlen(diagnostics);
+	va_start(args, fmt);
+	vsnprintf(diagnostics + used, sizeof(diagnostics) - used, fmt, args);
+	va_end(args);
 }
 uint64_t
 spdk_get_ticks(void)
@@ -153,7 +161,13 @@ struct nvmf_urma_reg_entry {
 	struct spdk_nvme_urma_memory_region *region;
 	bool used;
 };
+enum { NVMF_URMA_CQE_CAPSULE_TX = 1, NVMF_URMA_CQE_CAPSULE_RX, NVMF_URMA_CQE_DATA };
+struct nvmf_urma_cqe_ctx {
+	int type;
+	void *owner;
+};
 struct nvmf_urma_qpair {
+	char peer_addr[64], service[16];
 	int fd;
 	uint64_t pending_peek_tick;
 	struct {
@@ -183,14 +197,17 @@ struct nvmf_urma_req {
 	struct spdk_nvme_urma_memory_region *local_region;
 	bool local_region_external;
 	struct nvmf_urma_reg_entry *cache_entry;
-	int state, cqe;
+	int state;
+	struct nvmf_urma_cqe_ctx cqe;
+	union { struct spdk_nvme_cpl nvme_cpl; } rsp;
+	uint64_t exec_tick;
 	uint64_t post_tick;
 	struct {
 		uint32_t flags;
-		uint64_t data_post_tick;
+		uint64_t data_post_tick, exec_tick, data_cpl_tick;
 	} stage_trace;
 };
-enum { NVMF_URMA_REQ_PUSHING, NVMF_URMA_REQ_PULLING };
+enum { NVMF_URMA_REQ_PUSHING, NVMF_URMA_REQ_PULLING, NVMF_URMA_REQ_EXECUTING };
 static struct nvmf_urma_qpair *
 nvmf_urma_qpair(void *p)
 {
@@ -202,6 +219,7 @@ nvmf_urma_import_cache_enabled(void)
 	return use_cache;
 }
 struct nvmf_urma_cmd_rx_slot {
+	struct nvmf_urma_cqe_ctx cqe;
 	struct nvmf_urma_qpair *qpair;
 	struct spdk_urma_capsule_cmd_frame frame;
 };
@@ -223,6 +241,10 @@ nvmf_urma_handle_capsule(struct nvmf_urma_qpair *q, const struct spdk_urma_msg_h
 	parsed_count++;
 	return 1;
 }
+static void nvmf_urma_disconnect_qpair(struct nvmf_urma_qpair *q) { disconnect_count++; }
+static int nvmf_urma_send_response(struct nvmf_urma_req *r) { return 0; }
+static void nvmf_urma_release_req(struct nvmf_urma_req *r) { }
+#define spdk_nvmf_request_exec(r) ((void)(r))
 /* REAL_TARGET_DATA_FUNCTIONS */
 
 enum nvme_urma_cqe_type {
@@ -267,8 +289,7 @@ static struct {
 static int
 nvme_urma_post_rsp_receive(struct nvme_urma_rsp_rx_slot *s)
 {
-	assert(false);
-	return -1;
+	return repost_result;
 }
 static int
 nvme_urma_queue_response(struct nvme_urma_qpair *q, const struct spdk_urma_capsule_rsp *s)
@@ -483,6 +504,7 @@ send_test(void)
 	cr.status = URMA_CR_WR_FLUSH_ERR;
 	assert(nvme_urma_process_capsule_cr(&other, &cr, &done) == 0 && q.deferred_error == -EIO &&
 	       !q.capsule_tx_slots[0].busy);
+	assert(strstr(diagnostics, "role=initiator stage=cr_error"));
 	q.deferred_error = 0;
 	post_error = true;
 	assert(nvme_urma_send_cmd_capsule(&q, &frame) == -EIO && !q.capsule_tx_slots[0].busy);
@@ -499,12 +521,58 @@ send_test(void)
 	spdk_nvme_urma_unregister_memory(q.capsule_tx_region);
 	free(q.capsule_tx_slots);
 }
+static void
+diagnostics_test(void)
+{
+	struct nvmf_urma_qpair target = {0};
+	struct nvmf_urma_cqe_ctx ctx = {NVMF_URMA_CQE_CAPSULE_TX, &target};
+	urma_cr_t cr = {.status = URMA_CR_SUCCESS, .user_ctx = (uint64_t)&ctx};
+	disconnect_count = 0;
+	diagnostics[0] = 0;
+	assert(nvmf_urma_handle_completion_inner(&cr) == 1 && disconnect_count == 0);
+	assert(!strstr(diagnostics, "tx_direction"));
+	cr.flag.bs.s_r = 1;
+	assert(nvmf_urma_handle_completion_inner(&cr) == 1 && disconnect_count == 1);
+	assert(strstr(diagnostics, "role=target stage=tx_direction"));
+	cr.status = URMA_CR_WR_FLUSH_ERR;
+	assert(nvmf_urma_handle_completion_inner(&cr) == 0 && disconnect_count == 2);
+	assert(strstr(diagnostics, "role=target stage=cr_error"));
+
+	struct nvme_urma_qpair owner = {0}, poller = {0};
+	spdk_urma_lifetime_init(&owner.lifetime);
+	struct nvme_urma_cqe_ctx tx = {NVME_URMA_CQE_CAPSULE_TX, &owner};
+	cr = (urma_cr_t){.status = URMA_CR_SUCCESS, .user_ctx = (uint64_t)&tx};
+	cr.flag.bs.s_r = 1;
+	uint32_t completed = 0;
+	bool transferred = false;
+	diagnostics[0] = 0;
+	assert(nvme_urma_process_capsule_cr_inner(&poller, &cr, &completed, &transferred) == 0);
+	assert(owner.deferred_error == -ECONNRESET);
+	assert(strstr(diagnostics, "role=initiator stage=tx_direction"));
+
+	struct nvme_urma_rsp_rx_slot rx = {.qpair = &owner};
+	rx.cqe.type = NVME_URMA_CQE_CAPSULE_RX;
+	rx.cqe.owner = &rx;
+	cr.user_ctx = (uint64_t)&rx.cqe;
+	cr.opcode = URMA_CR_OPC_SEND;
+	cr.completion_len = sizeof(rx.frame);
+	owner.deferred_error = 0;
+	repost_result = -EIO;
+	diagnostics[0] = 0;
+	assert(nvme_urma_process_capsule_cr_inner(&poller, &cr, &completed, &transferred) == 0);
+	assert(owner.deferred_error == -EIO);
+	assert(strstr(diagnostics, "stage=recv_repost"));
+	assert(!strstr(diagnostics, "stage=cr_error"));
+	repost_result = 0;
+	puts("PASS real target TX-direction guard and CR errors, initiator owner routing and successful-CR receive-repost diagnostics");
+}
 int
 main(void)
 {
 	target_data_test();
 	decode_test();
 	send_test();
+	diagnostics_test();
 	puts("PASS full segment export/import lifetime, whole-pool cache identity, real "
 	     "optical/electrical WRs, raw inline and non-inline SEND ownership");
 	return 0;

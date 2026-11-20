@@ -684,6 +684,9 @@ nvmf_urma_post_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot)
 			 &slot->wr, &bad_wr);
 	if (status != URMA_SUCCESS) {
 		spdk_urma_rx_ref_post_failed(&slot->rx_ref, &uqpair->lifetime);
+		SPDK_ERRLOG("URMA_DIAG role=target stage=recv_post owner=%p peer=%s service=%s "
+			    "qid=%u provider_status=%d bad_wr=%p\n", uqpair,
+			    uqpair->peer_addr, uqpair->service, uqpair->qpair.qid, status, bad_wr);
 		return -EIO;
 	}
 	return 0;
@@ -1580,6 +1583,9 @@ nvmf_urma_poll_group_add(struct spdk_nvmf_transport_poll_group *base, struct spd
 	uqpair->thread = spdk_get_thread();
 	rc = nvmf_urma_capsule_resources_init(uqpair);
 	if (rc != 0) {
+		SPDK_ERRLOG("URMA_DIAG role=target stage=rx_init owner=%p peer=%s service=%s "
+			    "qid=%u rc=%d\n", uqpair, uqpair->peer_addr, uqpair->service,
+			    uqpair->qpair.qid, rc);
 		uqpair->thread = NULL;
 		uqpair->group = NULL;
 		free(uqpair->reqs);
@@ -1588,6 +1594,9 @@ nvmf_urma_poll_group_add(struct spdk_nvmf_transport_poll_group *base, struct spd
 		return rc;
 	}
 	TAILQ_INSERT_TAIL(&group->qpairs, uqpair, link);
+	SPDK_NOTICELOG("URMA_DIAG role=target stage=rx_ready owner=%p peer=%s service=%s "
+		       "qid=%u recv_count=%u\n", uqpair, uqpair->peer_addr,
+		       uqpair->service, uqpair->qpair.qid, uqpair->capsule_rx_count);
 	return 0;
 }
 
@@ -1604,10 +1613,14 @@ nvmf_urma_poll_group_remove(struct spdk_nvmf_transport_poll_group *base, struct 
 static void nvmf_urma_release_req(struct nvmf_urma_req *ureq);
 
 static void
-nvmf_urma_disconnect_qpair(struct nvmf_urma_qpair *uqpair)
+nvmf_urma_disconnect_qpair_at(struct nvmf_urma_qpair *uqpair, const char *caller, int line)
 {
 	int rc;
 
+	SPDK_ERRLOG("URMA_DIAG role=target stage=disconnect owner=%p peer=%s service=%s "
+		    "qid=%u caller=%s:%d active=%d fd=%d\n", uqpair,
+		    uqpair->peer_addr, uqpair->service, uqpair->qpair.qid, caller, line,
+		    spdk_nvmf_qpair_is_active(&uqpair->qpair), uqpair->fd);
 	if (!spdk_nvmf_qpair_is_active(&uqpair->qpair)) {
 		return;
 	}
@@ -1617,6 +1630,9 @@ nvmf_urma_disconnect_qpair(struct nvmf_urma_qpair *uqpair)
 			    uqpair->qpair.qid, rc);
 	}
 }
+
+#define nvmf_urma_disconnect_qpair(qpair) \
+	nvmf_urma_disconnect_qpair_at((qpair), __func__, __LINE__)
 
 /* Every completion-enabled WR owns a lifetime reference before it becomes
  * visible to the device.  A polled CR keeps that same reference while it is in
@@ -1673,6 +1689,7 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 		};
 		urma_jfs_wr_t wr = {}, *bad_wr = NULL;
 		uint32_t jetty_index = nvmf_urma_next_jetty(uqpair);
+		urma_status_t post_status;
 
 		wr.opcode = URMA_OPC_SEND;
 		wr.flag.bs.complete_enable = 1;
@@ -1683,8 +1700,12 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 		wr.send.src.num_sge = 1;
 		if (!spdk_urma_lifetime_try_get(&uqpair->lifetime)) {
 			rc = -ESHUTDOWN;
-		} else if (urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr,
-						    &bad_wr) != URMA_SUCCESS) {
+		} else if ((post_status = urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr,
+							      &bad_wr)) != URMA_SUCCESS) {
+			SPDK_ERRLOG("URMA_DIAG role=target stage=response_send owner=%p "
+				    "peer=%s service=%s qid=%u cid=%u provider_status=%d bad_wr=%p\n",
+				    uqpair, uqpair->peer_addr, uqpair->service, uqpair->qpair.qid,
+				    rsp.cpl.cid, post_status, bad_wr);
 			spdk_urma_lifetime_put(&uqpair->lifetime);
 			rc = -EIO;
 		} else {
@@ -1696,6 +1717,12 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 		memcpy(msg, &hdr, sizeof(hdr));
 		memcpy(msg + sizeof(hdr), &rsp, sizeof(rsp));
 		rc = nvmf_urma_write_full(uqpair->fd, msg, sizeof(msg));
+	}
+	if (ureq->cmd.nvme_cmd.opc == SPDK_NVME_OPC_FABRIC) {
+		SPDK_NOTICELOG("URMA_DIAG role=target stage=response_post owner=%p peer=%s service=%s "
+			       "qid=%u cid=%u rc=%d sct=%u sc=%u\n", uqpair, uqpair->peer_addr,
+			       uqpair->service, uqpair->qpair.qid, rsp.cpl.cid, rc,
+			       rsp.cpl.status.sct, rsp.cpl.status.sc);
 	}
 	/* Modified By Yida(v3): W10 send rsp + target service total (parse -> rsp written) */
 	if (ureq->start_tick != 0) {
@@ -1741,6 +1768,7 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	urma_jfs_wr_t wr = {}, *bad_wr = NULL;
 	bondp_jfs_wr_t affinity_wr = {};
 	uint32_t jetty_index;
+	urma_status_t post_status;
 	int rc;
 
 	if (ureq->req.iovcnt != 1) {
@@ -1890,13 +1918,21 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 		spdk_urma_bonding_chip_ids(device->opts.electrical_network, local_chip,
 					   ureq->remote_data.chip_id, &affinity_wr.src_chip_id,
 					   &affinity_wr.dst_chip_id);
-		if (urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &affinity_wr.base,
-					     &bad_wr) != URMA_SUCCESS) {
+		post_status = urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &affinity_wr.base,
+					       &bad_wr);
+		if (post_status != URMA_SUCCESS) {
+			SPDK_ERRLOG("URMA_DIAG role=target stage=data_post_affinity owner=%p "
+				    "qid=%u provider_status=%d src_chip=%u dst_chip=%u bad_wr=%p\n",
+				    uqpair, uqpair->qpair.qid, post_status, affinity_wr.src_chip_id,
+				    affinity_wr.dst_chip_id, bad_wr);
 			spdk_urma_lifetime_put(&uqpair->lifetime);
 			return -EIO;
 		}
-	} else if (urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr, &bad_wr) !=
-		   URMA_SUCCESS) {
+	} else if ((post_status = urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr,
+						      &bad_wr)) != URMA_SUCCESS) {
+		SPDK_ERRLOG("URMA_DIAG role=target stage=data_post owner=%p qid=%u "
+			    "provider_status=%d bad_wr=%p\n", uqpair, uqpair->qpair.qid,
+			    post_status, bad_wr);
 		spdk_urma_lifetime_put(&uqpair->lifetime);
 		return -EIO;
 	}
@@ -1969,6 +2005,12 @@ nvmf_urma_handle_capsule(struct nvmf_urma_qpair *uqpair,
 	}
 	if (capsule->data.length > uqpair->max_io_size || hdr->qid != uqpair->qpair.qid) {
 		return capsule->data.length > uqpair->max_io_size ? -EMSGSIZE : -EPROTO;
+	}
+	if (capsule->cmd.opc == SPDK_NVME_OPC_FABRIC) {
+		SPDK_NOTICELOG("URMA_DIAG role=target stage=cmd_received owner=%p peer=%s service=%s "
+			       "qid=%u cid=%u opcode=%u data_len=%u\n", uqpair, uqpair->peer_addr,
+			       uqpair->service, hdr->qid, capsule->cmd.cid, capsule->cmd.opc,
+			       capsule->data.length);
 	}
 	ureq = TAILQ_FIRST(&uqpair->free_reqs);
 	if (ureq == NULL) {
@@ -2201,6 +2243,14 @@ nvmf_urma_handle_completion_inner(const urma_cr_t *completion)
 		return -EPROTO;
 	}
 	if (completion->status != URMA_CR_SUCCESS) {
+		SPDK_ERRLOG("URMA_DIAG role=target stage=cr_error owner=%p peer=%s service=%s "
+			    "qid=%u ctx_type=%d status=%d flags=0x%x s_r=%u "
+			    "opcode_raw=%u len=%u local_id=%u tpn=%u user_ctx=%p\n",
+			    uqpair, uqpair->peer_addr, uqpair->service, uqpair->qpair.qid,
+			    ctx->type, completion->status, (unsigned)completion->flag.value,
+			    (unsigned)completion->flag.bs.s_r, (unsigned)completion->opcode,
+			    completion->completion_len, completion->local_id, completion->tpn,
+			    (void *)completion->user_ctx);
 		SPDK_ERRLOG("poll_group: completion error status=%d type=%d user_ctx=%p\n",
 			    completion->status, ctx->type, (void *)completion->user_ctx);
 		if (ctx->type != NVMF_URMA_CQE_DATA) {
@@ -2222,6 +2272,12 @@ nvmf_urma_handle_completion_inner(const urma_cr_t *completion)
 	}
 	if (ctx->type == NVMF_URMA_CQE_CAPSULE_TX) {
 		if (completion->flag.bs.s_r != 0) {
+			SPDK_ERRLOG("URMA_DIAG role=target stage=tx_direction owner=%p peer=%s service=%s "
+				    "qid=%u ctx_type=%d status=%d flags=0x%x s_r=%u "
+				    "local_id=%u tpn=%u user_ctx=%p\n", uqpair, uqpair->peer_addr,
+				    uqpair->service, uqpair->qpair.qid, ctx->type, completion->status,
+				    (unsigned)completion->flag.value, (unsigned)completion->flag.bs.s_r,
+				    completion->local_id, completion->tpn, (void *)completion->user_ctx);
 			nvmf_urma_disconnect_qpair(uqpair);
 		}
 		return 1;
@@ -2230,6 +2286,10 @@ nvmf_urma_handle_completion_inner(const urma_cr_t *completion)
 		int rc = nvmf_urma_process_cmd_receive(ctx->owner, completion);
 
 		if (rc < 0) {
+			SPDK_ERRLOG("URMA_DIAG role=target stage=cmd_receive owner=%p peer=%s service=%s "
+				    "qid=%u rc=%d flags=0x%x len=%u\n", uqpair,
+				    uqpair->peer_addr, uqpair->service, uqpair->qpair.qid, rc,
+				    (unsigned)completion->flag.value, completion->completion_len);
 			nvmf_urma_disconnect_qpair(uqpair);
 			return 0;
 		}
@@ -2435,7 +2495,7 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 			int rc = nvmf_urma_check_lifetime_socket(uqpair);
 
 			if (rc < 0) {
-				SPDK_DEBUGLOG(nvmf_urma, "qpair qid=%u lifetime socket closed, rc=%d\n",
+				SPDK_ERRLOG("URMA_DIAG role=target stage=socket_close qid=%u rc=%d\n",
 					      uqpair->qpair.qid, rc);
 				/* spdk_nvmf_qpair_disconnect() may synchronously remove and free
 				 * this qpair, so do not access uqpair after this call. */

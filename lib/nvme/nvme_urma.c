@@ -742,6 +742,9 @@ nvme_urma_post_rsp_receive(struct nvme_urma_rsp_rx_slot *slot)
 			 &slot->wr, &bad_wr);
 	if (status != URMA_SUCCESS) {
 		spdk_urma_rx_ref_post_failed(&slot->rx_ref, &uqpair->lifetime);
+		SPDK_ERRLOG("URMA_DIAG role=initiator stage=recv_post owner=%p qid=%u "
+			    "provider_status=%d bad_wr=%p\n",
+			    uqpair, uqpair->qpair.id, status, bad_wr);
 		return -EIO;
 	}
 	return 0;
@@ -1371,6 +1374,13 @@ nvme_urma_process_capsule_cr_inner(struct nvme_urma_qpair *poller, const urma_cr
 		if (spdk_urma_lifetime_is_closing(&owner->lifetime)) {
 			return 0;
 		}
+		SPDK_ERRLOG("URMA_DIAG role=initiator stage=cr_error owner=%p poller=%p "
+			    "qid=%u ctx_type=%d status=%d flags=0x%x s_r=%u "
+			    "opcode_raw=%u len=%u local_id=%u tpn=%u user_ctx=%p\n",
+			    owner, poller, owner->qpair.id, ctx->type, cr->status,
+			    (unsigned)cr->flag.value, (unsigned)cr->flag.bs.s_r,
+			    (unsigned)cr->opcode, cr->completion_len, cr->local_id, cr->tpn,
+			    (void *)cr->user_ctx);
 		/* SE_Review #5: 错误 CR 归属 owner，而不是恰好轮到它的 poller。 */
 		nvme_urma_qpair_defer_error(owner, -EIO);
 		return 0;
@@ -1380,7 +1390,14 @@ nvme_urma_process_capsule_cr_inner(struct nvme_urma_qpair *poller, const urma_cr
 			return 0;
 		}
 		if (cr->flag.bs.s_r != 0) {
-			/* s_r 表示对端已关连接：故障属于 owner 这条连接。 */
+			SPDK_ERRLOG("URMA_DIAG role=initiator stage=tx_direction owner=%p "
+				    "poller=%p qid=%u ctx_type=%d status=%d flags=0x%x "
+				    "s_r=%u local_id=%u tpn=%u user_ctx=%p\n",
+				    owner, poller, owner->qpair.id, ctx->type, cr->status,
+				    (unsigned)cr->flag.value, (unsigned)cr->flag.bs.s_r,
+				    cr->local_id, cr->tpn, (void *)cr->user_ctx);
+			/* s_r denotes receive direction, not a peer-close notification.
+			 * Preserve the existing failure policy while recording the anomaly. */
 			nvme_urma_qpair_defer_error(owner, -ECONNRESET);
 		}
 		return 0;
@@ -1400,6 +1417,9 @@ nvme_urma_process_capsule_cr_inner(struct nvme_urma_qpair *poller, const urma_cr
 		}
 		rc = nvme_urma_post_rsp_receive(slot);
 		if (rc != 0) {
+			SPDK_ERRLOG("URMA_DIAG role=initiator stage=recv_repost owner=%p "
+				    "poller=%p qid=%u rc=%d cr_status=%d\n", owner, poller,
+				    owner->qpair.id, rc, cr->status);
 			nvme_urma_qpair_defer_error(owner, rc);
 			return 0;
 		}
@@ -1557,6 +1577,7 @@ nvme_urma_process_capsule_completions(struct nvme_urma_qpair *uqpair,
 static int
 nvme_urma_check_lifetime_socket(struct nvme_urma_qpair *uqpair)
 {
+	int saved_errno;
 	uint8_t byte;
 	ssize_t rc;
 
@@ -1566,12 +1587,22 @@ nvme_urma_check_lifetime_socket(struct nvme_urma_qpair *uqpair)
 		return -EPROTO;
 	}
 	if (rc == 0) {
+		SPDK_ERRLOG("URMA_DIAG role=initiator stage=socket_eof owner=%p qid=%u "
+			    "endpoint=%s:%s fd=%d\n", uqpair, uqpair->qpair.id,
+			    uqpair->qpair.ctrlr->trid.traddr, uqpair->qpair.ctrlr->trid.trsvcid,
+			    uqpair->fd);
 		return -ECONNRESET;
 	}
 	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
 		return 0;
 	}
-	return -errno;
+	saved_errno = errno;
+
+	SPDK_ERRLOG("URMA_DIAG role=initiator stage=socket_error owner=%p qid=%u "
+		    "endpoint=%s:%s fd=%d errno=%d\n", uqpair, uqpair->qpair.id,
+		    uqpair->qpair.ctrlr->trid.traddr, uqpair->qpair.ctrlr->trid.trsvcid,
+		    uqpair->fd, saved_errno);
+	return -saved_errno;
 }
 
 static int32_t
@@ -1683,6 +1714,9 @@ fail:
 	 * 对齐 nvme_tcp.c fail: 语义。 */
 	SPDK_ERRLOG("URMA qpair %u: fatal rc=%d, disconnecting for reconnect\n",
 		    qpair->id, rc);
+	SPDK_ERRLOG("URMA_DIAG role=initiator stage=fatal owner=%p endpoint=%s:%s "
+		    "qid=%u rc=%d fd=%d\n", uqpair, qpair->ctrlr->trid.traddr,
+		    qpair->ctrlr->trid.trsvcid, qpair->id, rc, uqpair->fd);
 	qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_UNKNOWN;
 	nvme_ctrlr_disconnect_qpair(qpair);
 	return -ENXIO;

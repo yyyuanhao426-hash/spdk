@@ -164,7 +164,8 @@ def main():
                 target_functions = "".join(extract_function(target, name) for name in (
                     "nvmf_urma_next_jetty", "nvmf_urma_seg_hash", "nvmf_urma_import_cache_find",
                     "nvmf_urma_import_cache_fini", "nvmf_urma_post_data", "nvmf_urma_read_full",
-                    "nvmf_urma_receive_capsule", "nvmf_urma_process_cmd_receive"))
+                    "nvmf_urma_receive_capsule", "nvmf_urma_process_cmd_receive",
+                    "nvmf_urma_handle_completion_inner"))
                 send_functions = "".join(extract_function(source, name) for name in (
                     "nvme_urma_next_jetty", "nvme_urma_tx_pool_init", "nvme_urma_send_cmd_capsule",
                     "nvme_urma_cr_owner_qpair", "nvme_urma_qpair_defer_error",
