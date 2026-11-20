@@ -8,7 +8,7 @@
 
 ## 当前分支实现快照
 
-当前 `urma_sendrec_v3` 分支已经提供可联调代码，而不是仅有接口占位：
+当前 `urma_enable_v2` 分支已经提供可联调代码，而不是仅有接口占位：
 
 - SPDK initiator 与 NVMf target 均注册独立的 `URMA` transport，没有调用 NVMe/RDMA transport。
 - TCP socket 始终承担 endpoint 描述符交换；NVMe command capsule 和 completion 可配置为 TCP 或 URMA SEND/RECV，有数据的 command 使用 URMA READ/WRITE 搬运 payload。
@@ -115,14 +115,15 @@ python3 test/urma/registration_build.py --umdk /path/to/gpu-capable/UMDK
 
 默认值参考 Mooncake 当前 URMA 实现：RM 模式、每块本地 NIC 共享 2 个发送 JFC 和 2 个接收 JFC、每个远端 NIC endpoint 1 个 Jetty、JFC 深度 4096、Jetty 深度 2048、max_sge 5、rnr_retry 7、err_timeout 17、token `0xACFE`，active port 默认自动选择。priority 默认根据设备 `priority_info` 自动选择 CTP 对应项。
 
-SPDK 使用以下环境变量；为便于与 Mooncake 联调，四个 Mooncake 同名变量也作为低优先级兼容入口：
+SPDK 使用以下环境变量。目前只有一个 Mooncake 变量名作为低优先级回退被读取：`SPDK_URMA_ELECTRICAL_NETWORK_ENABLE` 未设置时读取 `MC_UB_ELECTRICAL_NETWORK_ENABLE`。其余 `MC_URMA_*` / `MC_UB_*` 变量均不被代码读取，按 Mooncake 习惯只设置它们会静默落回 SPDK 默认值：
 
-| SPDK 参数 | Mooncake 兼容参数 | 默认值 |
+| SPDK 参数 | Mooncake 回退变量 | 默认值 |
 |---|---|---|
-| `SPDK_URMA_TRANS_MODE` | `MC_URMA_TRANS_MODE` | `RM` |
-| `SPDK_URMA_ACTIVE_PORT` | `MC_URMA_ACTIVE_PORT` | 自动选择 active port |
-| `SPDK_URMA_BONDING_BALANCE` | `MC_URMA_BONDING_BALANCE` | `false` |
-| `SPDK_URMA_BONDING_MULTIPATH_ENABLE` | `MC_URMA_BONDING_MULTIPATH_ENABLE` | `false` |
+| `SPDK_URMA_TRANS_MODE` | 无 | `RM` |
+| `SPDK_URMA_ACTIVE_PORT` | 无 | 自动选择 active port |
+| `SPDK_URMA_BONDING_BALANCE` | 无 | `false` |
+| `SPDK_URMA_BONDING_MULTIPATH_ENABLE` | 无 | `false` |
+| `SPDK_URMA_ELECTRICAL_NETWORK_ENABLE` | `MC_UB_ELECTRICAL_NETWORK_ENABLE` | `false` |
 | `SPDK_URMA_DEV_NAME` | 无 | 第一个匹配设备 |
 | `SPDK_URMA_EID_INDEX` | 无 | `0`，不存在时使用首个 EID |
 | `SPDK_URMA_SEND_JFC_COUNT` | 无 | `2`；`SPDK_URMA_JFC_COUNT` 为兼容别名 |
@@ -134,15 +135,21 @@ SPDK 使用以下环境变量；为便于与 Mooncake 联调，四个 Mooncake �
 | `SPDK_URMA_CAPSULE_TRANSPORT` | 无 | `tcp`；可设为 `sendrecv` |
 | `SPDK_URMA_TP_TYPE` | 无 | `ctp`；可设为 `rtp` |
 | `SPDK_URMA_JETTY_PRIORITY` | 无 | 自动从 `priority_info` 选择；显式值范围 `0..15` 且必须匹配 TP type |
-| `SPDK_URMA_NUMA_AFFINITY_ENABLE` | `MC_UB_NUMA_AFFINITY_ENABLE` | `false` |
+| `SPDK_URMA_NUMA_AFFINITY_ENABLE` | 无 | `false` |
+
+**与 Mooncake TE 的策略口径差异（部署前必读）**：
+
+- `SPDK_URMA_BONDING_MULTIPATH_ENABLE=1` 选择 `BALANCE+IODIE`；Mooncake TE 的 `MC_URMA_BONDING_MULTIPATH_ENABLE=on` 选择 `BALANCE+PORT`。**同名开关语义相反**，不要照搬 Mooncake 的取值。需要 `BALANCE+PORT` 时用 `SPDK_URMA_BONDING_BALANCE=1` + `SPDK_URMA_BONDING_MULTIPATH_ENABLE=0`（见上文 wire v6 段）。
+- SPDK 的 `electrical_network` 默认 `false`（光互联），Mooncake TE 的 `ub_electrical_network` 默认 `true`（电互联）。`numa_affinity` 打开时，前者 WR 选路为 `{local,remote}`、后者为 `{remote,remote}`；两端应显式配置，不要依赖默认值一致。
+- SPDK 只在 `bonding_balance || bonding_multipath` 时下发 `SET_BONDING_MODE` 且 mode 恒 `BALANCE`；Mooncake TE 对 bonding 设备无条件下发（含 `STANDALONE/PORT`）。裸设备缺省模式下发是有意规避 jetty UAF，属有意分歧。
 
 NVMf target 的 transport-specific JSON 还可覆盖 `dev_name`、`trans_mode`、`capsule_transport`、`active_port`、`eid_index`、`send_jfc_count`、`recv_jfc_count`、`jfc_depth`、`num_jetty_per_ep`、`jetty_depth`、`priority`、`tp_type`、`bonding_balance`、`bonding_multipath` 和 `numa_affinity`。`capsule_transport` 接受 `tcp` 或 `sendrecv`，`tp_type` 接受 `ctp` 或 `rtp`。initiator 与 target 必须配置成相同 capsule、transport、TP type 和 endpoint Jetty 数；握手发现不一致时会拒绝连接。
 
-同一进程内每块本地 NIC 只创建一个 URMA context。该 context 的 JFC/JFR、内存域和 target iobuf 整池注册由所有 endpoint/qpair 共享；target 的远端 segment import cache 是 context 级分桶哈希表，并以 `URMA_NON_CACHEABLE` 导入。启用 `bonding_multipath` 后 JFS 打开 multi-path 并将设备设置为 BALANCE/IODIE；再启用 `numa_affinity` 时，数据 WR 根据 initiator buffer 的 NUMA 节点携带 chip affinity。NUMA 到 chip 的映射优先读取 sysfs `physical_package_id` 并按 package 排序生成 1-based chip ID，受限环境无法读取时才回退到节点前后半区启发式。
+同一进程内每块本地 NIC 只创建一个 URMA context。该 context 的 JFC/JFR、内存域和 target iobuf 整池注册由所有 endpoint/qpair 共享；target 的远端 segment import cache 是 context 级分桶哈希表，并以 `URMA_NON_CACHEABLE` 导入。`bonding_balance`（bonding 设备）或 `bonding_multipath` 任一开启时，initiator/target 创建的 JFS 均开启 `multi_path=1`；`SPDK_URMA_BONDING_MULTIPATH_ENABLE=1` 另将设备 bonding level 切到 IODIE，BALANCE+PORT 则保持 PORT。再启用 `numa_affinity` 时，数据 WR 根据 initiator buffer 的 NUMA 节点携带 chip affinity。NUMA 到 chip 的映射优先读取 sysfs `physical_package_id` 并按 package 排序生成 1-based chip ID，受限环境无法读取时才回退到节点前后半区启发式。
 
 `tcp` 保持原有 capsule 数据路径，也是默认值。`sendrecv` 只把 command/response capsule 切换到 URMA SEND/RECV：建连握手仍走 TCP，I/O payload 仍走 URMA READ/WRITE。SEND 使用 inline WQE；设备的 `max_jfs_inline_len` 不足以容纳 capsule frame 时，qpair 创建会失败。接收端按协商后的队列深度预投递 receive WR，并在消费 completion 后先补回 receive WR 再交付 NVMe completion。
 
-握手描述符现在携带 Jetty 列表和数据 buffer chip ID，因此 wire version 更新为 3；新旧版本会在握手阶段明确拒绝，而不会继续使用不一致的帧布局。
+握手描述符现在逐 jetty 携带 `urma_get_rjetty()` 返回的完整 provider context，command capsule 另带完整 `urma_get_seg_ctx()` context，因此 wire version 为 **6**（v4/v5/v6 不可混用，两端须同步重编）；新旧版本会在握手阶段明确拒绝，而不会继续使用不一致的帧布局。
 
 ### 最小联调示例
 
