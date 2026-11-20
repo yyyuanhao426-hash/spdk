@@ -53,6 +53,11 @@ static urma_transport_mode_t mode;
 static int exports, releases, imports, binds, fail_export = -1;
 static unsigned export_length;
 static urma_target_jetty_t imported[64];
+/* Provider descriptors are opaque to the exporter. A sentinel tp_type that
+ * differs from the device's configured mode lets the tests detect a write
+ * into the provider-owned buffer before urma_put_rjetty() releases it. */
+static urma_tp_type_t provider_tp_type = URMA_CTP;
+static bool provider_descriptor_mutated;
 
 void
 spdk_log(enum spdk_log_level l, const char *f, const int n, const char *fn, const char *fmt, ...)
@@ -74,7 +79,7 @@ urma_get_rjetty(urma_jetty_t *j, urma_rjetty_t **out, uint32_t *length)
 	assert(*out);
 	(*out)->jetty_id = j->jetty_id;
 	(*out)->trans_mode = mode;
-	(*out)->tp_type = URMA_CTP;
+	(*out)->tp_type = provider_tp_type;
 	(*out)->type = URMA_JETTY;
 	if (extra && *length >= sizeof(**out) + extra) {
 		(*out)->flag.bs.has_drv_ext = 1;
@@ -89,6 +94,10 @@ void
 urma_put_rjetty(urma_rjetty_t *r)
 {
 	releases++;
+	/* Provider-owned descriptors must be released untouched. */
+	if (r->tp_type != provider_tp_type) {
+		provider_descriptor_mutated = true;
+	}
 	free(r);
 }
 urma_target_jetty_t *
@@ -167,6 +176,8 @@ counters_reset(void)
 	exports = releases = imports = binds = 0;
 	fail_export = -1;
 	export_length = 0;
+	provider_tp_type = URMA_CTP;
+	provider_descriptor_mutated = false;
 }
 static void
 roundtrip(bool bond, urma_transport_mode_t m, unsigned count)
@@ -268,6 +279,38 @@ validation(void)
 	export_length = sizeof(urma_rjetty_t);
 	assert(spdk_urma_export_rjettys(&e.d, e.jp, &d, &data) == -EPROTO && data == NULL);
 }
+/* Regression: the exporter must patch its own copy of the rjetty blob, not the
+ * provider-owned descriptor returned by urma_get_rjetty(). The provider hands
+ * back a tp_type that differs from the device's configured mode; writing into
+ * that buffer would be caught by urma_put_rjetty(). */
+static void
+provider_buffer_immutable(void)
+{
+	bonding = true;
+	mode = URMA_TM_RM;
+	counters_reset();
+	provider_tp_type = URMA_RTP;
+	struct endpoint a, b;
+	endpoint_init(&a, 1, 1);
+	endpoint_init(&b, 2, 1);
+	struct spdk_urma_endpoint_desc d = {.eid = a.d.eid,
+					    .jetty_count = 1,
+					    .transport_mode = mode,
+					    .tp_type = URMA_CTP};
+	d.jetty_ids[0] = a.js[0].jetty_id.id;
+	uint8_t *data = NULL;
+	assert(spdk_urma_export_rjettys(&a.d, a.jp, &d, &data) == 0 && data != NULL);
+	assert(exports == 1 && releases == 1);
+	assert(!provider_descriptor_mutated);
+	/* The exported copy must still carry the local CTP mode. */
+	urma_rjetty_t *exported = (urma_rjetty_t *)data;
+	assert(exported->tp_type == URMA_CTP);
+	urma_target_jetty_t *t = NULL;
+	b.d.opts.tp_type = URMA_CTP;
+	assert(spdk_urma_import_rjetty(&b.d, &d, 0, data, &t) == 0);
+	free(data);
+	counters_reset();
+}
 static void
 fragmented(void)
 {
@@ -368,9 +411,10 @@ main(void)
 		roundtrip(false, URMA_TM_RM, n);
 	}
 	validation();
+	provider_buffer_immutable();
 	fragmented();
 	puts("PASS complete provider bytes, both real HELLO paths, multi-jetty RM/RC, fragmented "
-	     "TCP, invalid frames and cleanup");
+	     "TCP, invalid frames, provider buffer immutability and cleanup");
 #else
 	roundtrip(false, URMA_TM_RM, 1);
 	bonding = true;

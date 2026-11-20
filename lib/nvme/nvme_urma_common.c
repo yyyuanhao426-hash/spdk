@@ -111,14 +111,23 @@ spdk_urma_export_rjettys(struct spdk_urma_device *device, urma_jetty_t **jettys,
 				    device->dev_name);
 			rc = -EPROTO;
 		} else {
-			/* Match the selected CTP/RTP mode, as in the Mooncake TE path. */
-			rjetty->tp_type = device->opts.tp_type;
 			grown = realloc(buffer, used + length);
 			if (grown == NULL) {
 				rc = -ENOMEM;
 			} else {
+				urma_tp_type_t tp_type = device->opts.tp_type;
+
 				buffer = grown;
 				memcpy(buffer + used, rjetty, length);
+				/* Match the selected CTP/RTP mode, as in the Mooncake TE
+				 * path, but patch our own copy: urma_get_rjetty() returns a
+				 * provider-owned descriptor that urma_put_rjetty() releases
+				 * immediately after this block, and it may be const/shared.
+				 * Concatenated blobs need not preserve the SDK's alignment,
+				 * so patch by offset instead of casting to urma_rjetty_t *.
+				 */
+				memcpy(buffer + used + offsetof(urma_rjetty_t, tp_type),
+				       &tp_type, sizeof(tp_type));
 				desc->rjetty_lengths[i] = length;
 				used += length;
 			}
