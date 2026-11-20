@@ -104,6 +104,9 @@ CONFIG_RDMA_CM=cma
 # Requires liburma and the URMA public headers.
 CONFIG_URMA=n
 CONFIG_URMA_DIR=
+# Detected automatically: complete provider context export API.
+CONFIG_URMA_RJETTY=n
+CONFIG_URMA_SEG_CTX=n
 # Optional accelerator registration mechanisms. Neither requires CONFIG_CUDA.
 CONFIG_URMA_PEERMEM=n
 CONFIG_URMA_DMABUF=n

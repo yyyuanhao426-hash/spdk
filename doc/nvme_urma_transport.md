@@ -27,7 +27,7 @@ make -j
 
 关闭该功能使用 `--without-urma`。配置项为 `CONFIG_URMA` 和 `CONFIG_URMA_DIR`，关闭时不会编译 URMA transport，也不会引入 `liburma`。
 
-`--with-urma` 默认仅启用 HOST 注册和基础 transport/bonding，不要求定制
+`--with-urma` 默认启用 HOST 注册和基础 transport；bonding 还要求下文的 rjetty 导出接口，不要求定制
 `is_gpu_seg` 字段、`urma_register_seg_dmabuf` 符号或 CUDA provider。异构内存注册
 通过两个默认关闭的独立选项开启，且均要求 `--with-urma`：
 
@@ -60,6 +60,51 @@ python3 test/urma/registration_build.py --umdk /path/to/gpu-capable/UMDK
 
 该测试从指定 SDK 构造缺字段/缺符号的头文件版本，编译实际注册代码和测试工具，
 检查四种构建组合的符号依赖、注册/降级/资源清理，以及 configure 能力探针。
+
+### Bonding 完整上下文与光互联（wire v6）
+
+本实现参考 Mooncake `mooncake-vesegment@4c0ea28c` 的 Transfer Engine：
+`UrmaEndpoint::JettyRjettyBlobs()`、`UrmaContext::buildLocalBufferDesc()` /
+`retrieveRemoteSeg()`、`selectBondingChipIds()`。SPDK 保留原有 NVMe 请求执行流程，
+在 transport 内使用相同的 provider 上下文与选路策略：
+
+- HELLO 交换 `urma_get_rjetty()` 返回的完整上下文，按每个 jetty 的实际长度传输。
+- 注册内存时调用 `urma_get_seg_ctx()`，缓存完整导出结果。command capsule 携带完整
+  context，target 导入完整副本；缓存身份同时比较基础描述与完整 context 字节。
+  与 TE 一样，导入描述保留到 `urma_unimport_seg()` 后释放。
+- 光互联 WR 选择 `{local_chip, remote_chip}`；电互联保持 `{remote_chip, remote_chip}`。
+  显式亲和仅用于 bonding；芯片 ID 无法确定时使用 provider 默认路径。
+
+configure 自动编译、链接探测四个 get/put API，内部宏为 `SPDK_CONFIG_URMA_RJETTY`
+和 `SPDK_CONFIG_URMA_SEG_CTX`，无需新增构建开关。缺少接口的 SDK 仍可编译 raw 路径；
+bonding 在打开设备时明确返回 `-ENOTSUP`，不静默回退到旧的内核元数据交换路径。
+同一程序必须使用 ABI 配套的 UMDK 头文件、core、provider 和内核驱动。
+
+**wire version 为 6。target、urma_perf、Mooncake master/客户端依赖的 SPDK 均须重编
+并同步更新；不支持混用 v4/v5/v6。** rjetty context 上限 16 KiB，segment context
+上限 4 KiB，每个 endpoint 最多 32 个 jetty；非法长度在导入或复制前拒绝。
+
+capsule 只发送实际使用的 context 长度，raw 不发送冗余 blob。较小 command 继续 inline
+SEND；较大的 bonding command 使用按 qpair 延迟分配、一次注册的 TX slot 池。slot
+由 SEND completion 释放，独立于 NVMe response 和 CID 复用；断连须等待完成排空。
+target RX slot 与请求槽各预留最多 4 KiB context，内存开销随队列深度增长。
+
+光互联显式选路需 `SPDK_URMA_NUMA_AFFINITY_ENABLE=1`，以及
+`SPDK_URMA_ELECTRICAL_NETWORK_ENABLE=false`。后者也可从现有
+`MC_UB_ELECTRICAL_NETWORK_ENABLE` 读取，默认 false。显式设置 NUMA affinity 为 0
+仍保持 provider 默认选路；之前为规避 remote/remote 实现而设置的 0 不会被代码覆盖。
+
+不依赖 URMA 硬件的回归：
+
+~~~bash
+python3 test/urma/handshake_build.py --umdk /path/to/UMDK --sanitize
+python3 test/urma/registration_build.py --umdk /path/to/gpu-capable/UMDK
+~~~
+
+测试编译完整 common/initiator/target 源码，并运行真实 HELLO、capsule 解码、target
+数据 WR 和 initiator SEND 完成路径。覆盖完整扩展、缓存身份/保活、光/电选路、raw、
+分段与背压、buffer 重投、跨 qpair 完成、发送失败和断连。provider fixture 不能替代
+实际 aarch64 库与集群上的 bonding Admin Connect、读写和 master 挂载验证。
 
 ### 运行参数
 

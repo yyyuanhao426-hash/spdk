@@ -226,6 +226,7 @@ struct nvme_urma_reg_entry {
 enum nvme_urma_cqe_type {
 	NVME_URMA_CQE_CAPSULE_TX = 1,
 	NVME_URMA_CQE_CAPSULE_RX,
+	NVME_URMA_CQE_BUFFERED_TX,
 };
 
 struct nvme_urma_cqe_ctx {
@@ -242,6 +243,15 @@ struct nvme_urma_rsp_rx_slot {
 	struct spdk_urma_capsule_rsp_frame frame;
 	urma_sge_t sge;
 	urma_jfr_wr_t wr;
+};
+
+/* A non-inline command owns its slot until the SEND completion, which can
+ * arrive after the NVMe response. Never tie this lifetime to CID reuse. */
+struct nvme_urma_cmd_tx_slot {
+	struct nvme_urma_cqe_ctx cqe;
+	struct nvme_urma_qpair *qpair;
+	bool busy;
+	struct spdk_urma_capsule_cmd_frame frame;
 };
 
 struct nvme_urma_req {
@@ -275,6 +285,10 @@ struct nvme_urma_qpair {
 	uint8_t *cid_bitmap;
 	enum spdk_urma_capsule_transport capsule_transport;
 	struct nvme_urma_cqe_ctx capsule_tx_cqe;
+	struct nvme_urma_cmd_tx_slot *capsule_tx_slots;
+	struct spdk_nvme_urma_memory_region *capsule_tx_region;
+	uint32_t capsule_tx_slots_cap;
+	uint32_t next_tx_slot;
 	struct nvme_urma_rsp_rx_slot *capsule_rx_slots;
 	struct spdk_nvme_urma_memory_region *capsule_rx_region;
 	uint32_t capsule_rx_count;
@@ -508,9 +522,9 @@ nvme_urma_create_jetty(struct nvme_urma_qpair *uqpair)
 {
 	urma_jfs_cfg_t jfs = {};
 	const char *failed_stage = NULL;
-	uint32_t capsule_inline_size = spdk_max(
-		(uint32_t)sizeof(struct spdk_urma_capsule_cmd_frame),
-		(uint32_t)sizeof(struct spdk_urma_capsule_rsp_frame));
+	uint32_t capsule_inline_size =
+	    spdk_max((uint32_t)SPDK_URMA_CMD_BASE_FRAME_SIZE,
+		     (uint32_t)sizeof(struct spdk_urma_capsule_rsp_frame));
 	uint32_t i;
 
 	uqpair->jetty_count = spdk_min(uqpair->device->opts.num_jetty_per_ep,
@@ -596,13 +610,13 @@ nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
 {
 	struct spdk_urma_msg_hdr hdr = {};
 	struct spdk_urma_endpoint_desc local = {}, remote = {};
-	urma_rjetty_t rjetty = {};
+	uint8_t *local_data = NULL, *remote_data = NULL;
+	size_t local_length, remote_length, offset = 0;
 	int rc;
 
 	hdr.magic = SPDK_URMA_WIRE_MAGIC;
 	hdr.version = SPDK_URMA_WIRE_VERSION;
 	hdr.type = SPDK_URMA_MSG_HELLO;
-	hdr.length = sizeof(local);
 	hdr.qid = uqpair->qpair.id;
 	local.eid = uqpair->device->eid;
 	local.jetty_count = uqpair->jetty_count;
@@ -617,23 +631,49 @@ nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
 						 uqpair->jetty_count, (uint64_t)UINT32_MAX));
 	local.max_io_size = uqpair->max_io_size;
 	local.capsule_transport = uqpair->device->opts.capsule_transport;
+	rc = spdk_urma_export_rjettys(uqpair->device, uqpair->jettys, &local, &local_data);
+	if (rc != 0) {
+		return rc;
+	}
+	local_length = 0;
+	for (uint32_t i = 0; i < local.jetty_count; i++) {
+		local_length += local.rjetty_lengths[i];
+	}
+	hdr.length = sizeof(local) + local_length;
 	rc = nvme_urma_write_full(uqpair->fd, &hdr, sizeof(hdr));
 	if (rc == 0) {
 		rc = nvme_urma_write_full(uqpair->fd, &local, sizeof(local));
+	}
+	if (rc == 0) {
+		rc = nvme_urma_write_full(uqpair->fd, local_data, local_length);
 	}
 	if (rc == 0) {
 		rc = nvme_urma_read_full(uqpair->fd, &hdr, sizeof(hdr));
 	}
 	if (rc == 0 && (hdr.magic != SPDK_URMA_WIRE_MAGIC ||
 			 hdr.version != SPDK_URMA_WIRE_VERSION ||
-			 hdr.type != SPDK_URMA_MSG_HELLO_RSP || hdr.length != sizeof(remote))) {
+			 hdr.type != SPDK_URMA_MSG_HELLO_RSP || hdr.qid != uqpair->qpair.id ||
+			 hdr.length < sizeof(remote) ||
+			 hdr.length > sizeof(remote) +
+			 SPDK_URMA_MAX_JETTY_PER_EP * SPDK_URMA_MAX_RJETTY_SIZE)) {
 		rc = -EPROTO;
 	}
 	if (rc == 0) {
 		rc = nvme_urma_read_full(uqpair->fd, &remote, sizeof(remote));
 	}
+	if (rc == 0) {
+		rc = spdk_urma_hello_data_length(&remote, hdr.length, &remote_length);
+	}
+	if (rc == 0) {
+		remote_data = malloc(remote_length);
+		if (remote_data == NULL) {
+			rc = -ENOMEM;
+		} else {
+			rc = nvme_urma_read_full(uqpair->fd, remote_data, remote_length);
+		}
+	}
 	if (rc != 0) {
-		return rc;
+		goto out;
 	}
 	if (remote.transport_mode != uqpair->device->opts.transport_mode ||
 	    remote.tp_type != uqpair->device->opts.tp_type ||
@@ -646,35 +686,28 @@ nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
 			    remote.transport_mode,
 			    remote.tp_type,
 			    spdk_urma_capsule_transport_name(remote.capsule_transport));
-		return -EPROTONOSUPPORT;
+		rc = -EPROTONOSUPPORT;
+		goto out;
 	}
 	if (remote.max_queue_depth < 2 || remote.max_io_size == 0 ||
 	    remote.jetty_count == 0 || remote.jetty_count != uqpair->jetty_count ||
 	    remote.jetty_count > SPDK_URMA_MAX_JETTY_PER_EP) {
-		return -EPROTO;
+		rc = -EPROTO;
+		goto out;
 	}
 	uqpair->num_entries = spdk_min(uqpair->num_entries, remote.max_queue_depth - 1);
 	uqpair->num_entries = spdk_min(uqpair->num_entries, local.max_queue_depth - 1);
 	uqpair->capsule_transport = uqpair->device->opts.capsule_transport;
 	uqpair->max_io_size = spdk_min(uqpair->max_io_size, remote.max_io_size);
 	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
-		urma_token_t token = {.token = SPDK_URMA_DEFAULT_TOKEN};
 		urma_status_t status;
 
-		memset(&rjetty, 0, sizeof(rjetty));
-		rjetty.jetty_id.eid = remote.eid;
-		rjetty.jetty_id.id = remote.jetty_ids[i];
-		rjetty.trans_mode = remote.transport_mode;
-		rjetty.type = URMA_JETTY;
-		rjetty.tp_type = remote.tp_type;
-		uqpair->target_jettys[i] = urma_import_jetty(uqpair->device->context, &rjetty, &token);
-		if (uqpair->target_jettys[i] == NULL) {
-			SPDK_ERRLOG("URMA IO qpair %u on %s eid_index=%u jetty=%u: "
-				    "urma_import_jetty failed (remote_jetty=%u)\n",
-				    uqpair->qpair.id, uqpair->device->dev_name,
-				    uqpair->device->eid_index, i, remote.jetty_ids[i]);
-			return -EIO;
+		rc = spdk_urma_import_rjetty(uqpair->device, &remote, i, remote_data + offset,
+					   &uqpair->target_jettys[i]);
+		if (rc != 0) {
+			goto out;
 		}
+		offset += remote.rjetty_lengths[i];
 		if (uqpair->device->opts.transport_mode != URMA_TM_RC) {
 			continue;
 		}
@@ -684,10 +717,14 @@ nvme_urma_exchange_hello(struct nvme_urma_qpair *uqpair)
 				    "urma_bind_jetty failed status=%d\n",
 				    uqpair->qpair.id, uqpair->device->dev_name,
 				    uqpair->device->eid_index, i, status);
-			return -EIO;
+			rc = -EIO;
+			goto out;
 		}
 	}
-	return 0;
+out:
+	free(local_data);
+	free(remote_data);
+	return rc;
 }
 
 static int
@@ -771,6 +808,11 @@ nvme_urma_capsule_resources_init(struct nvme_urma_qpair *uqpair)
 static void
 nvme_urma_capsule_resources_fini(struct nvme_urma_qpair *uqpair)
 {
+	spdk_nvme_urma_unregister_memory(uqpair->capsule_tx_region);
+	uqpair->capsule_tx_region = NULL;
+	for (uint32_t i = 0; i < uqpair->capsule_tx_slots_cap; i++) {
+		assert(!__atomic_load_n(&uqpair->capsule_tx_slots[i].busy, __ATOMIC_ACQUIRE));
+	}
 	spdk_nvme_urma_unregister_memory(uqpair->capsule_rx_region);
 	uqpair->capsule_rx_region = NULL;
 	if (uqpair->pending_rsp_lock_initialized) {
@@ -789,30 +831,94 @@ nvme_urma_capsule_resources_fini(struct nvme_urma_qpair *uqpair)
 }
 
 static int
+nvme_urma_tx_pool_init(struct nvme_urma_qpair *uqpair)
+{
+	if (uqpair->num_entries == 0) {
+		return -EINVAL;
+	}
+	if (uqpair->capsule_tx_region != NULL) {
+		return 0;
+	}
+	if (uqpair->capsule_tx_slots == NULL) {
+		uqpair->capsule_tx_slots =
+		    calloc(uqpair->num_entries, sizeof(*uqpair->capsule_tx_slots));
+		if (uqpair->capsule_tx_slots == NULL) {
+			return -ENOMEM;
+		}
+		uqpair->capsule_tx_slots_cap = uqpair->num_entries;
+		for (uint32_t i = 0; i < uqpair->capsule_tx_slots_cap; i++) {
+			uqpair->capsule_tx_slots[i].cqe.type = NVME_URMA_CQE_BUFFERED_TX;
+			uqpair->capsule_tx_slots[i].cqe.owner = &uqpair->capsule_tx_slots[i];
+			uqpair->capsule_tx_slots[i].qpair = uqpair;
+		}
+	}
+	return spdk_nvme_urma_register_memory(uqpair->device->context, uqpair->capsule_tx_slots,
+					      uqpair->capsule_tx_slots_cap *
+						  sizeof(*uqpair->capsule_tx_slots),
+					      SPDK_NVME_URMA_MEM_HOST, &uqpair->capsule_tx_region);
+}
+
+static int
 nvme_urma_send_cmd_capsule(struct nvme_urma_qpair *uqpair,
 			   struct spdk_urma_capsule_cmd_frame *frame)
 {
 	urma_sge_t sge = {
-		.addr = (uint64_t)frame,
-		.len = sizeof(*frame),
+	    .addr = (uint64_t)frame,
+	    .len = sizeof(frame->hdr) + frame->hdr.length,
 	};
+	struct nvme_urma_cmd_tx_slot *slot = NULL;
 	urma_jfs_wr_t wr = {}, *bad_wr = NULL;
 	urma_status_t status;
 	uint32_t jetty_index = nvme_urma_next_jetty(uqpair);
 
+	if (spdk_urma_validate_cmd(&frame->hdr, &frame->capsule) != 0) {
+		return -EPROTO;
+	}
 	wr.opcode = URMA_OPC_SEND;
 	wr.flag.bs.complete_enable = 1;
 	wr.flag.bs.inline_flag = 1;
 	wr.tjetty = uqpair->target_jettys[jetty_index];
 	wr.user_ctx = (uint64_t)&uqpair->capsule_tx_cqe;
+	if (sge.len > SPDK_URMA_CMD_BASE_FRAME_SIZE) {
+		int rc = nvme_urma_tx_pool_init(uqpair);
+
+		if (rc != 0) {
+			return rc;
+		}
+		for (uint32_t i = 0; i < uqpair->capsule_tx_slots_cap; i++) {
+			uint32_t index = uqpair->next_tx_slot++ % uqpair->capsule_tx_slots_cap;
+			bool expected = false;
+
+			if (__atomic_compare_exchange_n(&uqpair->capsule_tx_slots[index].busy,
+							&expected, true, false, __ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				slot = &uqpair->capsule_tx_slots[index];
+				break;
+			}
+		}
+		if (slot == NULL) {
+			return -EAGAIN;
+		}
+		memcpy(&slot->frame, frame, sge.len);
+		sge.addr = (uint64_t)&slot->frame;
+		sge.tseg = spdk_urma_memory_region_get_tseg(uqpair->capsule_tx_region);
+		wr.flag.bs.inline_flag = 0;
+		wr.user_ctx = (uint64_t)&slot->cqe;
+	}
 	wr.send.src.sge = &sge;
 	wr.send.src.num_sge = 1;
 	if (!spdk_urma_lifetime_try_get(&uqpair->lifetime)) {
+		if (slot != NULL) {
+			__atomic_store_n(&slot->busy, false, __ATOMIC_RELEASE);
+		}
 		return -ESHUTDOWN;
 	}
 	status = urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &wr, &bad_wr);
 	if (status != URMA_SUCCESS) {
 		spdk_urma_lifetime_put(&uqpair->lifetime);
+		if (slot != NULL) {
+			__atomic_store_n(&slot->busy, false, __ATOMIC_RELEASE);
+		}
 		SPDK_ERRLOG("capsule SEND post failed: status=%d qid=%u cid=%u jetty=%u "
 			    "send_jfc=%u queue_depth=%u/%u bad_wr=%p\n",
 			    status, uqpair->qpair.id, frame->capsule.cmd.cid, jetty_index,
@@ -851,10 +957,11 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
 	struct nvme_urma_req *ureq;
 	struct spdk_urma_msg_hdr hdr = {};
-	struct spdk_urma_capsule_cmd capsule = {};
+	struct spdk_urma_capsule_cmd capsule;
 	void *addr = NULL;
 	int rc;
 
+	memset(&capsule, 0, SPDK_URMA_CMD_BASE_SIZE);
 	if (qpair->queue_depth >= uqpair->num_entries) {
 		return -EAGAIN;
 	}
@@ -928,6 +1035,20 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 			}
 		}
 		capsule.data.seg = spdk_urma_memory_region_get_tseg(ureq->region)->seg;
+		if (strncmp(uqpair->device->dev_name, "bonding", 7) == 0) {
+			size_t length = sizeof(capsule.seg_ctx);
+
+			rc = spdk_nvme_urma_memory_region_export(ureq->region, capsule.seg_ctx,
+								 &length);
+			if (rc != 0 || length <= sizeof(urma_seg_t)) {
+				SPDK_ERRLOG("URMA bonding requires complete segment context: "
+					    "device=%s rc=%d length=%zu\n",
+					    uqpair->device->dev_name, rc, length);
+				rc = rc != 0 ? rc : -ENOTSUP;
+				goto send_error;
+			}
+			capsule.seg_ctx_length = length;
+		}
 		capsule.data.address = (uint64_t)addr;
 		capsule.data.length = req->payload.size;
 		capsule.data.chip_id = uqpair->device->opts.numa_affinity ?
@@ -936,16 +1057,16 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	hdr.magic = SPDK_URMA_WIRE_MAGIC;
 	hdr.version = SPDK_URMA_WIRE_VERSION;
 	hdr.type = SPDK_URMA_MSG_CAPSULE_CMD;
-	hdr.length = sizeof(capsule);
+	hdr.length = SPDK_URMA_CMD_BASE_SIZE + capsule.seg_ctx_length;
 	hdr.qid = qpair->id;
-	/* Keep the wire frame contiguous. TCP emits it with one write; SEND/RECV
-	 * copies the same bytes inline into the WQE, so the stack frame may be
-	 * released as soon as urma_post_jetty_send_wr() returns. */
+	/* TCP emits the contiguous frame with one write. Small capsules use inline
+	 * SEND; complete provider contexts are copied into a registered TX slot
+	 * which stays owned until SEND completion, independently of NVMe response. */
 	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
-		struct spdk_urma_capsule_cmd_frame frame = {
-			.hdr = hdr,
-			.capsule = capsule,
-		};
+		struct spdk_urma_capsule_cmd_frame frame;
+
+		frame.hdr = hdr;
+		memcpy(&frame.capsule, &capsule, hdr.length);
 
 		ureq->send_start = spdk_get_ticks();
 		rc = nvme_urma_send_cmd_capsule(uqpair, &frame);
@@ -953,9 +1074,9 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		uint8_t msg[sizeof(hdr) + sizeof(capsule)];
 
 		memcpy(msg, &hdr, sizeof(hdr));
-		memcpy(msg + sizeof(hdr), &capsule, sizeof(capsule));
+		memcpy(msg + sizeof(hdr), &capsule, hdr.length);
 		ureq->send_start = spdk_get_ticks();  /* send-phase start */
-		rc = nvme_urma_write_full(uqpair->fd, msg, sizeof(msg));
+		rc = nvme_urma_write_full(uqpair->fd, msg, sizeof(hdr) + hdr.length);
 	}
 	{
 		uint64_t t_send1 = spdk_get_ticks();
@@ -977,6 +1098,7 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 			rec->xfer = (uint8_t)spdk_nvme_opc_get_data_transfer(req->cmd.opc);
 		}
 	}
+send_error:
 	if (rc != 0) {
 		/* Modified By Yida: on send failure, release cache refcount if cached.
 		 * Modified By Yida(v7): 整池采纳的 region_external 不 unregister。 */
@@ -1201,6 +1323,9 @@ nvme_urma_cr_owner_qpair(const struct nvme_urma_cqe_ctx *ctx)
 	if (ctx->type == NVME_URMA_CQE_CAPSULE_RX) {
 		return ((struct nvme_urma_rsp_rx_slot *)ctx->owner)->qpair;
 	}
+	if (ctx->type == NVME_URMA_CQE_BUFFERED_TX) {
+		return ((struct nvme_urma_cmd_tx_slot *)ctx->owner)->qpair;
+	}
 	return NULL;
 }
 
@@ -1237,6 +1362,11 @@ nvme_urma_process_capsule_cr_inner(struct nvme_urma_qpair *poller, const urma_cr
 		SPDK_ERRLOG("capsule completion with unknown ctx type=%d\n", ctx->type);
 		return -EPROTO;
 	}
+	if (ctx->type == NVME_URMA_CQE_BUFFERED_TX) {
+		struct nvme_urma_cmd_tx_slot *slot = ctx->owner;
+
+		__atomic_store_n(&slot->busy, false, __ATOMIC_RELEASE);
+	}
 	if (cr->status != URMA_CR_SUCCESS) {
 		if (spdk_urma_lifetime_is_closing(&owner->lifetime)) {
 			return 0;
@@ -1245,7 +1375,7 @@ nvme_urma_process_capsule_cr_inner(struct nvme_urma_qpair *poller, const urma_cr
 		nvme_urma_qpair_defer_error(owner, -EIO);
 		return 0;
 	}
-	if (ctx->type == NVME_URMA_CQE_CAPSULE_TX) {
+	if (ctx->type == NVME_URMA_CQE_CAPSULE_TX || ctx->type == NVME_URMA_CQE_BUFFERED_TX) {
 		if (spdk_urma_lifetime_is_closing(&owner->lifetime)) {
 			return 0;
 		}
@@ -1896,6 +2026,8 @@ nvme_urma_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 	uqpair->cid_bitmap = NULL;
 	free(uqpair->capsule_rx_slots);
 	uqpair->capsule_rx_slots = NULL;
+	free(uqpair->capsule_tx_slots);
+	uqpair->capsule_tx_slots = NULL;
 	nvme_qpair_deinit(qpair);
 	free(uqpair);
 	return 0;

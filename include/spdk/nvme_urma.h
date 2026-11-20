@@ -100,7 +100,11 @@ void *spdk_nvme_urma_memory_region_get_addr(
 size_t spdk_nvme_urma_memory_region_get_length(
 	const struct spdk_nvme_urma_memory_region *region);
 
-/** Copy the portable URMA segment descriptor for connection exchange. */
+/**
+ * Copy the complete provider segment context for connection exchange.
+ * Query the required size with buf == NULL. Legacy SDKs export the base
+ * descriptor; bonding requires an SDK providing urma_get_seg_ctx().
+ */
 int spdk_nvme_urma_memory_region_export(
 	const struct spdk_nvme_urma_memory_region *region, void *buf, size_t *length);
 

@@ -1051,6 +1051,22 @@ if [ "${CONFIG[URMA]}" = "y" ]; then
 		echo "Use --with-urma=/path/to/umdk-install if they are not installed system-wide."
 		exit 1
 	fi
+	CONFIG[URMA_RJETTY]=n
+	if echo -e '#include <urma_api.h>\nint main(void) { urma_rjetty_t *r = NULL; uint32_t n = 0; (void)urma_get_rjetty(NULL, &r, &n); urma_put_rjetty(r); return 0; }\n' \
+		| "${BUILD_CMD[@]}" "${urma_cflags[@]}" "${urma_ldflags[@]}" \
+			-Werror=implicit-function-declaration - -lurma 2> /dev/null; then
+		CONFIG[URMA_RJETTY]=y
+	else
+		echo "URMA SDK lacks rjetty export APIs: raw devices only; bonding requires a newer matching SDK."
+	fi
+	CONFIG[URMA_SEG_CTX]=n
+	if echo -e '#include <urma_api.h>\nint main(void) { urma_seg_t *s = NULL; uint32_t n = 0; (void)urma_get_seg_ctx(NULL, &s, &n); urma_put_seg_ctx(s); return 0; }\n' \
+		| "${BUILD_CMD[@]}" "${urma_cflags[@]}" "${urma_ldflags[@]}" \
+			-Werror=implicit-function-declaration - -lurma 2> /dev/null; then
+		CONFIG[URMA_SEG_CTX]=y
+	else
+		echo "URMA SDK lacks segment context APIs: bonding data I/O requires a newer matching SDK."
+	fi
 	if [[ "${CONFIG[URMA_PEERMEM]}" == "y" ]]; then
 		if ! echo -e '#include <urma_api.h>\nint main(void) { urma_seg_cfg_t cfg = {0}; cfg.is_gpu_seg = 1; return (int)cfg.is_gpu_seg; }\n' \
 			| "${BUILD_CMD[@]}" "${urma_cflags[@]}" -c - 2> /dev/null; then
@@ -1066,7 +1082,7 @@ if [ "${CONFIG[URMA]}" = "y" ]; then
 			exit 1
 		fi
 	fi
-	echo "Using independent URMA transport (peermem=${CONFIG[URMA_PEERMEM]}, dmabuf=${CONFIG[URMA_DMABUF]})"
+	echo "Using independent URMA transport (rjetty=${CONFIG[URMA_RJETTY]}, seg_ctx=${CONFIG[URMA_SEG_CTX]}, peermem=${CONFIG[URMA_PEERMEM]}, dmabuf=${CONFIG[URMA_DMABUF]})"
 fi
 
 if [[ "${CONFIG[FC]}" = "y" ]]; then

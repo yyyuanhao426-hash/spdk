@@ -43,6 +43,8 @@
 
 struct nvmf_urma_import_entry {
 	urma_seg_t seg;
+	void *context;
+	uint32_t context_length;
 	urma_target_seg_t *tseg;
 	LIST_ENTRY(nvmf_urma_import_entry) link;
 };
@@ -324,6 +326,9 @@ struct nvmf_urma_req {
 	urma_target_seg_t *remote_seg;
 	/* remote_seg 保活于 transport 级 import 哈希表时，release 不得 unimport。 */
 	bool remote_seg_cached;
+	void *remote_seg_handle;
+	uint32_t remote_seg_ctx_length;
+	uint8_t remote_seg_ctx[SPDK_URMA_MAX_SEG_CTX_SIZE];
 	struct spdk_nvme_urma_memory_region *local_region;
 	bool local_region_external;
 	/* Modified By Yida: cache entry when local_region is cached (NULL if uncached) */
@@ -383,6 +388,11 @@ struct nvmf_urma_qpair {
 	enum nvmf_urma_hs_state hs_state;
 	size_t hs_off0;
 	size_t hs_off1;
+	size_t hs_off2;
+	size_t hs_remote_length;
+	size_t hs_local_length;
+	uint8_t *hs_remote_data;
+	uint8_t *hs_local_data;
 	uint64_t hs_deadline_tsc;
 	struct spdk_poller *hs_poller;
 	TAILQ_ENTRY(nvmf_urma_qpair) handshake_link;
@@ -522,13 +532,16 @@ nvmf_urma_seg_hash(const urma_seg_t *seg)
 }
 
 static struct nvmf_urma_import_entry *
-nvmf_urma_import_cache_find(struct nvmf_urma_transport *transport, const urma_seg_t *seg)
+nvmf_urma_import_cache_find(struct nvmf_urma_transport *transport, const urma_seg_t *seg,
+			    const void *context, uint32_t context_length)
 {
 	struct nvmf_urma_import_entry *entry;
 	uint32_t bucket = nvmf_urma_seg_hash(seg);
 
 	LIST_FOREACH(entry, &transport->import_cache[bucket], link) {
-		if (memcmp(&entry->seg, seg, sizeof(*seg)) == 0) {
+		if (memcmp(&entry->seg, seg, sizeof(*seg)) == 0 &&
+		    entry->context_length == context_length &&
+		    (context_length == 0 || memcmp(entry->context, context, context_length) == 0)) {
 			return entry;
 		}
 	}
@@ -577,9 +590,9 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 	struct spdk_urma_device *device = uqpair->device;
 	urma_jfs_cfg_t jfs = {};
 	const char *failed_stage = NULL;
-	uint32_t capsule_inline_size = spdk_max(
-		(uint32_t)sizeof(struct spdk_urma_capsule_cmd_frame),
-		(uint32_t)sizeof(struct spdk_urma_capsule_rsp_frame));
+	uint32_t capsule_inline_size =
+	    spdk_max((uint32_t)SPDK_URMA_CMD_BASE_FRAME_SIZE,
+		     (uint32_t)sizeof(struct spdk_urma_capsule_rsp_frame));
 	uint32_t i;
 
 	uqpair->jetty_count = spdk_min(device->opts.num_jetty_per_ep,
@@ -792,11 +805,12 @@ nvmf_urma_handshake_apply(struct nvmf_urma_qpair *uqpair)
 	struct spdk_urma_msg_hdr *rsp_hdr = &uqpair->hs_rsp.hdr;
 	struct spdk_urma_endpoint_desc *local = &uqpair->hs_rsp.local;
 	uint32_t max_queue_depth;
+	size_t offset = 0;
 	int rc;
 
 	if (hdr->magic != SPDK_URMA_WIRE_MAGIC ||
 	    hdr->version != SPDK_URMA_WIRE_VERSION || hdr->type != SPDK_URMA_MSG_HELLO ||
-	    hdr->length != sizeof(*remote)) {
+	    spdk_urma_hello_data_length(remote, hdr->length, &uqpair->hs_remote_length) != 0) {
 		return -EPROTO;
 	}
 	if (remote->transport_mode != device->opts.transport_mode ||
@@ -833,19 +847,14 @@ nvmf_urma_handshake_apply(struct nvmf_urma_qpair *uqpair)
 	}
 	uqpair->capsule_transport = device->opts.capsule_transport;
 	for (uint32_t i = 0; i < uqpair->jetty_count; i++) {
-		urma_token_t token = {.token = SPDK_URMA_DEFAULT_TOKEN};
 		urma_status_t status;
-		urma_rjetty_t rjetty = {};
 
-		rjetty.jetty_id.eid = remote->eid;
-		rjetty.jetty_id.id = remote->jetty_ids[i];
-		rjetty.trans_mode = remote->transport_mode;
-		rjetty.type = URMA_JETTY;
-		rjetty.tp_type = remote->tp_type;
-		uqpair->target_jettys[i] = urma_import_jetty(device->context, &rjetty, &token);
-		if (uqpair->target_jettys[i] == NULL) {
-			return -EIO;
+		rc = spdk_urma_import_rjetty(device, remote, i, uqpair->hs_remote_data + offset,
+					   &uqpair->target_jettys[i]);
+		if (rc != 0) {
+			return rc;
 		}
+		offset += remote->rjetty_lengths[i];
 		if (device->opts.transport_mode != URMA_TM_RC) {
 			continue;
 		}
@@ -858,7 +867,6 @@ nvmf_urma_handshake_apply(struct nvmf_urma_qpair *uqpair)
 	rsp_hdr->magic = SPDK_URMA_WIRE_MAGIC;
 	rsp_hdr->version = SPDK_URMA_WIRE_VERSION;
 	rsp_hdr->type = SPDK_URMA_MSG_HELLO_RSP;
-	rsp_hdr->length = sizeof(*local);
 	rsp_hdr->qid = hdr->qid;
 	memset(local, 0, sizeof(*local));
 	local->eid = device->eid;
@@ -871,6 +879,15 @@ nvmf_urma_handshake_apply(struct nvmf_urma_qpair *uqpair)
 	local->max_queue_depth = max_queue_depth;
 	local->max_io_size = uqpair->transport->transport.opts.max_io_size;
 	local->capsule_transport = uqpair->capsule_transport;
+	rc = spdk_urma_export_rjettys(device, uqpair->jettys, local, &uqpair->hs_local_data);
+	if (rc != 0) {
+		return rc;
+	}
+	uqpair->hs_local_length = 0;
+	for (uint32_t i = 0; i < local->jetty_count; i++) {
+		uqpair->hs_local_length += local->rjetty_lengths[i];
+	}
+	rsp_hdr->length = sizeof(*local) + uqpair->hs_local_length;
 	return 0;
 }
 
@@ -889,8 +906,32 @@ nvmf_urma_handshake_progress(struct nvmf_urma_qpair *uqpair)
 				return rc;
 			}
 		}
+		if (uqpair->hs_hdr.magic != SPDK_URMA_WIRE_MAGIC ||
+		    uqpair->hs_hdr.version != SPDK_URMA_WIRE_VERSION ||
+		    uqpair->hs_hdr.type != SPDK_URMA_MSG_HELLO ||
+		    uqpair->hs_hdr.length < sizeof(uqpair->hs_remote) ||
+		    uqpair->hs_hdr.length > sizeof(uqpair->hs_remote) +
+		    SPDK_URMA_MAX_JETTY_PER_EP * SPDK_URMA_MAX_RJETTY_SIZE) {
+			return -EPROTO;
+		}
 		rc = nvmf_urma_hs_fill(uqpair->fd, &uqpair->hs_remote,
 				       sizeof(uqpair->hs_remote), &uqpair->hs_off1);
+		if (rc != 0) {
+			return rc;
+		}
+		if (uqpair->hs_remote_data == NULL) {
+			rc = spdk_urma_hello_data_length(&uqpair->hs_remote, uqpair->hs_hdr.length,
+							 &uqpair->hs_remote_length);
+			if (rc != 0) {
+				return rc;
+			}
+			uqpair->hs_remote_data = malloc(uqpair->hs_remote_length);
+			if (uqpair->hs_remote_data == NULL) {
+				return -ENOMEM;
+			}
+		}
+		rc = nvmf_urma_hs_fill(uqpair->fd, uqpair->hs_remote_data,
+					       uqpair->hs_remote_length, &uqpair->hs_off2);
 		if (rc != 0) {
 			return rc;
 		}
@@ -900,6 +941,7 @@ nvmf_urma_handshake_progress(struct nvmf_urma_qpair *uqpair)
 		}
 		uqpair->hs_off0 = 0;
 		uqpair->hs_off1 = 0;
+		uqpair->hs_off2 = 0;
 		uqpair->hs_state = NVMF_URMA_HS_SEND_RSP;
 		/* fallthrough */
 	case NVMF_URMA_HS_SEND_RSP:
@@ -912,6 +954,11 @@ nvmf_urma_handshake_progress(struct nvmf_urma_qpair *uqpair)
 		}
 		rc = nvmf_urma_hs_flush(uqpair->fd, &uqpair->hs_rsp.local,
 					sizeof(uqpair->hs_rsp.local), &uqpair->hs_off1);
+		if (rc != 0) {
+			return rc;
+		}
+		rc = nvmf_urma_hs_flush(uqpair->fd, uqpair->hs_local_data,
+						uqpair->hs_local_length, &uqpair->hs_off2);
 		if (rc != 0) {
 			return rc;
 		}
@@ -938,6 +985,10 @@ nvmf_urma_accept_reject(struct nvmf_urma_qpair *uqpair)
 	uint32_t i;
 
 	nvmf_urma_handshake_detach(uqpair);
+	free(uqpair->hs_remote_data);
+	free(uqpair->hs_local_data);
+	uqpair->hs_remote_data = NULL;
+	uqpair->hs_local_data = NULL;
 
 	for (i = 0; i < uqpair->jetty_count; i++) {
 		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
@@ -974,6 +1025,10 @@ nvmf_urma_handshake_complete(struct nvmf_urma_qpair *uqpair)
 	int flags = fcntl(uqpair->fd, F_GETFL);
 
 	nvmf_urma_handshake_detach(uqpair);
+	free(uqpair->hs_remote_data);
+	free(uqpair->hs_local_data);
+	uqpair->hs_remote_data = NULL;
+	uqpair->hs_local_data = NULL;
 
 	/* SE_Review #3: 握手完成即恢复阻塞语义——TCP capsule 路径的
 	 * read_full/write_full 依赖阻塞 socket，残余阻塞由 accept 时设置的
@@ -1188,6 +1243,7 @@ nvmf_urma_import_cache_fini(struct nvmf_urma_transport *transport)
 		LIST_FOREACH_SAFE(entry, &transport->import_cache[i], link, tmp) {
 			LIST_REMOVE(entry, link);
 			urma_unimport_seg(entry->tseg);
+			free(entry->context);
 			free(entry);
 		}
 	}
@@ -1681,8 +1737,6 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 {
 	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
 	struct spdk_urma_device *device = uqpair->device;
-	urma_import_seg_flag_t import_flag = {};
-	urma_token_t token = {.token = SPDK_URMA_DEFAULT_TOKEN};
 	urma_sge_t local_sge = {}, remote_sge = {};
 	urma_jfs_wr_t wr = {}, *bad_wr = NULL;
 	bondp_jfs_wr_t affinity_wr = {};
@@ -1692,9 +1746,6 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	if (ureq->req.iovcnt != 1) {
 		return -ENOTSUP;
 	}
-	import_flag.bs.cacheable = URMA_NON_CACHEABLE;
-	import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
-	import_flag.bs.mapping = URMA_SEG_NOMAP;
 	/* Modified By Yida(v7): W5 — 远端段 import 缓存：seg 相同的 I/O 复用已
 	 * import 的 tseg，只有首次见到的 seg 才真正调 urma_import_seg。
 	 * initiator 整池注册时所有 I/O 共享同一 seg → 每个共享 context 仅 1 次 import。 */
@@ -1704,7 +1755,8 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 		struct nvmf_urma_import_entry *e;
 
 		pthread_rwlock_rdlock(&transport->import_cache_lock);
-		e = nvmf_urma_import_cache_find(transport, &ureq->remote_data.seg);
+		e = nvmf_urma_import_cache_find(transport, &ureq->remote_data.seg,
+						ureq->remote_seg_ctx, ureq->remote_seg_ctx_length);
 		if (e != NULL) {
 			ureq->remote_seg = e->tseg;
 			ureq->remote_seg_cached = true;
@@ -1715,7 +1767,9 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 			pthread_rwlock_wrlock(&transport->import_cache_lock);
 			/* Another worker may have populated the bucket while this worker
 			 * upgraded from the shared lookup to the exclusive miss path. */
-			e = nvmf_urma_import_cache_find(transport, &ureq->remote_data.seg);
+			e = nvmf_urma_import_cache_find(transport, &ureq->remote_data.seg,
+							ureq->remote_seg_ctx,
+							ureq->remote_seg_ctx_length);
 			if (e != NULL) {
 				ureq->remote_seg = e->tseg;
 				ureq->remote_seg_cached = true;
@@ -1724,14 +1778,19 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 				uint64_t t_import0 = spdk_get_ticks();
 
 				/* Serialize the first import for a segment on this shared context. */
-				ureq->remote_seg = urma_import_seg(device->context, &ureq->remote_data.seg,
-							   &token, 0, import_flag);
+				rc = spdk_urma_import_segment(
+				    device, &ureq->remote_data, ureq->remote_seg_ctx,
+				    ureq->remote_seg_ctx_length, &ureq->remote_seg,
+				    &ureq->remote_seg_handle);
 				if (ureq->remote_seg != NULL) {
 					NVMF_URMA_TGT_STAGE(import, spdk_get_ticks() - t_import0);
 					e = calloc(1, sizeof(*e));
 					if (e != NULL) {
 						e->seg = ureq->remote_data.seg;
 						e->tseg = ureq->remote_seg;
+						e->context = ureq->remote_seg_handle;
+						e->context_length = ureq->remote_seg_ctx_length;
+						ureq->remote_seg_handle = NULL;
 						LIST_INSERT_HEAD(&transport->import_cache[
 								 nvmf_urma_seg_hash(&e->seg)], e, link);
 						ureq->remote_seg_cached = true;
@@ -1747,8 +1806,9 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 		/* Modified By Yida(v3): W5 — urma_import_seg (cache miss only) */
 		uint64_t t_import0 = spdk_get_ticks();
 
-		ureq->remote_seg = urma_import_seg(device->context, &ureq->remote_data.seg,
-						   &token, 0, import_flag);
+		rc = spdk_urma_import_segment(device, &ureq->remote_data, ureq->remote_seg_ctx,
+					      ureq->remote_seg_ctx_length, &ureq->remote_seg,
+					      &ureq->remote_seg_handle);
 		if (ureq->remote_seg == NULL) {
 			return -EIO;
 		}
@@ -1818,12 +1878,18 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	if (!spdk_urma_lifetime_try_get(&uqpair->lifetime)) {
 		return -ESHUTDOWN;
 	}
-	if (device->opts.numa_affinity && ureq->remote_data.chip_id != 0 &&
-	    ureq->remote_data.chip_id != SPDK_URMA_INVALID_CHIP_ID) {
+	uint8_t local_chip = device->opts.numa_affinity
+				 ? spdk_urma_memory_chip_id(ureq->req.iov[0].iov_base)
+				 : SPDK_URMA_INVALID_CHIP_ID;
+
+	if (device->opts.numa_affinity && strncmp(device->dev_name, "bonding", 7) == 0 &&
+	    ureq->remote_data.chip_id != SPDK_URMA_INVALID_CHIP_ID &&
+	    (device->opts.electrical_network || local_chip != SPDK_URMA_INVALID_CHIP_ID)) {
 		affinity_wr.base = wr;
 		affinity_wr.base.flag.bs.has_drv_ext = 1;
-		affinity_wr.src_chip_id = ureq->remote_data.chip_id;
-		affinity_wr.dst_chip_id = ureq->remote_data.chip_id;
+		spdk_urma_bonding_chip_ids(device->opts.electrical_network, local_chip,
+					   ureq->remote_data.chip_id, &affinity_wr.src_chip_id,
+					   &affinity_wr.dst_chip_id);
 		if (urma_post_jetty_send_wr(uqpair->jettys[jetty_index], &affinity_wr.base,
 					     &bad_wr) != URMA_SUCCESS) {
 			spdk_urma_lifetime_put(&uqpair->lifetime);
@@ -1898,6 +1964,9 @@ nvmf_urma_handle_capsule(struct nvmf_urma_qpair *uqpair,
 {
 	struct nvmf_urma_req *ureq;
 
+	if (spdk_urma_validate_cmd(hdr, capsule) != 0) {
+		return -EPROTO;
+	}
 	if (capsule->data.length > uqpair->max_io_size || hdr->qid != uqpair->qpair.qid) {
 		return capsule->data.length > uqpair->max_io_size ? -EMSGSIZE : -EPROTO;
 	}
@@ -1967,6 +2036,9 @@ nvmf_urma_handle_capsule(struct nvmf_urma_qpair *uqpair,
 	}
 	ureq->cmd.nvme_cmd = capsule->cmd;
 	ureq->remote_data = capsule->data;
+	ureq->remote_seg_ctx_length = capsule->seg_ctx_length;
+	ureq->remote_seg_handle = NULL;
+	memcpy(ureq->remote_seg_ctx, capsule->seg_ctx, capsule->seg_ctx_length);
 	ureq->req.raw = 0;
 	ureq->req.zcopy_phase = NVMF_ZCOPY_PHASE_NONE;
 	ureq->req.xfer = spdk_nvmf_req_get_xfer(&ureq->req);
@@ -2004,6 +2076,9 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 	if ((size_t)rc < sizeof(hdr)) {
 		return 0;
 	}
+	if (hdr.length < SPDK_URMA_CMD_BASE_SIZE || hdr.length > sizeof(capsule)) {
+		return -EPROTO;
+	}
 	/* Modified By Yida(v4): W4p — stamp when the poller FIRST observed this
 	 * capsule in the kernel rcvbuf. If the hdr was already seen on an earlier
 	 * poll round (capsule body still in flight), reuse that tick: the capsule
@@ -2032,8 +2107,8 @@ nvmf_urma_receive_capsule(struct nvmf_urma_qpair *uqpair)
 	uint64_t t_parse0 = spdk_get_ticks(); /* Modified By Yida(v3): W4a parse start */
 	if (nvmf_urma_read_full(uqpair->fd, &hdr, sizeof(hdr)) != 0 ||
 	    hdr.magic != SPDK_URMA_WIRE_MAGIC || hdr.version != SPDK_URMA_WIRE_VERSION ||
-	    hdr.type != SPDK_URMA_MSG_CAPSULE_CMD || hdr.length != sizeof(capsule) ||
-	    nvmf_urma_read_full(uqpair->fd, &capsule, sizeof(capsule)) != 0) {
+	    hdr.type != SPDK_URMA_MSG_CAPSULE_CMD ||
+	    nvmf_urma_read_full(uqpair->fd, &capsule, hdr.length) != 0) {
 		return -EPROTO;
 	}
 	NVMF_URMA_TGT_STAGE(capsule, spdk_get_ticks() - t_parse0);
@@ -2069,7 +2144,7 @@ nvmf_urma_process_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot,
 			      const urma_cr_t *cr)
 {
 	struct nvmf_urma_qpair *uqpair = slot->qpair;
-	struct spdk_urma_capsule_cmd_frame frame = slot->frame;
+	struct spdk_urma_capsule_cmd_frame frame;
 	uint64_t t_parse0 = spdk_get_ticks();
 	int rc;
 
@@ -2079,9 +2154,11 @@ nvmf_urma_process_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot,
 		return 0;
 	}
 	if (cr->flag.bs.s_r == 0 || cr->opcode != URMA_CR_OPC_SEND ||
-	    cr->completion_len != (uint32_t)sizeof(frame)) {
+	    cr->completion_len < SPDK_URMA_CMD_BASE_FRAME_SIZE ||
+	    cr->completion_len > sizeof(frame)) {
 		return -EPROTO;
 	}
+	memcpy(&frame, &slot->frame, cr->completion_len);
 	rc = nvmf_urma_post_cmd_receive(slot);
 	if (rc != 0) {
 		return rc;
@@ -2089,7 +2166,8 @@ nvmf_urma_process_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot,
 	if (frame.hdr.magic != SPDK_URMA_WIRE_MAGIC ||
 	    frame.hdr.version != SPDK_URMA_WIRE_VERSION ||
 	    frame.hdr.type != SPDK_URMA_MSG_CAPSULE_CMD ||
-	    frame.hdr.length != sizeof(frame.capsule) ||
+	    frame.hdr.length != cr->completion_len - sizeof(frame.hdr) ||
+	    spdk_urma_validate_cmd(&frame.hdr, &frame.capsule) != 0 ||
 	    frame.hdr.qid != uqpair->qpair.qid) {
 		return -EPROTO;
 	}
@@ -2459,7 +2537,9 @@ nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 	/* Modified By Yida(v7): import 缓存保活的段留在缓存里，不 unimport */
 	if (ureq->remote_seg != NULL && !ureq->remote_seg_cached) {
 		urma_unimport_seg(ureq->remote_seg);
+		free(ureq->remote_seg_handle);
 	}
+	ureq->remote_seg_handle = NULL;
 	ureq->remote_seg = NULL;
 	ureq->remote_seg_cached = false;
 	/* Modified By Yida(v3): release — unregister (uncached) + urma_unimport_seg */

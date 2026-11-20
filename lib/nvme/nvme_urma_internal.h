@@ -25,7 +25,9 @@
 #define SPDK_URMA_RX_QUIESCE_BUDGET 4096
 
 #define SPDK_URMA_WIRE_MAGIC 0x41524d55u /* "URMA", little endian */
-#define SPDK_URMA_WIRE_VERSION 4
+#define SPDK_URMA_WIRE_VERSION 6
+#define SPDK_URMA_MAX_RJETTY_SIZE (16 * 1024)
+#define SPDK_URMA_MAX_SEG_CTX_SIZE 4096
 #define SPDK_URMA_MAX_JETTY_PER_EP 32
 #define SPDK_URMA_INVALID_CHIP_ID UINT8_MAX
 
@@ -61,6 +63,8 @@ struct spdk_urma_endpoint_desc {
 	urma_eid_t eid;
 	uint32_t jetty_count;
 	uint32_t jetty_ids[SPDK_URMA_MAX_JETTY_PER_EP];
+	/* Complete provider contexts follow this descriptor, in jetty order. */
+	uint32_t rjetty_lengths[SPDK_URMA_MAX_JETTY_PER_EP];
 	uint32_t transport_mode;
 	uint32_t tp_type;
 	uint32_t max_queue_depth;
@@ -82,6 +86,8 @@ struct spdk_urma_capsule_cmd {
 	uint64_t trace_seq;
 	uint32_t trace_flags;
 	uint32_t reserved;
+	uint32_t seg_ctx_length;
+	uint8_t seg_ctx[SPDK_URMA_MAX_SEG_CTX_SIZE];
 };
 
 /* Target-local ticks returned with the completion.  The timestamps are only
@@ -117,6 +123,9 @@ struct spdk_urma_capsule_rsp_frame {
 
 #pragma pack(pop)
 
+#define SPDK_URMA_CMD_BASE_SIZE offsetof(struct spdk_urma_capsule_cmd, seg_ctx)
+#define SPDK_URMA_CMD_BASE_FRAME_SIZE (sizeof(struct spdk_urma_msg_hdr) + SPDK_URMA_CMD_BASE_SIZE)
+
 struct spdk_urma_transport_opts {
 	char dev_name[URMA_MAX_NAME];
 	uint32_t eid_index;
@@ -134,6 +143,7 @@ struct spdk_urma_transport_opts {
 	bool bonding_balance;
 	bool bonding_multipath;
 	bool numa_affinity;
+	bool electrical_network;
 };
 
 struct spdk_urma_device {
@@ -161,6 +171,24 @@ struct spdk_urma_device {
 	TAILQ_ENTRY(spdk_urma_device) link;
 	struct spdk_memory_domain *memory_domain;
 };
+
+/* HELLO owns the provider bytes until every peer jetty has been imported. */
+int spdk_urma_hello_data_length(const struct spdk_urma_endpoint_desc *desc,
+			      uint32_t frame_length, size_t *data_length);
+int spdk_urma_export_rjettys(struct spdk_urma_device *device, urma_jetty_t **jettys,
+			   struct spdk_urma_endpoint_desc *desc, uint8_t **data);
+int spdk_urma_import_rjetty(struct spdk_urma_device *device,
+			  const struct spdk_urma_endpoint_desc *desc, uint32_t index,
+			  const void *data, urma_target_jetty_t **target);
+
+int spdk_urma_validate_cmd(const struct spdk_urma_msg_hdr *hdr,
+			   const struct spdk_urma_capsule_cmd *cmd);
+int spdk_urma_import_segment(struct spdk_urma_device *device,
+			     const struct spdk_urma_data_desc *data, const void *context,
+			     uint32_t context_length, urma_target_seg_t **target,
+			     void **retained_context);
+void spdk_urma_bonding_chip_ids(bool electrical, uint8_t local, uint8_t remote, uint32_t *src,
+				uint32_t *dst);
 
 typedef bool (*spdk_urma_recv_cr_prepare_cb)(urma_cr_t *cr, void *ctx);
 

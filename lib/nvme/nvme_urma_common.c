@@ -15,6 +15,9 @@ struct spdk_nvme_urma_memory_region {
 	const struct spdk_nvme_urma_memory_provider *provider;
 	void *pin_handle;
 	int dmabuf_fd;
+	uint8_t *seg_ctx;
+	size_t seg_ctx_length;
+	int seg_ctx_error;
 };
 
 static pthread_mutex_t g_provider_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -33,6 +36,230 @@ static size_t g_numa_chip_id_count;
 #define SPDK_URMA_STAT_INC(member) \
 	__atomic_fetch_add(&g_memory_stats.member, 1, __ATOMIC_RELAXED)
 
+/* Keep provider-private bytes opaque. Reconstructing an rjetty from an EID
+ * and ID discards the UB aggregation context and forces legacy kernel exchange. */
+int
+spdk_urma_hello_data_length(const struct spdk_urma_endpoint_desc *desc, uint32_t frame_length,
+			    size_t *data_length)
+{
+	size_t total = 0;
+
+	if (desc->jetty_count == 0 || desc->jetty_count > SPDK_URMA_MAX_JETTY_PER_EP) {
+		return -EPROTO;
+	}
+	for (uint32_t i = 0; i < desc->jetty_count; i++) {
+		if (desc->rjetty_lengths[i] < sizeof(urma_rjetty_t) ||
+		    desc->rjetty_lengths[i] > SPDK_URMA_MAX_RJETTY_SIZE) {
+			return -EPROTO;
+		}
+		total += desc->rjetty_lengths[i];
+	}
+	if (frame_length != sizeof(*desc) + total) {
+		return -EPROTO;
+	}
+	*data_length = total;
+	return 0;
+}
+
+int
+spdk_urma_export_rjettys(struct spdk_urma_device *device, urma_jetty_t **jettys,
+			 struct spdk_urma_endpoint_desc *desc, uint8_t **data)
+{
+	bool bonding = strncmp(device->dev_name, "bonding", 7) == 0;
+	uint8_t *buffer = NULL;
+	size_t used = 0;
+	int rc = 0;
+
+	*data = NULL;
+	if (desc->jetty_count == 0 || desc->jetty_count > SPDK_URMA_MAX_JETTY_PER_EP) {
+		return -EINVAL;
+	}
+	for (uint32_t i = 0; i < desc->jetty_count; i++) {
+		urma_rjetty_t *rjetty = NULL;
+		uint32_t length = 0;
+		uint8_t *grown;
+#ifndef SPDK_CONFIG_URMA_RJETTY
+		urma_rjetty_t plain = {};
+
+		if (bonding) {
+			SPDK_ERRLOG("URMA bonding requires urma_get_rjetty/urma_put_rjetty; "
+				    "rebuild with the matching UMDK SDK\n");
+			rc = -ENOTSUP;
+			break;
+		}
+		plain.jetty_id = jettys[i]->jetty_id;
+		plain.trans_mode = device->opts.transport_mode;
+		plain.type = URMA_JETTY;
+		rjetty = &plain;
+		length = sizeof(plain);
+#else
+		urma_status_t status = urma_get_rjetty(jettys[i], &rjetty, &length);
+
+		if (status != URMA_SUCCESS || rjetty == NULL) {
+			SPDK_ERRLOG("URMA export rjetty %u on %s failed status=%d\n", i,
+				    device->dev_name, status);
+			if (rjetty != NULL) {
+				urma_put_rjetty(rjetty);
+			}
+			rc = -EIO;
+			break;
+		}
+#endif
+		if (length < sizeof(*rjetty) || length > SPDK_URMA_MAX_RJETTY_SIZE ||
+		    (bonding && length == sizeof(*rjetty))) {
+			SPDK_ERRLOG("URMA invalid rjetty length=%u on %s\n", length,
+				    device->dev_name);
+			rc = -EPROTO;
+		} else {
+			/* Match the selected CTP/RTP mode, as in the Mooncake TE path. */
+			rjetty->tp_type = device->opts.tp_type;
+			grown = realloc(buffer, used + length);
+			if (grown == NULL) {
+				rc = -ENOMEM;
+			} else {
+				buffer = grown;
+				memcpy(buffer + used, rjetty, length);
+				desc->rjetty_lengths[i] = length;
+				used += length;
+			}
+		}
+#ifdef SPDK_CONFIG_URMA_RJETTY
+		urma_put_rjetty(rjetty);
+#endif
+		if (rc != 0) {
+			break;
+		}
+	}
+	if (rc != 0) {
+		free(buffer);
+		return rc;
+	}
+	*data = buffer;
+	return 0;
+}
+
+int
+spdk_urma_import_rjetty(struct spdk_urma_device *device, const struct spdk_urma_endpoint_desc *desc,
+			uint32_t index, const void *data, urma_target_jetty_t **target)
+{
+	urma_token_t token = {.token = SPDK_URMA_DEFAULT_TOKEN};
+	urma_rjetty_t *rjetty;
+	uint32_t length;
+	int saved_errno, rc = 0;
+
+	*target = NULL;
+	if (index >= desc->jetty_count || index >= SPDK_URMA_MAX_JETTY_PER_EP || data == NULL) {
+		return -EINVAL;
+	}
+#ifndef SPDK_CONFIG_URMA_RJETTY
+	if (strncmp(device->dev_name, "bonding", 7) == 0) {
+		return -ENOTSUP;
+	}
+#endif
+	length = desc->rjetty_lengths[index];
+	if (length < sizeof(*rjetty) || length > SPDK_URMA_MAX_RJETTY_SIZE ||
+	    (strncmp(device->dev_name, "bonding", 7) == 0 && length == sizeof(*rjetty))) {
+		return -EPROTO;
+	}
+	/* Concatenated blobs need not preserve the SDK's alignment. */
+	rjetty = malloc(length);
+	if (rjetty == NULL) {
+		return -ENOMEM;
+	}
+	memcpy(rjetty, data, length);
+	if (memcmp(&rjetty->jetty_id.eid, &desc->eid, sizeof(desc->eid)) != 0 ||
+	    rjetty->jetty_id.id != desc->jetty_ids[index] ||
+	    rjetty->trans_mode != device->opts.transport_mode ||
+	    rjetty->tp_type != device->opts.tp_type || rjetty->type != URMA_JETTY) {
+		free(rjetty);
+		return -EPROTO;
+	}
+	errno = 0;
+	*target = urma_import_jetty(device->context, rjetty, &token);
+	saved_errno = errno;
+	if (*target == NULL) {
+		SPDK_ERRLOG("URMA import rjetty %u on %s failed errno=%d (%s), blob_length=%u\n",
+			    index, device->dev_name, saved_errno,
+			    saved_errno ? strerror(saved_errno) : "not set by provider", length);
+		rc = -EIO;
+	}
+	free(rjetty);
+	return rc;
+}
+
+int
+spdk_urma_validate_cmd(const struct spdk_urma_msg_hdr *hdr, const struct spdk_urma_capsule_cmd *cmd)
+{
+	if (hdr->magic != SPDK_URMA_WIRE_MAGIC || hdr->version != SPDK_URMA_WIRE_VERSION ||
+	    hdr->type != SPDK_URMA_MSG_CAPSULE_CMD ||
+	    cmd->seg_ctx_length > SPDK_URMA_MAX_SEG_CTX_SIZE ||
+	    (cmd->seg_ctx_length != 0 && cmd->seg_ctx_length < sizeof(urma_seg_t)) ||
+	    (cmd->data.length == 0 && cmd->seg_ctx_length != 0) ||
+	    hdr->length != SPDK_URMA_CMD_BASE_SIZE + cmd->seg_ctx_length) {
+		return -EPROTO;
+	}
+	return 0;
+}
+
+int
+spdk_urma_import_segment(struct spdk_urma_device *device, const struct spdk_urma_data_desc *data,
+			 const void *context, uint32_t context_length, urma_target_seg_t **target,
+			 void **retained_context)
+{
+	urma_import_seg_flag_t flag = {};
+	urma_token_t token = {.token = SPDK_URMA_DEFAULT_TOKEN};
+	urma_seg_t *copy;
+	bool bonding = strncmp(device->dev_name, "bonding", 7) == 0;
+	uint32_t length = context_length ? context_length : sizeof(*copy);
+	int saved_errno;
+
+	*target = NULL;
+	*retained_context = NULL;
+	if (length < sizeof(*copy) || length > SPDK_URMA_MAX_SEG_CTX_SIZE ||
+	    (context_length && context == NULL) || (bonding && context_length <= sizeof(*copy))) {
+		return -EPROTO;
+	}
+	if (data->address < data->seg.ubva.va || data->length > data->seg.len ||
+	    data->address - data->seg.ubva.va > data->seg.len - data->length) {
+		return -EPROTO;
+	}
+	copy = malloc(length);
+	if (copy == NULL) {
+		return -ENOMEM;
+	}
+	memcpy(copy, context_length ? context : &data->seg, length);
+	if (memcmp(&copy->ubva, &data->seg.ubva, sizeof(copy->ubva)) != 0 ||
+	    copy->len != data->seg.len || copy->token_id != data->seg.token_id) {
+		free(copy);
+		return -EPROTO;
+	}
+	flag.bs.cacheable = URMA_NON_CACHEABLE;
+	flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+	flag.bs.mapping = URMA_SEG_NOMAP;
+	errno = 0;
+	*target = urma_import_seg(device->context, copy, &token, 0, flag);
+	saved_errno = errno;
+	if (*target == NULL) {
+		SPDK_ERRLOG("URMA segment import on %s failed errno=%d, context_length=%u\n",
+			    device->dev_name, saved_errno, context_length);
+		free(copy);
+		return -EIO;
+	}
+	/* Match TE: retain the imported descriptor until unimport. */
+	*retained_context = copy;
+	return 0;
+}
+
+/* Same policy as Mooncake TE selectBondingChipIds(): electrical pairs the
+ * remote chip with itself; optical uses the local and remote memory chips. */
+void
+spdk_urma_bonding_chip_ids(bool electrical, uint8_t local, uint8_t remote, uint32_t *src,
+			   uint32_t *dst)
+{
+	*src = electrical ? remote : local;
+	*dst = remote;
+}
+
 static bool
 spdk_urma_accel_memory_enabled(void)
 {
@@ -43,8 +270,7 @@ spdk_urma_accel_memory_enabled(void)
 #endif
 }
 
-static int
-spdk_urma_runtime_get(void)
+static int spdk_urma_runtime_get(void)
 {
 	int rc = 0;
 
@@ -185,6 +411,9 @@ spdk_urma_opts_init(struct spdk_urma_transport_opts *opts)
 	opts->bonding_balance = spdk_urma_env_bool("SPDK_URMA_BONDING_BALANCE", false);
 	opts->bonding_multipath = spdk_urma_env_bool("SPDK_URMA_BONDING_MULTIPATH_ENABLE", false);
 	opts->numa_affinity = spdk_urma_env_bool("SPDK_URMA_NUMA_AFFINITY_ENABLE", false);
+	opts->electrical_network =
+	    spdk_urma_env_bool("SPDK_URMA_ELECTRICAL_NETWORK_ENABLE",
+			       spdk_urma_env_bool("MC_UB_ELECTRICAL_NETWORK_ENABLE", false));
 
 	value = getenv("SPDK_URMA_ACTIVE_PORT");
 	if (value != NULL && value[0] != '\0') {
@@ -480,6 +709,31 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 		}
 		goto fail_pin;
 	}
+#ifdef SPDK_CONFIG_URMA_SEG_CTX
+	/* Snapshot once per registration, including whole-pool registrations.
+	 * Export failure affects publishing this region, not local SEND/RECV use. */
+	urma_seg_t *context = NULL;
+	uint32_t context_length = 0;
+	urma_status_t status = urma_get_seg_ctx(region->target_seg, &context, &context_length);
+
+	if (status != URMA_SUCCESS || context == NULL) {
+		region->seg_ctx_error = -EIO;
+	} else if (context_length < sizeof(*context) ||
+		   context_length > SPDK_URMA_MAX_SEG_CTX_SIZE) {
+		region->seg_ctx_error = -EMSGSIZE;
+	} else {
+		region->seg_ctx = malloc(context_length);
+		if (region->seg_ctx == NULL) {
+			region->seg_ctx_error = -ENOMEM;
+		} else {
+			memcpy(region->seg_ctx, context, context_length);
+			region->seg_ctx_length = context_length;
+		}
+	}
+	if (context != NULL) {
+		urma_put_seg_ctx(context);
+	}
+#endif
 	*region_out = region;
 	return 0;
 
@@ -525,6 +779,7 @@ spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 		g_provider_refs[region->type]--;
 		pthread_mutex_unlock(&g_provider_mutex);
 	}
+	free(region->seg_ctx);
 	free(region);
 }
 
@@ -547,18 +802,26 @@ spdk_urma_memory_region_get_tseg(struct spdk_nvme_urma_memory_region *region)
 }
 
 int
-spdk_nvme_urma_memory_region_export(const struct spdk_nvme_urma_memory_region *region,
-				    void *buf, size_t *length)
+spdk_nvme_urma_memory_region_export(const struct spdk_nvme_urma_memory_region *region, void *buf,
+				    size_t *length)
 {
 	if (region == NULL || length == NULL) {
 		return -EINVAL;
 	}
-	if (buf == NULL || *length < sizeof(region->target_seg->seg)) {
-		*length = sizeof(region->target_seg->seg);
+	if (region->seg_ctx_error != 0) {
+		return region->seg_ctx_error;
+	}
+	const void *context = region->seg_ctx ? (const void *)region->seg_ctx
+					      : (const void *)&region->target_seg->seg;
+	size_t required =
+	    region->seg_ctx ? region->seg_ctx_length : sizeof(region->target_seg->seg);
+
+	if (buf == NULL || *length < required) {
+		*length = required;
 		return buf == NULL ? 0 : -ENOSPC;
 	}
-	memcpy(buf, &region->target_seg->seg, sizeof(region->target_seg->seg));
-	*length = sizeof(region->target_seg->seg);
+	memcpy(buf, context, required);
+	*length = required;
 	return 0;
 }
 
@@ -607,8 +870,8 @@ spdk_urma_device_opts_compatible(const struct spdk_urma_device *device,
 	       device->opts.bonding_balance == opts->bonding_balance &&
 	       device->opts.bonding_multipath == opts->bonding_multipath &&
 	       device->opts.numa_affinity == opts->numa_affinity &&
-	       device->opts.priority == opts->priority &&
-	       device->opts.tp_type == opts->tp_type;
+	       device->opts.electrical_network == opts->electrical_network &&
+	       device->opts.priority == opts->priority && device->opts.tp_type == opts->tp_type;
 }
 
 static int
@@ -938,6 +1201,14 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 			    opts->dev_name);
 		goto fail;
 	}
+#if !defined(SPDK_CONFIG_URMA_RJETTY) || !defined(SPDK_CONFIG_URMA_SEG_CTX)
+	if (strncmp(selected->name, "bonding", 7) == 0) {
+		SPDK_ERRLOG("URMA bonding requires complete rjetty and segment context APIs; "
+			    "rebuild with a matching UMDK SDK\n");
+		rc = -ENOTSUP;
+		goto fail;
+	}
+#endif
 	snprintf(device->dev_name, sizeof(device->dev_name), "%s", selected->name);
 	eids = urma_get_eid_list(selected, &eid_count);
 	if (eids == NULL || eid_count == 0) {
