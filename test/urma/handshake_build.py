@@ -138,6 +138,15 @@ def main():
                 run([*compiler, *flags, *legacy_flags, "-c", str(ROOT / path),
                      "-o", str(work / (Path(path).stem + ".o"))])
             binary = work / "test"
+            policy = (ROOT / "test/urma/jetty_policy.c").read_text().replace(
+                "/* REAL_JETTY_CONSTRUCTORS */",
+                extract_function(source, "nvme_urma_create_jetty") +
+                extract_function(target, "nvmf_urma_create_jetty"))
+            (work / "policy.c").write_text(policy)
+            run([*compiler, *flags, str(work / "policy.c"),
+                 str(work / "nvme_urma_common.o"), "-Wl,--gc-sections", "-pthread",
+                 "-o", str(work / "policy")])
+            run([str(work / "policy")])
             run([*compiler, *flags, str(work / "test.c"),
                  str(work / "nvme_urma_common.o"), "-Wl,--gc-sections",
                  "-pthread", "-o", str(binary)])

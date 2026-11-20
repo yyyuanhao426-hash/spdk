@@ -611,7 +611,7 @@ nvmf_urma_create_jetty(struct nvmf_urma_qpair *uqpair)
 	jfs.trans_mode = device->opts.transport_mode;
 	jfs.priority = device->priority;
 	jfs.max_sge = SPDK_URMA_DEFAULT_MAX_SGE;
-	jfs.flag.bs.multi_path = device->opts.bonding_multipath ? 1 : 0;
+	jfs.flag.bs.multi_path = spdk_urma_device_uses_multipath(device);
 	if (device->opts.capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		if (device->attr.dev_cap.max_jfs_inline_len < capsule_inline_size) {
 			SPDK_ERRLOG("URMA capsule SEND requires %u inline bytes, device supports %u\n",

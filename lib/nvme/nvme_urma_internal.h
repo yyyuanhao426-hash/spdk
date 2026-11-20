@@ -192,6 +192,16 @@ void spdk_urma_bonding_chip_ids(bool electrical, uint8_t local, uint8_t remote, 
 
 typedef bool (*spdk_urma_recv_cr_prepare_cb)(urma_cr_t *cr, void *ctx);
 
+/* BALANCE+PORT needs the JFS multi_path bit too (Mooncake TE policy).
+ * The existing bonding_multipath option still selects IODIE in device_open;
+ * keep that level choice separate from enabling multipath on each jetty. */
+static inline bool
+spdk_urma_device_uses_multipath(const struct spdk_urma_device *device)
+{
+	return device->opts.bonding_multipath ||
+	       (device->opts.bonding_balance && strncmp(device->dev_name, "bonding", 7) == 0);
+}
+
 /* UMDK constructs these queue-state notification CRs without a valid
  * user_ctx.  They must be consumed before any transport context lookup. */
 static inline bool

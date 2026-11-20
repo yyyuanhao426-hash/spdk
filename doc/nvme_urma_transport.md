@@ -74,6 +74,11 @@ python3 test/urma/registration_build.py --umdk /path/to/gpu-capable/UMDK
   与 TE 一样，导入描述保留到 `urma_unimport_seg()` 后释放。
 - 光互联 WR 选择 `{local_chip, remote_chip}`；电互联保持 `{remote_chip, remote_chip}`。
   显式亲和仅用于 bonding；芯片 ID 无法确定时使用 provider 默认路径。
+- bonding 设备设置 `SPDK_URMA_BONDING_BALANCE=1`、
+  `SPDK_URMA_BONDING_MULTIPATH_ENABLE=0` 时，设备为 BALANCE+PORT，且 initiator/target
+  创建的 JFS 均开启 `multi_path=1`，与 TE 的 multipath=on 一致。原有
+  `SPDK_URMA_BONDING_MULTIPATH_ENABLE=1` 仍选择 IODIE，不需要为 PORT 将它改成 1。
+  raw 默认不启用该位；原有显式 multipath 开关的行为保留。
 
 configure 自动编译、链接探测四个 get/put API，内部宏为 `SPDK_CONFIG_URMA_RJETTY`
 和 `SPDK_CONFIG_URMA_SEG_CTX`，无需新增构建开关。缺少接口的 SDK 仍可编译 raw 路径；
@@ -101,7 +106,7 @@ python3 test/urma/handshake_build.py --umdk /path/to/UMDK --sanitize
 python3 test/urma/registration_build.py --umdk /path/to/gpu-capable/UMDK
 ~~~
 
-测试编译完整 common/initiator/target 源码，并运行真实 HELLO、capsule 解码、target
+测试编译完整 common/initiator/target 源码，并运行真实 jetty 构造、HELLO、capsule 解码、target
 数据 WR 和 initiator SEND 完成路径。覆盖完整扩展、缓存身份/保活、光/电选路、raw、
 分段与背压、buffer 重投、跨 qpair 完成、发送失败和断连。provider fixture 不能替代
 实际 aarch64 库与集群上的 bonding Admin Connect、读写和 master 挂载验证。
