@@ -882,7 +882,9 @@ nvme_urma_send_cmd_capsule(struct nvme_urma_qpair *uqpair,
 	wr.flag.bs.inline_flag = 1;
 	wr.tjetty = uqpair->target_jettys[jetty_index];
 	wr.user_ctx = (uint64_t)&uqpair->capsule_tx_cqe;
-	if (sge.len > SPDK_URMA_CMD_BASE_FRAME_SIZE) {
+	/* Bonding providers need registered storage even for small admin commands. */
+	if (strncmp(uqpair->device->dev_name, "bonding", 7) == 0 ||
+	    sge.len > SPDK_URMA_CMD_BASE_FRAME_SIZE) {
 		int rc = nvme_urma_tx_pool_init(uqpair);
 
 		if (rc != 0) {
@@ -923,10 +925,11 @@ nvme_urma_send_cmd_capsule(struct nvme_urma_qpair *uqpair,
 			__atomic_store_n(&slot->busy, false, __ATOMIC_RELEASE);
 		}
 		SPDK_ERRLOG("capsule SEND post failed: status=%d qid=%u cid=%u jetty=%u "
-			    "send_jfc=%u queue_depth=%u/%u bad_wr=%p\n",
+			    "send_jfc=%u queue_depth=%u/%u bad_wr=%p inline=%u bytes=%u tseg=%p\n",
 			    status, uqpair->qpair.id, frame->capsule.cmd.cid, jetty_index,
 			    uqpair->send_jfc_index, uqpair->qpair.queue_depth,
-			    uqpair->num_entries, bad_wr);
+			    uqpair->num_entries, bad_wr, (unsigned)wr.flag.bs.inline_flag,
+			    sge.len, sge.tseg);
 		return -EIO;
 	}
 	return 0;
@@ -1062,9 +1065,9 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	hdr.type = SPDK_URMA_MSG_CAPSULE_CMD;
 	hdr.length = SPDK_URMA_CMD_BASE_SIZE + capsule.seg_ctx_length;
 	hdr.qid = qpair->id;
-	/* TCP emits the contiguous frame with one write. Small capsules use inline
-	 * SEND; complete provider contexts are copied into a registered TX slot
-	 * which stays owned until SEND completion, independently of NVMe response. */
+	/* TCP emits the contiguous frame with one write. Small raw capsules use inline
+	 * SEND; bonding commands and larger frames use a registered TX slot owned
+	 * until SEND completion, independently of the NVMe response. */
 	if (uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		struct spdk_urma_capsule_cmd_frame frame;
 

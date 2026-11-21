@@ -3,6 +3,7 @@
 #include "nvme_urma_internal.h"
 #include "spdk/config.h"
 #include "spdk/likely.h"
+#include "spdk/nvmf_spec.h"
 #include "spdk/thread.h"
 #include "spdk_internal/urma_lifetime.h"
 
@@ -10,7 +11,7 @@ static unsigned registrations, context_exports, context_releases, imports;
 static char diagnostics[16384];
 static int repost_result;
 static unsigned disconnect_count, response_releases;
-static bool strict_bond_response;
+static bool strict_registered_send;
 static unsigned unregistrations, fail_registration_at;
 static struct spdk_thread *current_thread;
 static spdk_msg_fn pending_msg;
@@ -143,7 +144,7 @@ urma_post_jetty_send_wr(urma_jetty_t *j, urma_jfs_wr_t *w, urma_jfs_wr_t **bad)
 		last_user_ctx = w->user_ctx;
 		assert(s->len <= sizeof(last_bytes));
 		memcpy(last_bytes, (void *)s->addr, s->len);
-		if (strict_bond_response && (last_inline || s->tseg == NULL)) {
+		if (strict_registered_send && (last_inline || s->tseg == NULL)) {
 			*bad = w;
 			return URMA_EINVAL;
 		}
@@ -518,7 +519,7 @@ send_test(void)
 {
 	urma_context_t ctx = {0};
 	struct spdk_urma_device d = {.context = &ctx};
-	strcpy(d.dev_name, "bonding_dev_75");
+	strcpy(d.dev_name, "udmac0d1e3");
 	urma_jetty_t *jettys[1] = {0};
 	urma_target_jetty_t *targets[1] = {0};
 	struct nvme_urma_qpair q = {.device = &d,
@@ -580,6 +581,84 @@ send_test(void)
 	assert(spdk_urma_validate_cmd(&frame.hdr, &frame.capsule) == -EPROTO);
 	spdk_nvme_urma_unregister_memory(q.capsule_tx_region);
 	free(q.capsule_tx_slots);
+}
+static void
+bond_command_test(void)
+{
+	urma_context_t ctx = {0};
+	struct spdk_urma_device device = {.context = &ctx};
+	strcpy(device.dev_name, "bonding_dev_75");
+	urma_jetty_t *jettys[1] = {0};
+	urma_target_jetty_t *targets[1] = {0};
+	struct nvme_urma_qpair q = {.device = &device,
+				    .jettys = jettys,
+				    .target_jettys = targets,
+				    .jetty_count = 1,
+				    .num_entries = 1};
+	spdk_urma_lifetime_init(&q.lifetime);
+	q.capsule_tx_cqe.type = NVME_URMA_CQE_CAPSULE_TX;
+	q.capsule_tx_cqe.owner = &q;
+	struct spdk_urma_capsule_cmd_frame frame = {0};
+	frame.hdr.magic = SPDK_URMA_WIRE_MAGIC;
+	frame.hdr.version = SPDK_URMA_WIRE_VERSION;
+	frame.hdr.type = SPDK_URMA_MSG_CAPSULE_CMD;
+	frame.hdr.length = SPDK_URMA_CMD_BASE_SIZE;
+	struct spdk_nvmf_fabric_prop_get_cmd cmd = {
+		.opcode = SPDK_NVME_OPC_FABRIC,
+		.cid = 1,
+		.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET,
+		.ofst = offsetof(struct spdk_nvme_registers, vs),
+	};
+	memcpy(&frame.capsule.cmd, &cmd, sizeof(cmd));
+	strict_registered_send = true;
+	diagnostics[0] = 0;
+	int rc = nvme_urma_send_cmd_capsule(&q, &frame);
+	if (rc != 0) {
+		fprintf(stderr, "bond Property Get failed: rc=%d inline=%u bytes=%u\n%s",
+			rc, last_inline, last_length, diagnostics);
+	}
+	assert(rc == 0 && !last_inline && last_length == SPDK_URMA_CMD_BASE_FRAME_SIZE);
+	assert(last_send_addr != (uint64_t)&frame && q.capsule_tx_slots[0].busy);
+	assert(spdk_urma_lifetime_refs(&q.lifetime) == 1);
+	assert(memcmp(last_bytes, (void *)last_send_addr, last_length) == 0);
+	uint64_t tx = last_user_ctx;
+	frame.capsule.cmd.cid = 2;
+	assert(((struct spdk_urma_capsule_cmd_frame *)last_send_addr)->capsule.cmd.cid == 1);
+	assert(nvme_urma_send_cmd_capsule(&q, &frame) == -EAGAIN);
+	struct nvme_urma_qpair poller = {0};
+	spdk_urma_lifetime_init(&poller.lifetime);
+	urma_cr_t cr = {.status = URMA_CR_SUCCESS, .user_ctx = tx};
+	uint32_t done = 0;
+	assert(nvme_urma_process_capsule_cr(&poller, &cr, &done) == 0);
+	assert(!q.capsule_tx_slots[0].busy && spdk_urma_lifetime_refs(&q.lifetime) == 0);
+	post_error = true;
+	assert(nvme_urma_send_cmd_capsule(&q, &frame) == -EIO);
+	post_error = false;
+	assert(strstr(diagnostics, "inline=0 bytes=") && strstr(diagnostics, "tseg="));
+	assert(!q.capsule_tx_slots[0].busy && spdk_urma_lifetime_refs(&q.lifetime) == 0);
+	assert(nvme_urma_send_cmd_capsule(&q, &frame) == 0);
+	cr.user_ctx = last_user_ctx;
+	cr.status = URMA_CR_WR_FLUSH_ERR;
+	spdk_urma_lifetime_close(&q.lifetime);
+	assert(nvme_urma_process_capsule_cr(&poller, &cr, &done) == 0);
+	assert(!q.capsule_tx_slots[0].busy && spdk_urma_lifetime_refs(&q.lifetime) == 0);
+	spdk_nvme_urma_unregister_memory(q.capsule_tx_region);
+	free(q.capsule_tx_slots);
+	q.capsule_tx_region = NULL;
+	q.capsule_tx_slots = NULL;
+	spdk_urma_lifetime_init(&q.lifetime);
+	fail_registration_at = registrations + 1;
+	assert(nvme_urma_send_cmd_capsule(&q, &frame) != 0);
+	assert(q.capsule_tx_region == NULL && !q.capsule_tx_slots[0].busy &&
+	       spdk_urma_lifetime_refs(&q.lifetime) == 0);
+	fail_registration_at = 0;
+	assert(nvme_urma_send_cmd_capsule(&q, &frame) == 0);
+	cr = (urma_cr_t){.status = URMA_CR_SUCCESS, .user_ctx = last_user_ctx};
+	assert(nvme_urma_process_capsule_cr(&q, &cr, &done) == 0);
+	spdk_nvme_urma_unregister_memory(q.capsule_tx_region);
+	free(q.capsule_tx_slots);
+	strict_registered_send = false;
+	puts("PASS bond Property Get registered SEND, frame reuse, pool backpressure, completion ownership, post/registration failure and close/flush");
 }
 static void
 diagnostics_test(void)
@@ -658,7 +737,7 @@ response_test(void)
 	assert(nvmf_urma_capsule_resources_init(&q) == 0);
 	struct nvmf_urma_req request, second, waiting;
 	init_response_request(&request, &q, 17);
-	strict_bond_response = true;
+	strict_registered_send = true;
 	diagnostics[0] = 0;
 	unsigned released = response_releases;
 	int rc = nvmf_urma_send_response(&request);
@@ -724,7 +803,7 @@ response_test(void)
 	nvmf_urma_capsule_resources_fini(&q);
 	assert(unregistrations == before_unreg + 2);
 	assert(q.capsule_tx_slots == NULL && q.capsule_tx_region == NULL);
-	strict_bond_response = false;
+	strict_registered_send = false;
 
 	/* Partial initialization failure must release RX and TX allocations. */
 	spdk_urma_lifetime_init(&q.lifetime);
@@ -766,6 +845,7 @@ main(void)
 	target_data_test();
 	decode_test();
 	send_test();
+	bond_command_test();
 	diagnostics_test();
 	response_test();
 	puts("PASS full segment export/import lifetime, whole-pool cache identity, real "
