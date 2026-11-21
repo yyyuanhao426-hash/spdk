@@ -165,7 +165,12 @@ def main():
                     "nvmf_urma_next_jetty", "nvmf_urma_seg_hash", "nvmf_urma_import_cache_find",
                     "nvmf_urma_import_cache_fini", "nvmf_urma_post_data", "nvmf_urma_read_full",
                     "nvmf_urma_receive_capsule", "nvmf_urma_process_cmd_receive",
-                    "nvmf_urma_handle_completion_inner"))
+                    "nvmf_urma_handle_completion_inner", "nvmf_urma_handle_completion",
+                    "nvmf_urma_completion_msg_fn", "nvmf_urma_process_completion",
+                    "nvmf_urma_write_full", "nvmf_urma_rsp_tx_pool_init",
+                    "nvmf_urma_rsp_tx_acquire", "nvmf_urma_send_response",
+                    "nvmf_urma_retry_responses", "nvmf_urma_qpair_drained",
+                    "nvmf_urma_capsule_resources_init", "nvmf_urma_capsule_resources_fini"))
                 send_functions = "".join(extract_function(source, name) for name in (
                     "nvme_urma_next_jetty", "nvme_urma_tx_pool_init", "nvme_urma_send_cmd_capsule",
                     "nvme_urma_cr_owner_qpair", "nvme_urma_qpair_defer_error",

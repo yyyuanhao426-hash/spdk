@@ -3,12 +3,25 @@
 #include "nvme_urma_internal.h"
 #include "spdk/config.h"
 #include "spdk/likely.h"
+#include "spdk/thread.h"
 #include "spdk_internal/urma_lifetime.h"
 
 static unsigned registrations, context_exports, context_releases, imports;
 static char diagnostics[16384];
 static int repost_result;
-static unsigned disconnect_count;
+static unsigned disconnect_count, response_releases;
+static bool strict_bond_response;
+static unsigned unregistrations, fail_registration_at;
+static struct spdk_thread *current_thread;
+static spdk_msg_fn pending_msg;
+static void *pending_msg_arg;
+struct spdk_thread *spdk_get_thread(void) { return current_thread; }
+int spdk_thread_send_msg(const struct spdk_thread *t, spdk_msg_fn fn, void *arg) {
+	assert(pending_msg == NULL);
+	pending_msg = fn;
+	pending_msg_arg = arg;
+	return 0;
+}
 static uint8_t export_marker = 0xac, local_chip = 1;
 static bool require_context = true, use_cache = true, post_error;
 static uint64_t last_user_ctx, last_send_addr;
@@ -39,6 +52,10 @@ __wrap_spdk_urma_memory_chip_id(const void *p)
 urma_target_seg_t *
 urma_register_seg(urma_context_t *c, urma_seg_cfg_t *cfg)
 {
+	if (fail_registration_at == registrations + 1) {
+		errno = EIO;
+		return NULL;
+	}
 	urma_target_seg_t *s = calloc(1, sizeof(*s));
 	assert(s);
 	s->seg.ubva.va = cfg->va;
@@ -50,6 +67,7 @@ urma_register_seg(urma_context_t *c, urma_seg_cfg_t *cfg)
 urma_status_t
 urma_unregister_seg(urma_target_seg_t *s)
 {
+	unregistrations++;
 	free(s);
 	return URMA_SUCCESS;
 }
@@ -125,8 +143,16 @@ urma_post_jetty_send_wr(urma_jetty_t *j, urma_jfs_wr_t *w, urma_jfs_wr_t **bad)
 		last_user_ctx = w->user_ctx;
 		assert(s->len <= sizeof(last_bytes));
 		memcpy(last_bytes, (void *)s->addr, s->len);
-		if (!last_inline)
+		if (strict_bond_response && (last_inline || s->tseg == NULL)) {
+			*bad = w;
+			return URMA_EINVAL;
+		}
+		if (!last_inline) {
 			assert(s->tseg != NULL);
+			assert(s->addr >= s->tseg->seg.ubva.va);
+			assert(s->addr - s->tseg->seg.ubva.va <= s->tseg->seg.len);
+			assert(s->len <= s->tseg->seg.len - (s->addr - s->tseg->seg.ubva.va));
+		}
 	} else {
 		last_affinity = w->flag.bs.has_drv_ext;
 		if (last_affinity) {
@@ -161,17 +187,24 @@ struct nvmf_urma_reg_entry {
 	struct spdk_nvme_urma_memory_region *region;
 	bool used;
 };
-enum { NVMF_URMA_CQE_CAPSULE_TX = 1, NVMF_URMA_CQE_CAPSULE_RX, NVMF_URMA_CQE_DATA };
+enum { NVMF_URMA_CQE_CAPSULE_TX = 1, NVMF_URMA_CQE_CAPSULE_RX, NVMF_URMA_CQE_DATA, NVMF_URMA_CQE_BUFFERED_TX };
 struct nvmf_urma_cqe_ctx {
 	int type;
 	void *owner;
 };
+struct nvmf_urma_rsp_tx_slot {
+	struct nvmf_urma_cqe_ctx cqe;
+	struct nvmf_urma_qpair *qpair;
+	bool busy;
+	struct spdk_urma_capsule_rsp_frame frame;
+};
 struct nvmf_urma_qpair {
+	struct spdk_thread *thread;
 	char peer_addr[64], service[16];
 	int fd;
 	uint64_t pending_peek_tick;
 	struct {
-		uint32_t qid;
+		uint32_t qid, sq_head_max;
 	} qpair;
 	struct spdk_urma_device *device;
 	struct nvmf_urma_transport *transport;
@@ -180,6 +213,14 @@ struct nvmf_urma_qpair {
 	struct spdk_urma_lifetime lifetime;
 	struct nvmf_urma_reg_entry reg_cache[128];
 	uint32_t next_jetty, jetty_count;
+	urma_jfr_t **jfrs;
+	enum spdk_urma_capsule_transport capsule_transport;
+	struct nvmf_urma_cqe_ctx capsule_tx_cqe;
+	struct nvmf_urma_cmd_rx_slot *capsule_rx_slots;
+	struct spdk_nvme_urma_memory_region *capsule_rx_region, *capsule_tx_region;
+	struct nvmf_urma_rsp_tx_slot *capsule_tx_slots;
+	uint32_t capsule_rx_count, capsule_tx_count, next_tx_slot, resource_count, pending_responses;
+	TAILQ_HEAD(, nvmf_urma_req) working_reqs;
 };
 struct nvmf_urma_req {
 	struct {
@@ -200,14 +241,15 @@ struct nvmf_urma_req {
 	int state;
 	struct nvmf_urma_cqe_ctx cqe;
 	union { struct spdk_nvme_cpl nvme_cpl; } rsp;
+	union { struct spdk_nvme_cmd nvme_cmd; } cmd;
+	uint64_t start_tick;
+	uint32_t trace_idx;
+	TAILQ_ENTRY(nvmf_urma_req) link;
 	uint64_t exec_tick;
 	uint64_t post_tick;
-	struct {
-		uint32_t flags;
-		uint64_t data_post_tick, exec_tick, data_cpl_tick;
-	} stage_trace;
+	struct spdk_urma_stage_trace stage_trace;
 };
-enum { NVMF_URMA_REQ_PUSHING, NVMF_URMA_REQ_PULLING, NVMF_URMA_REQ_EXECUTING };
+enum { NVMF_URMA_REQ_PUSHING, NVMF_URMA_REQ_PULLING, NVMF_URMA_REQ_EXECUTING, NVMF_URMA_REQ_WAIT_TX };
 static struct nvmf_urma_qpair *
 nvmf_urma_qpair(void *p)
 {
@@ -222,6 +264,9 @@ struct nvmf_urma_cmd_rx_slot {
 	struct nvmf_urma_cqe_ctx cqe;
 	struct nvmf_urma_qpair *qpair;
 	struct spdk_urma_capsule_cmd_frame frame;
+	struct spdk_urma_rx_ref rx_ref;
+	urma_sge_t sge;
+	urma_jfr_wr_t wr;
 };
 static struct spdk_urma_capsule_cmd parsed;
 static unsigned parsed_count;
@@ -242,9 +287,24 @@ nvmf_urma_handle_capsule(struct nvmf_urma_qpair *q, const struct spdk_urma_msg_h
 	return 1;
 }
 static void nvmf_urma_disconnect_qpair(struct nvmf_urma_qpair *q) { disconnect_count++; }
-static int nvmf_urma_send_response(struct nvmf_urma_req *r) { return 0; }
-static void nvmf_urma_release_req(struct nvmf_urma_req *r) { }
+static int nvmf_urma_send_response(struct nvmf_urma_req *r);
+static void nvmf_urma_release_req(struct nvmf_urma_req *r) {
+	response_releases++;
+	if (r->state == NVMF_URMA_REQ_WAIT_TX) {
+		struct nvmf_urma_qpair *q = r->req.qpair;
+		assert(q->pending_responses > 0);
+		q->pending_responses--;
+	}
+	if (r->link.tqe_prev != NULL) {
+		TAILQ_REMOVE(&((struct nvmf_urma_qpair *)r->req.qpair)->working_reqs, r, link);
+		r->link.tqe_prev = NULL;
+	}
+	r->state = 0;
+}
+#define NVMF_URMA_RX_TRACE_SIZE 1
+static struct { uint64_t rsp_tick; } g_rx_trace[NVMF_URMA_RX_TRACE_SIZE];
 #define spdk_nvmf_request_exec(r) ((void)(r))
+struct nvmf_urma_completion_msg { urma_cr_t completion; };
 /* REAL_TARGET_DATA_FUNCTIONS */
 
 enum nvme_urma_cqe_type {
@@ -566,6 +626,140 @@ diagnostics_test(void)
 	repost_result = 0;
 	puts("PASS real target TX-direction guard and CR errors, initiator owner routing and successful-CR receive-repost diagnostics");
 }
+static void
+init_response_request(struct nvmf_urma_req *request, struct nvmf_urma_qpair *q, uint16_t cid)
+{
+	memset(request, 0, sizeof(*request));
+	request->req.qpair = q;
+	request->trace_idx = UINT32_MAX;
+	request->cmd.nvme_cmd.cid = cid;
+	request->cmd.nvme_cmd.opc = SPDK_NVME_OPC_FABRIC;
+	request->state = NVMF_URMA_REQ_EXECUTING;
+	TAILQ_INSERT_TAIL(&q->working_reqs, request, link);
+}
+
+static void
+response_test(void)
+{
+	urma_context_t context = {0};
+	struct spdk_urma_device device = {.context = &context};
+	strcpy(device.dev_name, "bonding_dev_75");
+	urma_jfr_t jfr = {.jfr_cfg = {.depth = 8}};
+	urma_jfr_t *jfrs[] = {&jfr};
+	urma_jetty_t *jettys[] = {NULL};
+	urma_target_jetty_t *peers[] = {NULL};
+	struct nvmf_urma_qpair q = {.device = &device, .jfrs = jfrs,
+		.jettys = jettys, .target_jettys = peers, .jetty_count = 1,
+		.capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_URMA, .resource_count = 2};
+	q.qpair.sq_head_max = 1;
+	q.capsule_tx_cqe = (struct nvmf_urma_cqe_ctx){NVMF_URMA_CQE_CAPSULE_TX, &q};
+	TAILQ_INIT(&q.working_reqs);
+	spdk_urma_lifetime_init(&q.lifetime);
+	assert(nvmf_urma_capsule_resources_init(&q) == 0);
+	struct nvmf_urma_req request, second, waiting;
+	init_response_request(&request, &q, 17);
+	strict_bond_response = true;
+	diagnostics[0] = 0;
+	unsigned released = response_releases;
+	int rc = nvmf_urma_send_response(&request);
+	if (rc != 0) fprintf(stderr, "%s", diagnostics);
+	assert(rc == 0 && !last_inline);
+	assert(response_releases == released + 1);
+	uint64_t first_ctx = last_user_ctx, first_addr = last_send_addr;
+	assert(((struct spdk_urma_capsule_rsp_frame *)first_addr)->capsule.cpl.cid == 17);
+	memset(&request, 0xa5, sizeof(request));
+	assert(((struct spdk_urma_capsule_rsp_frame *)first_addr)->capsule.cpl.cid == 17);
+
+	init_response_request(&second, &q, 18);
+	assert(nvmf_urma_send_response(&second) == 0);
+	uint64_t second_ctx = last_user_ctx;
+	assert(first_ctx != second_ctx && first_addr != last_send_addr);
+	assert(spdk_urma_lifetime_refs(&q.lifetime) == 2 && !nvmf_urma_qpair_drained(&q));
+	init_response_request(&waiting, &q, 19);
+	assert(nvmf_urma_send_response(&waiting) == 0);
+	assert(q.pending_responses == 1 && response_releases == released + 2);
+	assert(nvmf_urma_retry_responses(&q) == 0 && q.pending_responses == 1);
+
+	/* A shared-JFC poller must retain both the slot and qpair until the
+	 * completion message actually runs on this qpair's owner thread. */
+	q.thread = (void *)(uintptr_t)2;
+	current_thread = (void *)(uintptr_t)1;
+	urma_cr_t cr = {.status = URMA_CR_SUCCESS, .user_ctx = second_ctx};
+	assert(nvmf_urma_process_completion(&cr) == 0 && pending_msg != NULL);
+	assert(spdk_urma_lifetime_refs(&q.lifetime) == 2);
+	assert(((struct nvmf_urma_rsp_tx_slot *)((struct nvmf_urma_cqe_ctx *)second_ctx)->owner)->busy);
+	spdk_msg_fn fn = pending_msg;
+	pending_msg = NULL;
+	current_thread = q.thread;
+	fn(pending_msg_arg);
+	assert(spdk_urma_lifetime_refs(&q.lifetime) == 1);
+	assert(nvmf_urma_retry_responses(&q) == 1 && q.pending_responses == 0);
+	assert(response_releases == released + 3 && last_user_ctx == second_ctx);
+	assert(((struct spdk_urma_capsule_rsp_frame *)first_addr)->capsule.cpl.cid == 17);
+	assert(((struct spdk_urma_capsule_rsp_frame *)last_send_addr)->capsule.cpl.cid == 19);
+	assert(spdk_urma_lifetime_refs(&q.lifetime) == 2);
+
+	cr.user_ctx = first_ctx;
+	assert(nvmf_urma_handle_completion(&cr) == 1);
+	init_response_request(&request, &q, 20);
+	post_error = true;
+	assert(nvmf_urma_send_response(&request) == -EIO);
+	assert(spdk_urma_lifetime_refs(&q.lifetime) == 1);
+	post_error = false;
+	init_response_request(&request, &q, 21);
+	assert(nvmf_urma_send_response(&request) == 0);
+	uint64_t final_ctx = last_user_ctx;
+	init_response_request(&waiting, &q, 22);
+	assert(nvmf_urma_send_response(&waiting) == 0 && q.pending_responses == 1);
+	spdk_urma_lifetime_close(&q.lifetime);
+	assert(nvmf_urma_retry_responses(&q) == 1 && q.pending_responses == 0);
+	assert(TAILQ_EMPTY(&q.working_reqs) && !nvmf_urma_qpair_drained(&q));
+	cr.status = URMA_CR_WR_FLUSH_ERR;
+	cr.user_ctx = second_ctx;
+	assert(nvmf_urma_handle_completion(&cr) == 0);
+	cr.user_ctx = final_ctx;
+	assert(nvmf_urma_handle_completion(&cr) == 0);
+	assert(spdk_urma_lifetime_refs(&q.lifetime) == 0 && nvmf_urma_qpair_drained(&q));
+	unsigned before_unreg = unregistrations;
+	nvmf_urma_capsule_resources_fini(&q);
+	assert(unregistrations == before_unreg + 2);
+	assert(q.capsule_tx_slots == NULL && q.capsule_tx_region == NULL);
+	strict_bond_response = false;
+
+	/* Partial initialization failure must release RX and TX allocations. */
+	spdk_urma_lifetime_init(&q.lifetime);
+	fail_registration_at = registrations + 2;
+	before_unreg = unregistrations;
+	assert(nvmf_urma_capsule_resources_init(&q) != 0);
+	nvmf_urma_capsule_resources_fini(&q);
+	assert(unregistrations == before_unreg + 1);
+	fail_registration_at = 0;
+
+	/* Raw retains the inline path; TCP retains its wire format and needs no
+	 * registered response pool or SEND-completion lifetime reference. */
+	strcpy(device.dev_name, "udmac0d1e3");
+	assert(nvmf_urma_capsule_resources_init(&q) == 0 && q.capsule_tx_slots == NULL);
+	q.qpair.qid = 3;
+	init_response_request(&request, &q, 23);
+	assert(nvmf_urma_send_response(&request) == 0 && last_inline);
+	assert(last_user_ctx == (uint64_t)&q.capsule_tx_cqe);
+	cr = (urma_cr_t){.status = URMA_CR_SUCCESS, .user_ctx = last_user_ctx};
+	assert(nvmf_urma_handle_completion(&cr) == 1 && nvmf_urma_qpair_drained(&q));
+	nvmf_urma_capsule_resources_fini(&q);
+	int fds[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	q.fd = fds[0];
+	q.capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
+	init_response_request(&request, &q, 24);
+	assert(nvmf_urma_send_response(&request) == 0);
+	struct spdk_urma_capsule_rsp_frame frame;
+	assert(recv(fds[1], &frame, sizeof(frame), MSG_WAITALL) == sizeof(frame));
+	assert(frame.hdr.magic == SPDK_URMA_WIRE_MAGIC && frame.hdr.qid == 3);
+	assert(frame.capsule.cpl.cid == 24 && spdk_urma_lifetime_refs(&q.lifetime) == 0);
+	close(fds[0]);
+	close(fds[1]);
+	puts("PASS real registered target responses, request reuse, out-of-order/cross-thread completions, pool backpressure, post/registration failure, close/flush, raw inline and TCP");
+}
 int
 main(void)
 {
@@ -573,6 +767,7 @@ main(void)
 	decode_test();
 	send_test();
 	diagnostics_test();
+	response_test();
 	puts("PASS full segment export/import lifetime, whole-pool cache identity, real "
 	     "optical/electrical WRs, raw inline and non-inline SEND ownership");
 	return 0;
