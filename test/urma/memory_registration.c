@@ -12,6 +12,16 @@ static unsigned int g_register_calls, g_unregister_calls, g_pin_calls, g_unpin_c
 static unsigned int g_export_calls, g_dmabuf_calls;
 static int g_register_error, g_pin_error, g_export_error, g_dmabuf_error, g_fd = -1;
 static char g_pin_handle;
+static bool g_register_without_errno;
+
+void
+spdk_log(enum spdk_log_level level, const char *file, int line, const char *func,
+	 const char *format, ...)
+{
+	/* A diagnostic sink must not change the registration error returned. */
+	errno = EINVAL;
+}
+
 
 urma_target_seg_t *
 urma_register_seg(urma_context_t *ctx, urma_seg_cfg_t *cfg)
@@ -19,6 +29,9 @@ urma_register_seg(urma_context_t *ctx, urma_seg_cfg_t *cfg)
 	assert(ctx != NULL);
 	g_register_calls++;
 	g_cfg = *cfg;
+	if (g_register_without_errno) {
+		return NULL;
+	}
 	if (g_register_error != 0) {
 		errno = g_register_error;
 		return NULL;
@@ -128,6 +141,16 @@ check_host(void)
 	assert(region == NULL);
 	spdk_nvme_urma_get_memory_stats(&stats);
 	assert(stats.registration_failures == 1);
+
+	/* A provider may fail without setting errno. Ambient ENOENT must not
+	 * turn an Identify registration failure into "No such file". */
+	reset_counters();
+	g_register_without_errno = true;
+	errno = ENOENT;
+	assert(spdk_nvme_urma_register_memory(&ctx, (void *)0x100040, 7000,
+					    SPDK_NVME_URMA_MEM_HOST, &region) == -EIO);
+	assert(region == NULL);
+	g_register_without_errno = false;
 }
 
 static void

@@ -494,6 +494,11 @@ struct nvmf_urma_json_opts {
 	bool numa_affinity;
 };
 
+/* Defined with the qpair drain state machine near the end of this file; used
+ * by accept_reject() when the HELLO_RSP RX-readiness barrier already posted
+ * command receive WRs on a connection that is being torn down. */
+static void nvmf_urma_accept_reject_drain(struct nvmf_urma_qpair *uqpair);
+
 static const struct spdk_json_object_decoder g_urma_opts_decoder[] = {
 	{"dev_name", offsetof(struct nvmf_urma_json_opts, dev_name), spdk_json_decode_string, true},
 	{"trans_mode", offsetof(struct nvmf_urma_json_opts, trans_mode), spdk_json_decode_string, true},
@@ -760,8 +765,30 @@ nvmf_urma_rsp_tx_acquire(struct nvmf_urma_qpair *uqpair)
 	return NULL;
 }
 
+/* Post the per-qpair command receive WRs for URMA capsule mode.
+ *
+ * HELLO_RSP is the readiness barrier: nvmf_urma_handshake_progress() calls
+ * nvmf_urma_handshake_rx_barrier() after handshake_apply() has negotiated
+ * qid/sq_head_max/capsule_transport and (in RC mode) bound the imported remote
+ * jettys, but BEFORE flushing the first HELLO_RSP byte.  The initiator cannot
+ * send its Connect capsule until it has read the complete HELLO_RSP from the
+ * bootstrap TCP socket, so these receive buffers are guaranteed to be posted
+ * by then.  Symmetrically, the initiator posts its response receive WRs in
+ * nvme_urma_capsule_resources_init() before emitting Connect.  Both directions
+ * are therefore ready before the first capsule SEND, which closes the RNR
+ * window (URMA_CR_RNR_RETRY_CNT_EXC_ERR / status 10, doc28 §3) without a wire
+ * version bump, a new READY message, or any change to per-qpair JFR ownership
+ * (share_jfr=1 stays as-is).
+ *
+ * TCP capsule mode carries commands/responses on the bootstrap socket and
+ * needs no receive WRs at all; its data path still uses URMA READ/WRITE on the
+ * jetty/JFS and JFC.  Only the command/response SEND/RECV is bypassed.
+ *
+ * Idempotent: poll_group_add() runs asynchronously and calls
+ * capsule_resources_init() again; a successful barrier post must not be
+ * duplicated because every posted WR owns a lifetime reference. */
 static int
-nvmf_urma_capsule_resources_init(struct nvmf_urma_qpair *uqpair)
+nvmf_urma_capsule_rx_post(struct nvmf_urma_qpair *uqpair, uint32_t count)
 {
 	urma_target_seg_t *tseg;
 	int rc;
@@ -769,30 +796,28 @@ nvmf_urma_capsule_resources_init(struct nvmf_urma_qpair *uqpair)
 	if (uqpair->capsule_transport != SPDK_URMA_CAPSULE_TRANSPORT_URMA) {
 		return 0;
 	}
-	uqpair->capsule_rx_count = uqpair->qpair.sq_head_max + 1;
-	if (uqpair->capsule_rx_count == 0 ||
-	    (uint64_t)uqpair->capsule_rx_count >
-	    (uint64_t)uqpair->jfrs[0]->jfr_cfg.depth * uqpair->jetty_count) {
+	if (uqpair->capsule_rx_slots != NULL) {
+		return 0; /* already posted: every posted WR owns a lifetime ref */
+	}
+	if (count == 0 ||
+	    (uint64_t)count > (uint64_t)uqpair->jfrs[0]->jfr_cfg.depth * uqpair->jetty_count) {
 		return -EINVAL;
 	}
-	uqpair->capsule_rx_slots = calloc(uqpair->capsule_rx_count,
-					  sizeof(*uqpair->capsule_rx_slots));
+	uqpair->capsule_rx_count = count;
+	uqpair->capsule_rx_slots = calloc(count, sizeof(*uqpair->capsule_rx_slots));
 	if (uqpair->capsule_rx_slots == NULL) {
+		uqpair->capsule_rx_count = 0;
 		return -ENOMEM;
 	}
 	rc = spdk_nvme_urma_register_memory(uqpair->device->context,
 			uqpair->capsule_rx_slots,
-			uqpair->capsule_rx_count * sizeof(*uqpair->capsule_rx_slots),
+			count * sizeof(*uqpair->capsule_rx_slots),
 			SPDK_NVME_URMA_MEM_HOST, &uqpair->capsule_rx_region);
 	if (rc != 0) {
 		return rc;
 	}
-	rc = nvmf_urma_rsp_tx_pool_init(uqpair);
-	if (rc != 0) {
-		return rc;
-	}
 	tseg = spdk_urma_memory_region_get_tseg(uqpair->capsule_rx_region);
-	for (uint32_t i = 0; i < uqpair->capsule_rx_count; i++) {
+	for (uint32_t i = 0; i < count; i++) {
 		struct nvmf_urma_cmd_rx_slot *slot = &uqpair->capsule_rx_slots[i];
 
 		slot->cqe.type = NVMF_URMA_CQE_CAPSULE_RX;
@@ -808,7 +833,39 @@ nvmf_urma_capsule_resources_init(struct nvmf_urma_qpair *uqpair)
 			return -EIO;
 		}
 	}
+	SPDK_NOTICELOG("URMA_DIAG role=target stage=rx_posted owner=%p peer=%s service=%s "
+		       "qid=%u recv_count=%u phase=hello_barrier\n", uqpair,
+		       uqpair->peer_addr, uqpair->service, uqpair->qpair.qid,
+		       uqpair->capsule_rx_count);
 	return 0;
+}
+
+/* Hook invoked exactly once by the HELLO state machine, after the endpoint
+ * descriptors have been applied and before any HELLO_RSP byte is written.
+ * The HELLO harness supplies a recorder double for this symbol so the barrier
+ * ordering itself is regression-tested. */
+static int
+nvmf_urma_handshake_rx_barrier(struct nvmf_urma_qpair *uqpair)
+{
+	return nvmf_urma_capsule_rx_post(uqpair, uqpair->qpair.sq_head_max + 1);
+}
+
+static int
+nvmf_urma_capsule_resources_init(struct nvmf_urma_qpair *uqpair)
+{
+	int rc;
+
+	/* Keep the original ordering: allocate/register the TX pool before any
+	 * receive WR is posted, so a partial-init failure cannot leave a posted
+	 * WR naming memory that teardown is about to release. */
+	rc = nvmf_urma_rsp_tx_pool_init(uqpair);
+	if (rc != 0) {
+		return rc;
+	}
+	/* poll_group_add() runs asynchronously after spdk_nvmf_tgt_new_qpair().
+	 * The HELLO_RSP barrier has normally posted these WRs already; this is
+	 * the idempotent fallback using the negotiated queue depth. */
+	return nvmf_urma_capsule_rx_post(uqpair, uqpair->qpair.sq_head_max + 1);
 }
 
 static void
@@ -1022,6 +1079,21 @@ nvmf_urma_handshake_progress(struct nvmf_urma_qpair *uqpair)
 		if (rc != 0) {
 			return rc;
 		}
+		/* Per-qpair RX readiness guarantee for URMA capsule mode.  At this
+		 * point qid/sq_head_max/capsule_transport are negotiated and (RC)
+		 * the imported remote jettys are bound, but not one HELLO_RSP byte
+		 * has been flushed yet.  Post the command receive WRs NOW: the
+		 * initiator cannot send Connect until it has read the complete
+		 * HELLO_RSP, so its first SEND always finds a receive buffer.
+		 * This is the fix for the RNR status=10 window (doc28 §3/§7).
+		 * TCP capsule mode is a no-op inside the helper. */
+		rc = nvmf_urma_handshake_rx_barrier(uqpair);
+		if (rc != 0) {
+			SPDK_ERRLOG("URMA_DIAG role=target stage=rx_ready_failed owner=%p "
+				    "peer=%s qid=%u rc=%d\n", uqpair, uqpair->peer_addr,
+				    uqpair->qpair.qid, rc);
+			return rc;
+		}
 		uqpair->hs_off0 = 0;
 		uqpair->hs_off1 = 0;
 		uqpair->hs_off2 = 0;
@@ -1072,6 +1144,25 @@ nvmf_urma_accept_reject(struct nvmf_urma_qpair *uqpair)
 	free(uqpair->hs_local_data);
 	uqpair->hs_remote_data = NULL;
 	uqpair->hs_local_data = NULL;
+	if (uqpair->hs_poller != NULL) {
+		spdk_poller_unregister(&uqpair->hs_poller);
+	}
+
+	/* The HELLO_RSP barrier may already have posted command receive WRs
+	 * before the handshake failed (short HELLO_RSP write, peer close,
+	 * handshake deadline).  Their flush CRs still carry user_ctx pointing
+	 * into capsule_rx_slots, and those CRs land in the device-wide shared
+	 * recv JFCs.  Freeing the slots inline here would leave a later poll of
+	 * another qpair dereferencing freed memory.  Hand the qpair to the same
+	 * drain state machine used by qpair_fini; no framework qpair exists yet,
+	 * so the fini callback stays NULL. */
+	if (uqpair->capsule_rx_slots != NULL) {
+		SPDK_NOTICELOG("URMA_DIAG role=target stage=reject_drain owner=%p peer=%s "
+			       "qid=%u recv_count=%u\n", uqpair, uqpair->peer_addr,
+			       uqpair->qpair.qid, uqpair->capsule_rx_count);
+		nvmf_urma_accept_reject_drain(uqpair);
+		return;
+	}
 
 	for (i = 0; i < uqpair->jetty_count; i++) {
 		if (uqpair->target_jettys != NULL && uqpair->target_jettys[i] != NULL) {
@@ -1094,9 +1185,6 @@ nvmf_urma_accept_reject(struct nvmf_urma_qpair *uqpair)
 	}
 	free(uqpair->jfrs);
 	nvmf_urma_capsule_resources_fini(uqpair);
-	if (uqpair->hs_poller != NULL) {
-		spdk_poller_unregister(&uqpair->hs_poller);
-	}
 	spdk_urma_device_close(uqpair->device);
 	close(uqpair->fd);
 	free(uqpair);
@@ -1237,6 +1325,13 @@ nvmf_urma_accept(void *arg)
 				nvmf_urma_accept_reject(uqpair);
 				continue;
 			}
+			/* Command receive WRs are posted by the HELLO_RSP barrier
+			 * inside handshake_progress(), after the queue depth and
+			 * capsule transport are negotiated and (RC) the remote
+			 * jettys are bound.  Do not post them here: at this point
+			 * qid/sq_head_max/capsule_transport are still zero and RC
+			 * jettys are not bound yet, so a pre-post would use the
+			 * wrong depth and could be rejected by the provider. */
 			/* SE_Review #3: 非阻塞增量握手 + 期限。先原地推进一次，没推完
 			 * 就交给周期 poller；只连接不发 HELLO 的对端再也卡不住本线程。 */
 			uqpair->hs_deadline_tsc = spdk_get_ticks() +
@@ -1829,11 +1924,18 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 		memcpy(msg + sizeof(hdr), &rsp, sizeof(rsp));
 		rc = nvmf_urma_write_full(uqpair->fd, msg, sizeof(msg));
 	}
-	if (ureq->cmd.nvme_cmd.opc == SPDK_NVME_OPC_FABRIC) {
+	/* Review doc32: rc=0 on a TCP write proves only that bytes entered the
+	 * socket, not that master received/parsed/matched the response.  Log the
+	 * full send-side correlation for Admin requests too; the initiator now
+	 * logs the receiving/matching half. */
+	if (SPDK_URMA_DIAG_ADMIN(uqpair->qpair.qid, ureq->cmd.nvme_cmd.opc,
+				 ureq->stage_trace.flags)) {
 		SPDK_NOTICELOG("URMA_DIAG role=target stage=response_post owner=%p peer=%s service=%s "
-			       "qid=%u cid=%u rc=%d sct=%u sc=%u tx_mode=%s\n", uqpair, uqpair->peer_addr,
-			       uqpair->service, uqpair->qpair.qid, rsp.cpl.cid, rc,
-			       rsp.cpl.status.sct, rsp.cpl.status.sc,
+			       "qid=%u cid=%u opcode=%u fctype=%u rc=%d sct=%u sc=%u tx_mode=%s\n",
+			       uqpair, uqpair->peer_addr, uqpair->service, uqpair->qpair.qid,
+			       rsp.cpl.cid, ureq->cmd.nvme_cmd.opc,
+			       SPDK_URMA_DIAG_FCTYPE(ureq->cmd.nvme_cmd.opc, &ureq->cmd.nvme_cmd),
+			       rc, rsp.cpl.status.sct, rsp.cpl.status.sc,
 			       uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_TCP ? "tcp" :
 			       (uqpair->capsule_tx_region != NULL ? "registered" : "inline"));
 	}
@@ -2087,6 +2189,23 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 		if (ureq->stage_trace.flags & SPDK_URMA_STAGE_TRACE_REQUESTED) {
 			ureq->stage_trace.data_post_tick = t_post1;
 		}
+		/* Review priority 2: success-path data WR correlation.  The
+		 * failure branches above already log; without this line a
+		 * dropped completion is indistinguishable from a WR that was
+		 * never posted. */
+		if (SPDK_URMA_DIAG_ADMIN(uqpair->qpair.qid, ureq->cmd.nvme_cmd.opc,
+					 ureq->stage_trace.flags)) {
+			SPDK_NOTICELOG("URMA_DIAG role=target stage=data_posted owner=%p qid=%u "
+				       "cid=%u opcode=%u fctype=%u push=%d wr_opcode=%s "
+				       "jetty_index=%u len=%u trace_seq=%" PRIu64 "\n",
+				       uqpair, uqpair->qpair.qid, ureq->cmd.nvme_cmd.cid,
+				       ureq->cmd.nvme_cmd.opc,
+				       SPDK_URMA_DIAG_FCTYPE(ureq->cmd.nvme_cmd.opc,
+							     &ureq->cmd.nvme_cmd),
+				       push, push ? "WRITE(C2H)" : "READ(H2C)", jetty_index,
+				       (unsigned)local_sge.len,
+				       (uint64_t)ureq->stage_trace.trace_seq);
+		}
 		return 0;
 	}
 }
@@ -2149,11 +2268,19 @@ nvmf_urma_handle_capsule(struct nvmf_urma_qpair *uqpair,
 	if (capsule->data.length > uqpair->max_io_size || hdr->qid != uqpair->qpair.qid) {
 		return capsule->data.length > uqpair->max_io_size ? -EMSGSIZE : -EPROTO;
 	}
-	if (capsule->cmd.opc == SPDK_NVME_OPC_FABRIC) {
+	/* Review doc28 §2.1: the old DIAG only fired for opcode == FABRIC, so
+	 * Identify and other Admin commands were invisible.  Log every Admin
+	 * request (plus explicitly traced I/O) with the fields needed to join
+	 * target cmd → data WR → response → initiator match. */
+	if (SPDK_URMA_DIAG_ADMIN(hdr->qid, capsule->cmd.opc, capsule->trace_flags)) {
 		SPDK_NOTICELOG("URMA_DIAG role=target stage=cmd_received owner=%p peer=%s service=%s "
-			       "qid=%u cid=%u opcode=%u data_len=%u\n", uqpair, uqpair->peer_addr,
+			       "qid=%u cid=%u opcode=%u fctype=%u data_len=%u capsule_mode=%s "
+			       "trace_seq=%" PRIu64 "\n", uqpair, uqpair->peer_addr,
 			       uqpair->service, hdr->qid, capsule->cmd.cid, capsule->cmd.opc,
-			       capsule->data.length);
+			       SPDK_URMA_DIAG_FCTYPE(capsule->cmd.opc, &capsule->cmd),
+			       capsule->data.length,
+			       uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA ?
+			       "urma" : "tcp", capsule->trace_seq);
 	}
 	ureq = TAILQ_FIRST(&uqpair->free_reqs);
 	if (ureq == NULL) {
@@ -2453,6 +2580,20 @@ nvmf_urma_handle_completion_inner(const urma_cr_t *completion)
 			nvmf_urma_release_req(ureq);
 		}
 		return 1;
+	}
+	/* Review priority 2: data completion is the missing half of data_posted.
+	 * A post without a completion (or vice versa) localizes the loss to the
+	 * data WR / JFC path rather than to the capsule SEND/RECV path. */
+	if (SPDK_URMA_DIAG_ADMIN(uqpair->qpair.qid, ureq->cmd.nvme_cmd.opc,
+				 ureq->stage_trace.flags)) {
+		SPDK_NOTICELOG("URMA_DIAG role=target stage=data_completed owner=%p qid=%u "
+			       "cid=%u opcode=%u fctype=%u cr_status=%d s_r=%u state=%d "
+			       "trace_seq=%" PRIu64 "\n", uqpair, uqpair->qpair.qid,
+			       ureq->cmd.nvme_cmd.cid, ureq->cmd.nvme_cmd.opc,
+			       SPDK_URMA_DIAG_FCTYPE(ureq->cmd.nvme_cmd.opc,
+						     &ureq->cmd.nvme_cmd),
+			       completion->status, (unsigned)completion->flag.bs.s_r,
+			       ureq->state, (uint64_t)ureq->stage_trace.trace_seq);
 	}
 	if (ureq->state == NVMF_URMA_REQ_PULLING) {
 		/* Modified By Yida(v3): W8 — WR posted -> JFC completion
@@ -3039,6 +3180,18 @@ nvmf_urma_qpair_fini(struct spdk_nvmf_qpair *qpair,
 	}
 	uqpair->drain_poller = SPDK_POLLER_REGISTER(nvmf_urma_drain_poll, uqpair,
 			       NVMF_URMA_DRAIN_POLL_US);
+}
+
+/* A rejected handshake that already passed the HELLO_RSP RX-readiness barrier
+ * has posted command receive WRs whose flush CRs live in the device-wide shared
+ * recv JFCs.  Reuse qpair_fini()'s drain state machine so teardown waits for
+ * those CRs.  No framework qpair exists yet, so the fini callback is NULL;
+ * drain_finish() guards it, and the qpair state is still UNINITIALIZED so a
+ * flush CR cannot trigger a spurious spdk_nvmf_qpair_disconnect(). */
+static void
+nvmf_urma_accept_reject_drain(struct nvmf_urma_qpair *uqpair)
+{
+	nvmf_urma_qpair_fini(&uqpair->qpair, NULL, NULL);
 }
 
 static int

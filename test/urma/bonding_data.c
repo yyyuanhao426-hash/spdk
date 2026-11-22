@@ -36,7 +36,9 @@ spdk_log(enum spdk_log_level l, const char *f, const int n, const char *fn, cons
 	va_list args;
 	size_t used = strlen(diagnostics);
 	va_start(args, fmt);
-	vsnprintf(diagnostics + used, sizeof(diagnostics) - used, fmt, args);
+	if (used + 1 < sizeof(diagnostics)) {
+		vsnprintf(diagnostics + used, sizeof(diagnostics) - used, fmt, args);
+	}
 	va_end(args);
 }
 uint64_t

@@ -706,16 +706,23 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 		cfg.va = (uint64_t)base;
 		cfg.len = SPDK_ALIGN_CEIL(((uintptr_t)addr - base) + length,
 					  (size_t)4096);
+		/* Do not attribute a provider failure without errno to a previous
+		 * syscall (for example ENOENT from device discovery). */
+		errno = 0;
 		region->target_seg = urma_register_seg(urma_context, &cfg);
 		if (region->target_seg != NULL && type != SPDK_NVME_URMA_MEM_HOST) {
 			SPDK_URMA_STAT_INC(peer_memory_registrations);
 		}
 	}
 	if (region->target_seg == NULL) {
-		rc = -errno;
-		if (rc == 0) {
-			rc = -EIO;
-		}
+		int saved_errno = errno;
+
+		rc = saved_errno != 0 ? -saved_errno : -EIO;
+		SPDK_ERRLOG("URMA_DIAG role=memory stage=register_failed context=%p "
+			    "addr=%p length=%zu grant_addr=0x%" PRIx64 " grant_length=%" PRIu64
+			    " mem_type=%d provider_errno=%d rc=%d\n",
+			    urma_context, addr, length, (uint64_t)cfg.va, (uint64_t)cfg.len,
+			    type, saved_errno, rc);
 		goto fail_pin;
 	}
 #ifdef SPDK_CONFIG_URMA_SEG_CTX

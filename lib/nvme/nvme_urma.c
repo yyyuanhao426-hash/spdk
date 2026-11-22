@@ -965,6 +965,7 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 	struct spdk_urma_msg_hdr hdr = {};
 	struct spdk_urma_capsule_cmd capsule;
 	void *addr = NULL;
+	const char *submit_stage = "capsule_send";
 	int rc;
 
 	memset(&capsule, 0, SPDK_URMA_CMD_BASE_SIZE);
@@ -1024,12 +1025,11 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 				entry->refcount++;
 				__atomic_add_fetch(&g_timing.cache_hit_count, 1, __ATOMIC_RELAXED);
 			} else {
+				submit_stage = "memory_register";
 				rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr,
 						req->payload.size, nvme_urma_req_memory_type(req), &ureq->region);
 				if (rc != 0) {
-					nvme_urma_cid_free(uqpair, req->cmd.cid);
-					free(ureq);
-					return rc;
+					goto send_error;
 				}
 				ureq->cache_entry = nvme_urma_reg_cache_insert(uqpair, addr,
 						req->payload.size, ureq->region);
@@ -1044,6 +1044,7 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		if (strncmp(uqpair->device->dev_name, "bonding", 7) == 0) {
 			size_t length = sizeof(capsule.seg_ctx);
 
+			submit_stage = "segment_context";
 			rc = spdk_nvme_urma_memory_region_export(ureq->region, capsule.seg_ctx,
 								 &length);
 			if (rc != 0 || length <= sizeof(urma_seg_t)) {
@@ -1060,6 +1061,7 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		capsule.data.chip_id = uqpair->device->opts.numa_affinity ?
 					spdk_urma_memory_chip_id(addr) : SPDK_URMA_INVALID_CHIP_ID;
 	}
+	submit_stage = "capsule_send";
 	hdr.magic = SPDK_URMA_WIRE_MAGIC;
 	hdr.version = SPDK_URMA_WIRE_VERSION;
 	hdr.type = SPDK_URMA_MSG_CAPSULE_CMD;
@@ -1105,6 +1107,29 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		}
 	}
 send_error:
+	/* Registration can fail before a capsule exists on the wire. Keep the
+	 * first error visible even in embedded users whose SPDK level is ERROR. */
+	if (rc != 0) {
+		SPDK_ERRLOG("URMA_DIAG role=initiator stage=%s owner=%p endpoint=%s:%s "
+			    "device=%s qid=%u cid=%u opcode=%u fctype=%u data_len=%u "
+			    "addr=%p rc=%d capsule_mode=%s\n", submit_stage, uqpair,
+			    qpair->ctrlr->trid.traddr, qpair->ctrlr->trid.trsvcid,
+			    uqpair->device->dev_name, qpair->id, req->cmd.cid, req->cmd.opc,
+			    SPDK_URMA_DIAG_FCTYPE(req->cmd.opc, &req->cmd), req->payload.size,
+			    addr, rc, spdk_urma_capsule_transport_name(uqpair->capsule_transport));
+	}
+	/* Review priority 2: submit-side correlation, including the return code.
+	 * Without this line a missing cmd_received cannot be attributed to a
+	 * local submit/post failure vs. a lost capsule on the wire. */
+	if (SPDK_URMA_DIAG_ADMIN(qpair->id, req->cmd.opc, ureq->trace_seq != 0 ?
+				 SPDK_URMA_STAGE_TRACE_REQUESTED : 0)) {
+		SPDK_NOTICELOG("URMA_DIAG role=initiator stage=cmd_submitted owner=%p qid=%u "
+			       "cid=%u opcode=%u fctype=%u rc=%d capsule_mode=%s data_len=%u\n",
+			       uqpair, qpair->id, req->cmd.cid, req->cmd.opc,
+			       SPDK_URMA_DIAG_FCTYPE(req->cmd.opc, &req->cmd), rc,
+			       uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA ?
+			       "urma" : "tcp", req->payload.size);
+	}
 	if (rc != 0) {
 		/* Modified By Yida: on send failure, release cache refcount if cached.
 		 * Modified By Yida(v7): 整池采纳的 region_external 不 unregister。 */
@@ -1144,6 +1169,16 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 	}
 	TAILQ_REMOVE(&uqpair->outstanding, ureq, link);
 	qpair->queue_depth--;
+	/* Review priority 2: positive CID-match evidence.  target response_post
+	 * rc=0 only proves the bytes left the target; this line proves master
+	 * received, parsed and matched them to the outstanding request. */
+	if (SPDK_URMA_DIAG_ADMIN(rsp->cpl.sqid, ureq->req->cmd.opc, rsp->stage.flags)) {
+		SPDK_NOTICELOG("URMA_DIAG role=initiator stage=rsp_matched owner=%p qid=%u "
+			       "cid=%u opcode=%u fctype=%u sct=%u sc=%u\n", uqpair,
+			       rsp->cpl.sqid, rsp->cpl.cid, ureq->req->cmd.opc,
+			       SPDK_URMA_DIAG_FCTYPE(ureq->req->cmd.opc, &ureq->req->cmd),
+			       rsp->cpl.status.sct, rsp->cpl.status.sc);
+	}
 	nvme_urma_cid_free(uqpair, ureq->req->cmd.cid);
 	t_rel0 = spdk_get_ticks();
 	if (ureq->cache_entry != NULL) {
@@ -1437,6 +1472,16 @@ nvme_urma_process_capsule_cr_inner(struct nvme_urma_qpair *poller, const urma_cr
 		__atomic_add_fetch(&g_timing.compl_ticks, spdk_get_ticks() - t_compl0,
 				   __ATOMIC_RELAXED);
 		__atomic_add_fetch(&g_timing.compl_count, 1, __ATOMIC_RELAXED);
+		/* Review priority 2: master-side response arrival.  Together with
+		 * rsp_matched this separates "never arrived" from "arrived but
+		 * no CID match". */
+		if (SPDK_URMA_DIAG_ADMIN(frame.hdr.qid, 0, frame.capsule.stage.flags)) {
+			SPDK_NOTICELOG("URMA_DIAG role=initiator stage=rsp_received owner=%p "
+				       "poller=%p qid=%u cid=%u sct=%u sc=%u cr_status=%d\n",
+				       owner, poller, frame.hdr.qid, frame.capsule.cpl.cid,
+				       frame.capsule.cpl.status.sct,
+				       frame.capsule.cpl.status.sc, cr->status);
+		}
 		if (owner != poller) {
 			rc = nvme_urma_queue_response(owner, &frame.capsule);
 			if (rc < 0) {

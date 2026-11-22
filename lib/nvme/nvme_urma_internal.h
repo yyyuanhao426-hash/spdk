@@ -31,6 +31,22 @@
 #define SPDK_URMA_MAX_JETTY_PER_EP 32
 #define SPDK_URMA_INVALID_CHIP_ID UINT8_MAX
 
+/* End-to-end correlation for Admin requests (Identify, Get/Set Features,
+ * Fabrics Connect/Property Get/Set, ...).  Admin/Fabrics commands are rare and
+ * must always be diagnosable; I/O commands are only logged when the initiator
+ * explicitly requested a stage trace, so this does not add a per-I/O log flood.
+ * Keeping the gate in one place makes target and initiator log the same set of
+ * commands, which is what makes a mount failure correlatable across both logs. */
+#define SPDK_URMA_DIAG_ADMIN(qid, opc, trace_flags) \
+	((qid) == 0 || (opc) == SPDK_NVME_OPC_FABRIC || \
+	 ((trace_flags) & SPDK_URMA_STAGE_TRACE_REQUESTED) != 0)
+
+/* fctype lives in the Fabrics command layout; for Admin opcodes it is not
+ * meaningful, so report 0 rather than misread cdw0 bits. */
+#define SPDK_URMA_DIAG_FCTYPE(opc, cmd) \
+	((opc) == SPDK_NVME_OPC_FABRIC ? \
+	 ((const struct spdk_nvmf_capsule_cmd *)(cmd))->fctype : 0)
+
 enum spdk_urma_capsule_transport {
 	SPDK_URMA_CAPSULE_TRANSPORT_TCP = 0,
 	SPDK_URMA_CAPSULE_TRANSPORT_URMA = 1,

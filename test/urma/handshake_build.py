@@ -170,7 +170,8 @@ def main():
                     "nvmf_urma_write_full", "nvmf_urma_rsp_tx_pool_init",
                     "nvmf_urma_rsp_tx_acquire", "nvmf_urma_send_response",
                     "nvmf_urma_retry_responses", "nvmf_urma_qpair_drained",
-                    "nvmf_urma_capsule_resources_init", "nvmf_urma_capsule_resources_fini"))
+                    "nvmf_urma_capsule_rx_post", "nvmf_urma_capsule_resources_init",
+                    "nvmf_urma_capsule_resources_fini"))
                 send_functions = "".join(extract_function(source, name) for name in (
                     "nvme_urma_next_jetty", "nvme_urma_tx_pool_init", "nvme_urma_send_cmd_capsule",
                     "nvme_urma_cr_owner_qpair", "nvme_urma_qpair_defer_error",

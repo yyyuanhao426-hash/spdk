@@ -16,6 +16,7 @@ struct nvmf_urma_transport {
 };
 struct nvmf_urma_qpair {
 	struct spdk_urma_device *device;
+	char peer_addr[64], service[16];
 	struct spdk_urma_msg_hdr hs_hdr;
 	struct spdk_urma_endpoint_desc hs_remote;
 	struct {
@@ -52,6 +53,8 @@ static bool bonding;
 static urma_transport_mode_t mode;
 static int exports, releases, imports, binds, fail_export = -1;
 static unsigned export_length;
+static unsigned rx_barrier_calls, rx_barrier_last_depth;
+static int rx_barrier_rc;
 static urma_target_jetty_t imported[64];
 /* Provider descriptors are opaque to the exporter. A sentinel tp_type that
  * differs from the device's configured mode lets the tests detect a write
@@ -126,6 +129,23 @@ urma_bind_jetty(urma_jetty_t *j, urma_target_jetty_t *t)
 	return URMA_SUCCESS;
 }
 
+/* Recorder double for the real target hook, which posts the per-qpair command
+ * receive WRs.  The real implementation lives in lib/nvmf/urma.c and is not
+ * extracted here.  Assertions below prove the barrier ordering: it must run
+ * after handshake_apply() (HELLO_RSP already built, depth negotiated) and
+ * before the SEND_RSP state flushes any HELLO_RSP byte. */
+static int
+nvmf_urma_handshake_rx_barrier(struct nvmf_urma_qpair *uqpair)
+{
+	rx_barrier_calls++;
+	assert(uqpair->hs_state == NVMF_URMA_HS_RECV_HELLO);
+	assert(uqpair->hs_rsp.hdr.type == SPDK_URMA_MSG_HELLO_RSP);
+	assert(uqpair->capsule_transport == SPDK_URMA_CAPSULE_TRANSPORT_URMA);
+	rx_barrier_last_depth = uqpair->qpair.sq_head_max + 1;
+	assert(rx_barrier_last_depth >= 2);
+	return rx_barrier_rc;
+}
+
 /* REAL_FUNCTIONS */
 
 struct endpoint {
@@ -178,6 +198,9 @@ counters_reset(void)
 	export_length = 0;
 	provider_tp_type = URMA_CTP;
 	provider_descriptor_mutated = false;
+	rx_barrier_calls = 0;
+	rx_barrier_last_depth = 0;
+	rx_barrier_rc = 0;
 }
 static void
 roundtrip(bool bond, urma_transport_mode_t m, unsigned count)
@@ -211,6 +234,10 @@ roundtrip(bool bond, urma_transport_mode_t m, unsigned count)
 		} while (rc == -EAGAIN);
 		assert(rc == 0 && imports == (int)count && exports == releases);
 		assert(binds == (mode == URMA_TM_RC ? (int)count : 0));
+		/* HELLO_RSP is the per-qpair RX-ready barrier: exactly one post,
+		 * after negotiation and before any HELLO_RSP byte is written. */
+		assert(rx_barrier_calls == 1);
+		assert(rx_barrier_last_depth >= 2 && rx_barrier_last_depth <= 32);
 		free(q.hs_local_data);
 		free(q.hs_remote_data);
 		close(fds[1]);
@@ -311,6 +338,78 @@ provider_buffer_immutable(void)
 	free(data);
 	counters_reset();
 }
+/* A failed RX-readiness barrier must abort the handshake before HELLO_RSP is
+ * flushed.  Otherwise the initiator would still see HELLO_RSP and send Connect
+ * into an empty JFR, reproducing the RNR status=10 failure. */
+static void
+rx_barrier_failure(void)
+{
+	bonding = true;
+	mode = URMA_TM_RM;
+	counters_reset();
+	export_length = 4096;
+	struct endpoint a, b;
+	endpoint_init(&a, 1, 2);
+	endpoint_init(&b, 2, 2);
+	struct spdk_urma_endpoint_desc d = {.eid = a.d.eid,
+					    .jetty_count = 2,
+					    .transport_mode = mode,
+					    .tp_type = URMA_CTP,
+					    .max_queue_depth = 32,
+					    .max_io_size = 8388608,
+					    .capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_URMA};
+	for (unsigned i = 0; i < 2; i++)
+		d.jetty_ids[i] = a.js[i].jetty_id.id;
+	uint8_t *data;
+	assert(spdk_urma_export_rjettys(&a.d, a.jp, &d, &data) == 0);
+	size_t size = d.rjetty_lengths[0] + d.rjetty_lengths[1];
+	struct spdk_urma_msg_hdr h = {.magic = SPDK_URMA_WIRE_MAGIC,
+				      .version = SPDK_URMA_WIRE_VERSION,
+				      .type = SPDK_URMA_MSG_HELLO,
+				      .length = sizeof(d) + size};
+	size_t n = sizeof(h) + h.length;
+	uint8_t *frame = malloc(n);
+	memcpy(frame, &h, sizeof(h));
+	memcpy(frame + sizeof(h), &d, sizeof(d));
+	memcpy(frame + sizeof(h) + sizeof(d), data, size);
+	free(data);
+	int fd[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+	assert(fcntl(fd[1], F_SETFL, O_NONBLOCK) == 0);
+	struct nvmf_urma_qpair q;
+	struct nvmf_urma_transport t;
+	target_init(&q, &b, &t, 2, fd[1]);
+	rx_barrier_rc = -EIO;
+	/* Feed the HELLO one byte at a time so hs_fill() never short-reads the
+	 * whole frame in a single call, independent of the socket buffer size. */
+	for (size_t i = 0; i < n; i++) {
+		assert(send(fd[0], frame + i, 1, 0) == 1);
+		int rc = nvmf_urma_handshake_progress(&q);
+
+		if (i + 1 < n) {
+			assert(rc == -EAGAIN);
+			assert(imports == 0 && rx_barrier_calls == 0);
+		} else {
+			assert(rc == -EIO);
+		}
+	}
+	free(frame);
+	assert(rx_barrier_calls == 1);
+	assert(q.hs_state == NVMF_URMA_HS_RECV_HELLO);
+	/* The RECV_HELLO offsets have not yet been reset for SEND_RSP, proving
+	 * that the barrier runs before the state machine emits HELLO_RSP. */
+	assert(q.hs_off0 == sizeof(struct spdk_urma_msg_hdr));
+	assert(fcntl(fd[0], F_SETFL, O_NONBLOCK) == 0);
+	char byte;
+	assert(recv(fd[0], &byte, 1, 0) == -1 && errno == EAGAIN);
+	rx_barrier_rc = 0;
+	free(q.hs_remote_data);
+	free(q.hs_local_data);
+	close(fd[0]);
+	close(fd[1]);
+	counters_reset();
+}
+
 static void
 fragmented(void)
 {
@@ -412,9 +511,11 @@ main(void)
 	}
 	validation();
 	provider_buffer_immutable();
+	rx_barrier_failure();
 	fragmented();
 	puts("PASS complete provider bytes, both real HELLO paths, multi-jetty RM/RC, fragmented "
-	     "TCP, invalid frames, provider buffer immutability and cleanup");
+	     "TCP, invalid frames, RX-ready barrier ordering/abort, provider buffer immutability "
+	     "and cleanup");
 #else
 	roundtrip(false, URMA_TM_RM, 1);
 	bonding = true;

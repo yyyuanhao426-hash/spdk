@@ -132,7 +132,7 @@ SPDK 使用以下环境变量。目前只有一个 Mooncake 变量名作为低�
 | `SPDK_URMA_NUM_JETTY_PER_EP` | 无 | `1`；`SPDK_URMA_JETTY_COUNT` 为兼容别名 |
 | `SPDK_URMA_JETTY_DEPTH` | 无 | `2048` |
 | `SPDK_URMA_MAX_IO_SIZE` | 无 | `131072` |
-| `SPDK_URMA_CAPSULE_TRANSPORT` | 无 | `tcp`；可设为 `sendrecv` |
+| `SPDK_URMA_CAPSULE_TRANSPORT` | 无 | `tcp`；可设为 `urma`（代码只接受 `tcp` / `urma`，旧文档写的 `sendrecv` 不是合法值） |
 | `SPDK_URMA_TP_TYPE` | 无 | `ctp`；可设为 `rtp` |
 | `SPDK_URMA_JETTY_PRIORITY` | 无 | 自动从 `priority_info` 选择；显式值范围 `0..15` 且必须匹配 TP type |
 | `SPDK_URMA_NUMA_AFFINITY_ENABLE` | 无 | `false` |
@@ -143,13 +143,40 @@ SPDK 使用以下环境变量。目前只有一个 Mooncake 变量名作为低�
 - SPDK 的 `electrical_network` 默认 `false`（光互联），Mooncake TE 的 `ub_electrical_network` 默认 `true`（电互联）。`numa_affinity` 打开时，前者 WR 选路为 `{local,remote}`、后者为 `{remote,remote}`；两端应显式配置，不要依赖默认值一致。
 - SPDK 只在 `bonding_balance || bonding_multipath` 时下发 `SET_BONDING_MODE` 且 mode 恒 `BALANCE`；Mooncake TE 对 bonding 设备无条件下发（含 `STANDALONE/PORT`）。裸设备缺省模式下发是有意规避 jetty UAF，属有意分歧。
 
-NVMf target 的 transport-specific JSON 还可覆盖 `dev_name`、`trans_mode`、`capsule_transport`、`active_port`、`eid_index`、`send_jfc_count`、`recv_jfc_count`、`jfc_depth`、`num_jetty_per_ep`、`jetty_depth`、`priority`、`tp_type`、`bonding_balance`、`bonding_multipath` 和 `numa_affinity`。`capsule_transport` 接受 `tcp` 或 `sendrecv`，`tp_type` 接受 `ctp` 或 `rtp`。initiator 与 target 必须配置成相同 capsule、transport、TP type 和 endpoint Jetty 数；握手发现不一致时会拒绝连接。
+NVMf target 的 transport-specific JSON 还可覆盖 `dev_name`、`trans_mode`、`capsule_transport`、`active_port`、`eid_index`、`send_jfc_count`、`recv_jfc_count`、`jfc_depth`、`num_jetty_per_ep`、`jetty_depth`、`priority`、`tp_type`、`bonding_balance`、`bonding_multipath` 和 `numa_affinity`。`capsule_transport` 接受 `tcp` 或 `urma`（`spdk_urma_parse_capsule_transport()` 只认这两个值，`sendrecv` 会被拒为 `-EINVAL`），`tp_type` 接受 `ctp` 或 `rtp`。initiator 与 target 必须配置成相同 capsule、transport、TP type 和 endpoint Jetty 数；握手发现不一致时会拒绝连接。
 
 同一进程内每块本地 NIC 只创建一个 URMA context。该 context 的 JFC/JFR、内存域和 target iobuf 整池注册由所有 endpoint/qpair 共享；target 的远端 segment import cache 是 context 级分桶哈希表，并以 `URMA_NON_CACHEABLE` 导入。`bonding_balance`（bonding 设备）或 `bonding_multipath` 任一开启时，initiator/target 创建的 JFS 均开启 `multi_path=1`；`SPDK_URMA_BONDING_MULTIPATH_ENABLE=1` 另将设备 bonding level 切到 IODIE，BALANCE+PORT 则保持 PORT。再启用 `numa_affinity` 时，数据 WR 根据 initiator buffer 的 NUMA 节点携带 chip affinity。NUMA 到 chip 的映射优先读取 sysfs `physical_package_id` 并按 package 排序生成 1-based chip ID，受限环境无法读取时才回退到节点前后半区启发式。
 
-`tcp` 保持原有 capsule 数据路径，也是默认值。`sendrecv` 只把 command/response capsule 切换到 URMA SEND/RECV：建连握手仍走 TCP，I/O payload 仍走 URMA READ/WRITE。SEND 使用 inline WQE；设备的 `max_jfs_inline_len` 不足以容纳 capsule frame 时，qpair 创建会失败。接收端按协商后的队列深度预投递 receive WR，并在消费 completion 后先补回 receive WR 再交付 NVMe completion。
+`tcp` 保持原有 capsule 数据路径，也是默认值。`urma` 只把 **命令/响应 capsule 的 SEND/RECV** 切到 URMA：建连握手仍走 TCP bootstrap socket，I/O payload **仍走 URMA READ/WRITE**，继续使用 jetty/JFS 和 JFC。因此「TCP capsule 完全绕开 JFR/JFC」的说法不准确——绕开的只是命令/响应方向的 URMA SEND/RECV，数据搬运和它的完成队列并未绕开（`lib/nvmf/urma.c` 的 `nvmf_urma_post_data()`）。SEND 使用 inline WQE（bonding 设备改用注册 TX 池槽位，其生命周期延伸到 SEND completion）；设备的 `max_jfs_inline_len` 不足以容纳 capsule frame 时，qpair 创建会失败。接收端按协商后的队列深度预投递 receive WR，并在消费 completion 后先补回 receive WR 再交付 NVMe completion。
 
-握手描述符现在逐 jetty 携带 `urma_get_rjetty()` 返回的完整 provider context，command capsule 另带完整 `urma_get_seg_ctx()` context，因此 wire version 为 **6**（v4/v5/v6 不可混用，两端须同步重编）；新旧版本会在握手阶段明确拒绝，而不会继续使用不一致的帧布局。
+#### HELLO_RSP 即 per-qpair 双向 RX 就绪门（wire v6，2026-11-21）
+
+现场 `status=10` = `URMA_CR_RNR_RETRY_CNT_EXC_ERR`（远端 JFR 无 receive buffer）的根因是顺序缺口：target 原先先发完 HELLO_RSP，随后才由 `spdk_nvmf_tgt_new_qpair()` 异步派发 `poll_group_add()` → `capsule_resources_init()` 投递 receive WR。initiator 一看到 HELLO_RSP 就可能发 Connect，此时 target 的 JFR 还是空的。
+
+现在 target 在 `handshake_apply()` **成功之后、写出第一个 HELLO_RSP 字节之前**调用 `nvmf_urma_handshake_rx_barrier()` 投递本 qpair 的命令 receive WR。因为 initiator 必须读完完整 HELLO_RSP 才发 Connect，两个方向由此得到严格保证：
+
+| 方向 | 就绪点 | 保证 |
+|---|---|---|
+| initiator → target（Connect/cmd capsule） | target 在 HELLO_RSP 之前投递命令 receive WR | initiator 读到 HELLO_RSP 时 WR 已就位 |
+| target → initiator（response capsule） | initiator 在 `exchange_hello()` 之后、`connect_async()` 之前由 `nvme_urma_capsule_resources_init()` 投递响应 receive WR | target 收到第一条命令时 WR 已就位 |
+
+`capsule_resources_init()` 对同一 qpair 幂等（已投递则直接返回），所以异步的 `poll_group_add()` 不会重复投递 WR、也不会重复持有 lifetime 引用。若 HELLO_RSP 写出中途失败，握手拒绝路径走 `qpair_fini()` 的排空状态机，等 flush CR 落完再释放 slot，避免复用已释放内存。
+
+该修复**不 bump wire version**（仍是 6），不新增 READY 消息，不改 `share_jfr=1`：每个 qpair 仍持有自己创建、交给 jetty 使用的 JFR，`share_jfr=1` 只表示使用外部创建的 JFR，不能推断成「所有 qpair 共用一个接收队列」。TCP capsule 模式在该 helper 内是 no-op，其数据路径仍经 URMA READ/WRITE + JFC。回归见 `test/urma/jetty_handshake.c` 的 `roundtrip()` 与 `rx_barrier_failure()`：断言 barrier 恰好调用一次、发生在 RECV_HELLO 状态且 HELLO_RSP 尚未写出，并断言 barrier 失败时握手在发出任何响应字节之前中止。
+
+#### Admin 请求端到端关联诊断
+
+`cmd_received` / `response_post` 原先只在 `opcode == SPDK_NVME_OPC_FABRIC` 时打印，Identify 等 Admin 命令是盲区。现在由 `SPDK_URMA_DIAG_ADMIN()` 统一门控（Admin qid、`0x7f` Fabrics、或显式开启 stage trace 的 I/O），避免每条 I/O 都刷 NOTICE。同一条请求可在两端按 `qid/cid/opcode/fctype/trace_seq` 串起来：
+
+```
+initiator cmd_submitted(rc) → target cmd_received → target data_posted(READ/WRITE)
+→ target data_completed → target response_post(rc,sct,sc)
+→ initiator rsp_received → initiator rsp_matched
+```
+
+注意 `response_post rc=0` 只证明字节写入了 socket（或 SEND WR 提交成功），**不证明 master 收到、解析并匹配**；接收与匹配分别由 `rsp_received` / `rsp_matched` 提供正向证据，`nvme_urma_complete_response()` 里「no matching ureq for cid」仍是匹配失败的负向证据。
+
+握手描述符现在逐 jetty 携带 `urma_get_rjetty()` 返回的完整 provider context，command capsule 另带完整 `urma_get_seg_ctx()` context，因此 wire version 为 **6**（v4/v5/v6 不可混用，两端须同步重编）；新旧版本会在握手阶段明确拒绝，而不会继续使用不一致的帧布局。上述 RX 就绪门只改变 HELLO_RSP 与 receive WR 投递的相对顺序，不改变任何线上字节，因此**不需要** bump 到 v7。
 
 ### 最小联调示例
 
@@ -164,8 +191,8 @@ scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 \
 启用 URMA SEND/RECV capsule 时，target 与 initiator 分别配置：
 
 ~~~bash
-scripts/rpc.py nvmf_create_transport -t URMA --capsule-transport sendrecv
-export SPDK_URMA_CAPSULE_TRANSPORT=sendrecv
+scripts/rpc.py nvmf_create_transport -t URMA --capsule-transport urma
+export SPDK_URMA_CAPSULE_TRANSPORT=urma
 ~~~
 
 initiator 测试侧：
@@ -633,6 +660,30 @@ SPDK <code>nvmf_tgt</code> 作为 storage target，SPDK
 5. XDS SDK 发布后的 provider ABI 收敛方式。
 6. UMDK 用通用 memory type 或 DMA-BUF contract 替代 <code>is_gpu_seg</code>。
 7. inline WRITE data 和小型 admin payload 的后续定义。
+8. **bond 线失败层次未定**：doc32 的「target TCP send 成功 → ubagg 回程断链」证据不足，需按 §14.1 的单变量矩阵重跑后再决定是否改 provider。
+
+### 14.1 bond 数据 WR / NUMA affinity / 完成队列归属的单变量验证（待执行）
+
+审阅指出 v3 在选 bond 时同时打开了 `BALANCE` 和 `numa_affinity`，raw 则关闭——两个变量一起变，无法把差异归因到任何一个。以下是**待执行**的验证矩阵，只做只读观测与配置切换，**不改 provider、不改 `share_jfr`**（`share_jfr=1` 表示使用外部创建的 per-qpair JFR，不能推断成「所有 qpair 共用一个接收队列」，也不应改成 0）。
+
+固定不变量（每轮前后都记录并核对）：设备名与 `urma_dev`、`rm|rc`、`capsule_transport`、`bonding_balance`/`bonding_multipath` 的 bonding level、`jetty_count`、`jfc_depth`、`rnr_retry`、镜像 commit（两端一致）、`SPDK_URMA_*` 全量 env 快照。
+
+| 轮 | 唯一改变量 | 固定值 | 采集 |
+|---|---|---|---|
+| A | 基线：`numa_affinity=0`，`electrical_network=0`，无 BALANCE | raw 同样参数 | 成功/失败计数、`cr_error status` |
+| B | 仅 `SPDK_URMA_NUMA_AFFINITY_ENABLE=1` | 其余同 A（bond/BALANCE/PORT 不动） | 同上 + `data_posted/data_completed` 是否成对、`src_chip/dst_chip` |
+| C | 仅 `SPDK_URMA_ELECTRICAL_NETWORK_ENABLE=1` | 其余同 A | 同上 + chip 选路 `{remote,remote}` vs `{local,remote}` |
+| D | 仅 `SPDK_URMA_BONDING_BALANCE=1` | 其余同 A，`numa_affinity=0` | 同上 + JFS `multi_path` 位 |
+| E | B+D 组合（复现 v3 现场） | — | 与 B/D 单变量结果对照，确认是否出现非线性交互 |
+
+每轮必须同时采集两端的 `cmd_submitted` / `cmd_received` / `data_posted` / `data_completed` / `response_post` / `rsp_received` / `rsp_matched`（§14 Admin 关联诊断），并按 `qid/cid/opcode/fctype/trace_seq` 对齐；另需记录发送 JFC 与接收 JFC 的归属（`send_jfc_index`、poll group 的 `worker_index` 分片）以排除「CR 落在无人轮询的队列」这一独立变量。判定顺序：
+
+1. 若 `cmd_submitted rc != 0` 或缺 `cmd_received` → 问题在提交/胶囊投递，与 bond 数据 WR 无关。
+2. 若有 `data_posted` 无 `data_completed` → 问题在数据 WR / JFC 完成，检查完成队列归属与 flush CR。
+3. 若 `response_post rc=0` 但缺 `rsp_received` → 才是回程投递问题，此时再用 tcpdump 抓包确认字节是否到达网卡。
+4. **只有**当上述链条完整、且仅 B/D/E 出现差异时，才把差异归因到 NUMA affinity / BALANCE，并考虑 provider 修改。
+
+注意本矩阵不含 `urma_perf` 长稳压测；`examples/nvme/urma_perf/urma_perf.c` 的 drain 循环目前只在 `g_failed` 为真时启用超时，completion 丢失但 `g_failed=false` 时 `run_workers()` 不会返回（`print_results()` 不打印）。压测前需单独决定是否改成无条件有界超时，避免把「卡住」误判成底层断链。
 
 ## 15. 实施阶段与验收
 
@@ -687,3 +738,45 @@ SPDK <code>nvmf_tgt</code> 作为 storage target，SPDK
 - <code>UMDK_tool_netlab/src/urma/tools/urma_perftest/perftest_memory.h</code>，仅作为既有 GPU memory 行为参考，不修改。
 - [NVMe specifications](https://nvmexpress.org/specifications/)
 - [SPDK NVMe-oF Target Programming Guide](https://spdk.io/doc/nvmf_tgt_pg.html)
+
+## 17. Embedded initiator Admin registration diagnostics (2026-11-22)
+
+A target receiving Connect/Property Get capsules does not prove that controller
+initialization or the following Identify transfer succeeded. In particular,
+`nvme_ctrlr_identify()` changes the state to ERROR when its submission returns an
+error. A later Property Get during shutdown is not the original failure.
+
+`nvme_urma_qpair_submit_request()` now reports every post-allocation submission
+failure at ERROR level, with endpoint, device, qid, cid, opcode, length and stage:
+
+- `memory_register`: preparing the local payload region failed; no command
+  capsule has been sent for that request.
+- `segment_context`: exporting the complete bonding region context failed;
+  this request has not been sent either.
+- `capsule_send`: registration/context preparation succeeded but capsule
+  submission failed. The peer has not necessarily received a complete frame.
+
+The common memory registration code clears errno before a provider call and
+captures it immediately on failure. A provider returning NULL without setting
+errno produces `-EIO`, not a stale `-ENOENT` from an earlier syscall. Its
+`role=memory stage=register_failed` record includes the original range, aligned
+grant range and provider errno. This corrects error reporting; it does not make
+an unsuccessful provider registration succeed or establish a fabric root cause.
+
+Tests (no URMA hardware required):
+
+```bash
+python3 test/urma/admin_submit_build.py --umdk /path/to/UMDK --sanitize
+python3 test/urma/registration_build.py --umdk /path/to/UMDK
+python3 test/urma/handshake_build.py --umdk /path/to/UMDK --sanitize
+```
+
+The Identify fixture runs the real submission/cache/CID code over a local TCP
+socketpair. It verifies ERROR-level `-ENOENT` correlation, no partial send or CID
+leak, retry after a failed registration, cache reuse, bonding context export,
+raw TCP submission and export failure cleanup. The registration fixture checks
+stale errno independently of provider behavior. These tests do not emulate the
+ARM bonding provider and cannot confirm that the reported cluster failure is
+fixed. Rebuild SPDK's initiator library and relink Mooncake master/kvtest before
+collecting the next attach attempt; replacing `nvmf_tgt` alone does not update
+statically linked initiators.
