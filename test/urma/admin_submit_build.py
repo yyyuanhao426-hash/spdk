@@ -22,8 +22,11 @@ def main():
     types += source[source.index('#define NVME_URMA_REG_CACHE_SIZE'):source.index('struct nvme_urma_ctrlr {')]
     names = ('nvme_urma_qpair', 'nvme_urma_cid_alloc', 'nvme_urma_cid_free',
              'nvme_urma_reg_cache_lookup', 'nvme_urma_reg_cache_insert',
-             'nvme_urma_reg_cache_release', 'nvme_urma_write_full',
-             'nvme_urma_req_memory_type', 'nvme_urma_qpair_submit_request')
+             'nvme_urma_reg_cache_release', 'nvme_urma_admin_region_diag',
+             'nvme_urma_write_full',
+             'nvme_urma_req_memory_type', 'nvme_urma_qpair_submit_request',
+             'nvme_urma_ticks_to_us', 'nvme_urma_monotonic_ns',
+             'nvme_urma_complete_response', 'nvme_urma_qpair_abort_reqs')
     functions = ''.join(extract_function(source, name) for name in names)
     fixture = (ROOT / 'test/urma/admin_submit.c').read_text().replace('/* REAL_TYPES */', types).replace('/* REAL_FUNCTIONS */', functions)
     with tempfile.TemporaryDirectory(prefix='spdk-urma-admin-') as tmp:
@@ -35,6 +38,7 @@ def main():
         command = shlex.split(os.environ.get('CC', 'cc')) + [
             '-D_GNU_SOURCE', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
             '-Wno-unused-parameter', '-Wno-unused-variable', '-Wno-unused-function',
+            '-Wno-discarded-qualifiers',
             '-Wno-missing-field-initializers', '-ffunction-sections', '-fdata-sections',
             '-include', str(work / 'api.h'), '-I' + str(work), '-I' + str(ROOT / 'include'),
             '-I' + str(ROOT / 'lib/nvme'), '-I' + str(core), '-I' + str(bond),

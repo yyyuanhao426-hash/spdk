@@ -783,3 +783,39 @@ ARM bonding provider and cannot confirm that the reported cluster failure is
 fixed. Rebuild SPDK's initiator library and relink Mooncake master/kvtest before
 collecting the next attach attempt; replacing `nvmf_tgt` alone does not update
 statically linked initiators.
+
+## 18. Request-owned bonding Admin payload registrations (2026-11-23)
+
+For bonding devices, Admin queue payloads that are not covered by an
+application-owned registry region no longer enter the qpair registration cache.
+They remain registered while the request is outstanding and follow the existing
+uncached-region cleanup on completion, submit failure or abort, before callbacks
+may free/reuse the DMA buffer. Raw devices and I/O queue caching retain their
+existing policy. Registry regions keep their original application ownership.
+
+This prevents a completed 1KB Connect buffer from leaving a cached 4KB grant
+which a later 4KB Identify at the same address tries to register again: the
+cache keys were the original `(va, payload_length)`, while the provider grants
+page-aligned ranges. Bond providers can reuse a physical TID and reject that
+second token-NONE grant. This change handles the transient Admin lifecycle;
+it is not a general solution for concurrent overlapping I/O registrations.
+
+`URMA_DIAG stage=admin_region_ready` and `stage=admin_region_release` record
+context, qid/cid/opcode/fctype, original range, actual grant range, region,
+segment token ID and external/cached ownership. They are limited to bonding
+Admin payloads and written to stderr so embedded masters filtering SPDK NOTICE
+still capture them. They preserve errno. `segment_token_id` belongs to the
+exported segment, not necessarily the underlying physical pctx TID. A release
+record precedes the provider unregister call; it is not proof that an ungrant
+succeeded. Provider error logs remain necessary if unregister fails.
+
+`test/urma/admin_submit_build.py --umdk /path/to/UMDK --sanitize` now exercises
+the production submit, response completion and abort paths. A provider fixture
+rejects duplicate grants for the same context/range: before the fix, completed
+Connect followed by same-address Identify returns `-EINVAL`; after it, the old
+grant is released before the callback and the Identify succeeds. It also checks
+error completion, send/export failures, abort, external region ownership, raw
+Admin cache reuse and bonding I/O cache reuse. This models the duplicate-grant
+contract; it does not emulate the ARM provider or establish which earlier grant
+occupied the range in the recorded cluster. Rebuild the initiator library and
+relink the Mooncake master before validating the next attach.

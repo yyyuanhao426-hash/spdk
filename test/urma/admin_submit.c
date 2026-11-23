@@ -3,12 +3,16 @@
 #include "nvme_internal.h"
 #include "nvme_urma_internal.h"
 #include "spdk_internal/urma_lifetime.h"
+#define URMA_STAGE_SIDE 1
+#include "spdk_internal/urma_stage_buffer.h"
 
 /* REAL_TYPES */
 static char diagnostics[16384];
 static int registration_errno;
 static bool fail_registration, fail_export;
-static unsigned registrations, unregistrations;
+static unsigned registrations, unregistrations, duplicate_rejections, callbacks;
+static bool reject_duplicate;
+static urma_target_seg_t *active_segments[256];
 
 void
 spdk_log(enum spdk_log_level level, const char *file, int line, const char *func,
@@ -32,6 +36,11 @@ spdk_get_ticks(void)
 {
 	static uint64_t tick;
 	return ++tick;
+}
+uint64_t
+spdk_get_ticks_hz(void)
+{
+	return 1000000;
 }
 struct spdk_memory_domain *
 spdk_memory_domain_get_system_domain(void)
@@ -69,16 +78,41 @@ urma_register_seg(urma_context_t *ctx, urma_seg_cfg_t *cfg)
 			errno = registration_errno;
 		return NULL;
 	}
+	for (unsigned i = 0; reject_duplicate && i < SPDK_COUNTOF(active_segments); i++) {
+		urma_target_seg_t *old = active_segments[i];
+		if (old && old->urma_ctx == ctx && old->seg.ubva.va == cfg->va &&
+		    old->seg.len == cfg->len) {
+			duplicate_rejections++;
+			errno = EINVAL;
+			return NULL;
+		}
+	}
 	urma_target_seg_t *s = calloc(1, sizeof(*s));
 	assert(s);
+	s->urma_ctx = ctx;
 	s->seg.ubva.va = cfg->va;
 	s->seg.len = cfg->len;
 	s->seg.token_id = ++registrations;
-	return s;
+	for (unsigned i = 0; i < SPDK_COUNTOF(active_segments); i++) {
+		if (!active_segments[i]) {
+			active_segments[i] = s;
+			return s;
+		}
+	}
+	abort();
 }
 urma_status_t
 urma_unregister_seg(urma_target_seg_t *seg)
 {
+	bool found = false;
+	for (unsigned i = 0; i < SPDK_COUNTOF(active_segments); i++) {
+		if (active_segments[i] == seg) {
+			active_segments[i] = NULL;
+			found = true;
+			break;
+		}
+	}
+	assert(found);
 	unregistrations++;
 	free(seg);
 	return URMA_SUCCESS;
@@ -104,11 +138,7 @@ urma_put_seg_ctx(urma_seg_t *ctx)
 static void
 cleanup(struct nvme_urma_qpair *q)
 {
-	while (!TAILQ_EMPTY(&q->outstanding)) {
-		struct nvme_urma_req *r = TAILQ_FIRST(&q->outstanding);
-		TAILQ_REMOVE(&q->outstanding, r, link);
-		free(r);
-	}
+	nvme_urma_qpair_abort_reqs(&q->qpair, 1);
 	for (unsigned i = 0; i < NVME_URMA_REG_CACHE_SIZE; i++)
 		if (q->reg_cache[i].used)
 			spdk_nvme_urma_unregister_memory(q->reg_cache[i].region);
@@ -131,11 +161,12 @@ identify_test(bool bond)
 				    .next_cid = 7,
 				    .capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP};
 	q.qpair.ctrlr = &ctrlr;
+	q.qpair.id = bond ? 1 : 0;
 	q.cid_bitmap = calloc(4, 1);
 	TAILQ_INIT(&q.outstanding);
 	void *buffer = aligned_alloc(4096, 4096);
 	assert(buffer);
-	struct nvme_request request = {0};
+	struct nvme_request request = {.qpair_reserved = true};
 	request.cmd.opc = SPDK_NVME_OPC_IDENTIFY;
 	request.payload.contig_or_cb_arg = buffer;
 	request.payload.size = 4096;
@@ -170,16 +201,18 @@ identify_test(bool bond)
 	assert(frame.capsule.data.length == 4096);
 	assert((frame.capsule.seg_ctx_length > sizeof(urma_seg_t)) == bond);
 	assert(registrations == before + 1 && q.qpair.queue_depth == 1);
-	assert(nvme_urma_qpair_submit_request(&q.qpair, &request) == 0);
+	struct nvme_request second = request;
+	assert(nvme_urma_qpair_submit_request(&q.qpair, &second) == 0);
 	assert(registrations == before + 1 && q.qpair.queue_depth == 2);
 	assert(recv(fds[1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
 	if (bond) {
 		void *other = aligned_alloc(4096, 4096);
 		assert(other);
-		request.payload.contig_or_cb_arg = other;
+		struct nvme_request failed = request;
+		failed.payload.contig_or_cb_arg = other;
 		fail_export = true;
 		diagnostics[0] = 0;
-		assert(nvme_urma_qpair_submit_request(&q.qpair, &request) == -EIO);
+		assert(nvme_urma_qpair_submit_request(&q.qpair, &failed) == -EIO);
 		assert(strstr(diagnostics, "stage=segment_context"));
 		assert(q.qpair.queue_depth == 2);
 		assert(recv(fds[1], &byte, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN);
@@ -193,9 +226,148 @@ identify_test(bool bond)
 	close(fds[0]);
 	close(fds[1]);
 }
+
+static void
+request_done(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	(void)cpl;
+	if (arg) {
+		*(unsigned *)arg = unregistrations;
+	}
+	callbacks++;
+}
+
+static void
+complete_request(struct nvme_urma_qpair *q, struct nvme_request *request, bool error)
+{
+	struct spdk_urma_capsule_rsp response = {};
+
+	response.cpl.cid = request->cmd.cid;
+	response.cpl.sqid = q->qpair.id;
+	response.cpl.status.sc = error ? SPDK_NVME_SC_INTERNAL_DEVICE_ERROR : 0;
+	assert(nvme_urma_complete_response(q, &response) == 1);
+}
+
+static void
+bond_admin_lifecycle_test(void)
+{
+	urma_context_t context = {};
+	struct spdk_urma_device device = {.context = &context};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	int fds[2];
+	struct spdk_urma_capsule_cmd_frame frame;
+	unsigned base_reg = registrations, base_unreg = unregistrations;
+	unsigned base_callbacks = callbacks, callback_unregistrations = 0;
+
+	strcpy(device.dev_name, "bonding_dev_15");
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	struct nvme_urma_qpair q = {.device = &device,
+				    .fd = fds[0],
+				    .num_entries = 32,
+				    .capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP};
+	q.qpair.ctrlr = &ctrlr;
+	q.cid_bitmap = calloc(4, 1);
+	assert(q.cid_bitmap);
+	TAILQ_INIT(&q.outstanding);
+	void *buffer = aligned_alloc(4096, 4096);
+	assert(buffer);
+	struct nvme_request connect = {.payload_type = NVME_PAYLOAD_TYPE_CONTIG,
+				       .qpair_reserved = true,
+				       .cb_fn = request_done,
+				       .cb_arg = &callback_unregistrations};
+	connect.cmd.opc = SPDK_NVME_OPC_FABRIC;
+	((struct spdk_nvmf_fabric_connect_cmd *)&connect.cmd)->fctype =
+	    SPDK_NVMF_FABRIC_COMMAND_CONNECT;
+	connect.payload.contig_or_cb_arg = buffer;
+	connect.payload.size = 1024;
+	reject_duplicate = true;
+	assert(nvme_urma_qpair_submit_request(&q.qpair, &connect) == 0);
+	assert(recv(fds[1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(frame.capsule.data.length == 1024 && frame.capsule.data.seg.len == 4096);
+	assert(unregistrations == base_unreg); /* Keep the grant while DMA is in flight. */
+	complete_request(&q, &connect, false);
+
+	struct nvme_request identify = {.payload_type = NVME_PAYLOAD_TYPE_CONTIG,
+					.qpair_reserved = true,
+					.cb_fn = request_done,
+					.cb_arg = &callback_unregistrations};
+	identify.cmd.opc = SPDK_NVME_OPC_IDENTIFY;
+	identify.payload.contig_or_cb_arg = buffer; /* Deliberate allocator reuse. */
+	identify.payload.size = 4096;
+	int rc = nvme_urma_qpair_submit_request(&q.qpair, &identify);
+	if (rc != 0) {
+		fprintf(stderr,
+			"RED: Connect completed but its grant remained; "
+			"same-page Identify rejected rc=%d duplicate_rejections=%u\n",
+			rc, duplicate_rejections);
+		abort();
+	}
+	assert(duplicate_rejections == 0);
+	assert(unregistrations == base_unreg + 1);
+	assert(callback_unregistrations == base_unreg + 1);
+	assert(recv(fds[1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(frame.capsule.data.length == 4096 && frame.capsule.data.seg.len == 4096);
+	complete_request(&q, &identify, true); /* Error completions release too. */
+	assert(unregistrations == base_unreg + 2);
+	assert(callback_unregistrations == base_unreg + 2);
+	assert(q.qpair.queue_depth == 0 && TAILQ_EMPTY(&q.outstanding));
+	for (unsigned i = 0; i < NVME_URMA_REG_CACHE_SIZE; i++) {
+		assert(!q.reg_cache[i].used);
+	}
+
+	/* Fail after registration/context export: no leaked region, CID or request. */
+	q.fd = -1;
+	diagnostics[0] = 0;
+	assert(nvme_urma_qpair_submit_request(&q.qpair, &identify) == -EBADF);
+	assert(strstr(diagnostics, "stage=capsule_send"));
+	assert(unregistrations == base_unreg + 3);
+	assert(q.qpair.queue_depth == 0 && TAILQ_EMPTY(&q.outstanding));
+	q.fd = fds[0];
+	fail_export = true;
+	assert(nvme_urma_qpair_submit_request(&q.qpair, &identify) == -EIO);
+	assert(unregistrations == base_unreg + 4);
+	fail_export = false;
+	assert(q.cid_bitmap[0] == 0 && q.cid_bitmap[1] == 0);
+
+	/* A disconnect abort releases the payload before its completion callback. */
+	assert(nvme_urma_qpair_submit_request(&q.qpair, &identify) == 0);
+	assert(recv(fds[1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(unregistrations == base_unreg + 4);
+	nvme_urma_qpair_abort_reqs(&q.qpair, 1);
+	assert(unregistrations == base_unreg + 5);
+	assert(callback_unregistrations == base_unreg + 5);
+	assert(callbacks == base_callbacks + 3);
+	assert(q.qpair.queue_depth == 0 && TAILQ_EMPTY(&q.outstanding));
+
+	/* An application-owned covering region retains its original ownership. */
+	struct spdk_nvme_urma_memory_region *external = NULL;
+	assert(spdk_nvme_urma_register_memory(&context, buffer, 4096, SPDK_NVME_URMA_MEM_HOST,
+					      &external) == 0);
+	assert(spdk_nvme_urma_region_registry_add(&context, buffer, 4096, external) == 0);
+	unsigned external_reg = registrations, external_unreg = unregistrations;
+	assert(nvme_urma_qpair_submit_request(&q.qpair, &identify) == 0);
+	assert(registrations == external_reg);
+	assert(recv(fds[1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	complete_request(&q, &identify, false);
+	assert(unregistrations == external_unreg);
+	assert(callback_unregistrations == external_unreg);
+	assert(spdk_nvme_urma_region_registry_find(&context, (uint64_t)buffer, 4096) == external);
+	spdk_nvme_urma_unregister_memory(external);
+	assert(!spdk_nvme_urma_region_registry_find(&context, (uint64_t)buffer, 4096));
+	assert(registrations == base_reg + 6 && unregistrations == base_unreg + 6);
+	reject_duplicate = false;
+	cleanup(&q);
+	free(buffer);
+	close(fds[0]);
+	close(fds[1]);
+	puts("PASS bond Admin: same-page Connect->Identify, in-flight lifetime, completion/error/"
+	     "abort cleanup, external ownership; no duplicate grant");
+}
+
 int
 main(void)
 {
+	bond_admin_lifecycle_test();
 	identify_test(true);
 	identify_test(false);
 	assert(registrations == unregistrations);

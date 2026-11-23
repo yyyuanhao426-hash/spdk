@@ -447,6 +447,36 @@ nvme_urma_reg_cache_release(struct nvme_urma_reg_entry *entry)
 	}
 }
 
+/* Attach provenance is limited to bonding Admin payloads. Embedded Mooncake
+ * filters SPDK NOTICE, so these records use stderr without labelling successful
+ * registrations as errors. Preserve errno around the diagnostic sink. */
+static void
+nvme_urma_admin_region_diag(struct nvme_urma_qpair *uqpair, struct nvme_urma_req *ureq,
+			    const char *stage, const char *reason)
+{
+	struct nvme_request *req = ureq->req;
+	urma_target_seg_t *tseg;
+	int saved_errno;
+
+	if (uqpair->qpair.id != 0 || ureq->region == NULL ||
+	    strncmp(uqpair->device->dev_name, "bonding", 7) != 0) {
+		return;
+	}
+	tseg = spdk_urma_memory_region_get_tseg(ureq->region);
+	saved_errno = errno;
+	fprintf(stderr, "URMA_DIAG role=initiator stage=%s reason=%s owner=%p context=%p "
+			"device=%s qid=0 cid=%u opcode=%u fctype=%u addr=%p data_len=%u "
+			"grant_addr=0x%" PRIx64 " grant_length=%" PRIu64 " region=%p "
+			"segment_token_id=%u external=%u cached=%u\n", stage, reason, uqpair,
+			uqpair->device->context, uqpair->device->dev_name, req->cmd.cid, req->cmd.opc,
+			SPDK_URMA_DIAG_FCTYPE(req->cmd.opc, &req->cmd),
+			(void *)((uintptr_t)req->payload.contig_or_cb_arg + req->payload.offset),
+			req->payload.size, (uint64_t)tseg->seg.ubva.va, (uint64_t)tseg->seg.len,
+			ureq->region, tseg->seg.token_id, ureq->region_external ? 1u : 0u,
+			ureq->cache_entry != NULL ? 1u : 0u);
+	errno = saved_errno;
+}
+
 static int
 nvme_urma_write_full(int fd, const void *buf, size_t length)
 {
@@ -1017,8 +1047,21 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 		} else {
 			/* Modified By Yida: check registration cache before doing a full register */
 			uint64_t t_reg0 = spdk_get_ticks();
-			struct nvme_urma_reg_entry *entry = nvme_urma_reg_cache_lookup(uqpair, addr,
-					req->payload.size);
+			struct nvme_urma_reg_entry *entry = NULL;
+			/* Connect/user-copy Admin buffers may be freed before qpair teardown.
+			 * Keeping a 1KB cache entry while its 4KB grant remains live makes a
+			 * later 4KB Identify at the same VA miss this cache and re-grant the
+			 * same range. Bond pctxs reuse a TID and reject that duplicate grant.
+			 * Keep transient bond Admin registrations request-owned; completion,
+			 * submit failure and abort already unregister uncached regions before
+			 * invoking callbacks that can free/reuse the DMA buffer. External
+			 * registry regions above retain their application-owned lifetime. */
+			bool cache_registration = qpair->id != 0 ||
+					  strncmp(uqpair->device->dev_name, "bonding", 7) != 0;
+
+			if (cache_registration) {
+				entry = nvme_urma_reg_cache_lookup(uqpair, addr, req->payload.size);
+			}
 			if (entry != NULL) {
 				ureq->region = entry->region;
 				ureq->cache_entry = entry;
@@ -1031,15 +1074,18 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 				if (rc != 0) {
 					goto send_error;
 				}
-				ureq->cache_entry = nvme_urma_reg_cache_insert(uqpair, addr,
-						req->payload.size, ureq->region);
-				/* If cache_entry is NULL (cache full), region stays uncached and
-				 * will be unregistered on completion (old behavior). */
+				if (cache_registration) {
+					ureq->cache_entry = nvme_urma_reg_cache_insert(uqpair, addr,
+							req->payload.size, ureq->region);
+				}
+				/* An uncached region (bond Admin or full cache) is released by
+				 * the request's completion, submit-error or abort cleanup. */
 				uint64_t t_reg1 = spdk_get_ticks();
 				__atomic_add_fetch(&g_timing.reg_ticks, t_reg1 - t_reg0, __ATOMIC_RELAXED);
 				__atomic_add_fetch(&g_timing.reg_count, 1, __ATOMIC_RELAXED);
 			}
 		}
+		nvme_urma_admin_region_diag(uqpair, ureq, "admin_region_ready", "submit");
 		capsule.data.seg = spdk_urma_memory_region_get_tseg(ureq->region)->seg;
 		if (strncmp(uqpair->device->dev_name, "bonding", 7) == 0) {
 			size_t length = sizeof(capsule.seg_ctx);
@@ -1136,6 +1182,8 @@ send_error:
 		if (ureq->cache_entry != NULL) {
 			nvme_urma_reg_cache_release(ureq->cache_entry);
 		} else if (!ureq->region_external) {
+			nvme_urma_admin_region_diag(uqpair, ureq, "admin_region_release",
+						    "submit_error");
 			spdk_nvme_urma_unregister_memory(ureq->region);
 		}
 		/* Modified By Yida (v3): 归还 cid 位 */
@@ -1184,6 +1232,8 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 	if (ureq->cache_entry != NULL) {
 		nvme_urma_reg_cache_release(ureq->cache_entry);
 	} else if (!ureq->region_external) {
+		nvme_urma_admin_region_diag(uqpair, ureq, "admin_region_release",
+					    "completion");
 		spdk_nvme_urma_unregister_memory(ureq->region);
 	}
 	t_rel1 = spdk_get_ticks();
@@ -1790,6 +1840,8 @@ nvme_urma_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
 		if (ureq->cache_entry != NULL) {
 			nvme_urma_reg_cache_release(ureq->cache_entry);
 		} else if (!ureq->region_external) {
+			nvme_urma_admin_region_diag(uqpair, ureq, "admin_region_release",
+						    "abort");
 			spdk_nvme_urma_unregister_memory(ureq->region);
 		}
 		nvme_complete_request(ureq->req->cb_fn, ureq->req->cb_arg, qpair, ureq->req, &cpl);
