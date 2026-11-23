@@ -206,6 +206,12 @@ int spdk_urma_import_segment(struct spdk_urma_device *device,
 void spdk_urma_bonding_chip_ids(bool electrical, uint8_t local, uint8_t remote, uint32_t *src,
 				uint32_t *dst);
 
+#ifdef SPDK_CONFIG_URMA_LOG_FUNC
+/* Install the liburma log sink once per process, before urma_init().
+ * Also callable from the registration harness to test level mapping. */
+void spdk_urma_log_redirect_init(void);
+#endif
+
 typedef bool (*spdk_urma_recv_cr_prepare_cb)(urma_cr_t *cr, void *ctx);
 
 /* BALANCE+PORT needs the JFS multi_path bit too (Mooncake TE policy).

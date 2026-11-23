@@ -115,7 +115,7 @@ python3 test/urma/registration_build.py --umdk /path/to/gpu-capable/UMDK
 
 默认值参考 Mooncake 当前 URMA 实现：RM 模式、每块本地 NIC 共享 2 个发送 JFC 和 2 个接收 JFC、每个远端 NIC endpoint 1 个 Jetty、JFC 深度 4096、Jetty 深度 2048、max_sge 5、rnr_retry 7、err_timeout 17、token `0xACFE`，active port 默认自动选择。priority 默认根据设备 `priority_info` 自动选择 CTP 对应项。
 
-SPDK 使用以下环境变量。目前只有一个 Mooncake 变量名作为低优先级回退被读取：`SPDK_URMA_ELECTRICAL_NETWORK_ENABLE` 未设置时读取 `MC_UB_ELECTRICAL_NETWORK_ENABLE`。其余 `MC_URMA_*` / `MC_UB_*` 变量均不被代码读取，按 Mooncake 习惯只设置它们会静默落回 SPDK 默认值：
+SPDK 使用以下环境变量。有两个 Mooncake 变量名作为低优先级回退被读取：`SPDK_URMA_ELECTRICAL_NETWORK_ENABLE` 未设置时读取 `MC_UB_ELECTRICAL_NETWORK_ENABLE`；`SPDK_URMA_LOG_REDIRECT` 未设置时读取 `MC_URMA_LOG_REDIRECT`（日志 sink 是进程级单例，与同进程的 Mooncake TE 共用一个开关）。其余 `MC_URMA_*` / `MC_UB_*` 变量均不被代码读取，按 Mooncake 习惯只设置它们会静默落回 SPDK 默认值：
 
 | SPDK 参数 | Mooncake 回退变量 | 默认值 |
 |---|---|---|
@@ -136,6 +136,9 @@ SPDK 使用以下环境变量。目前只有一个 Mooncake 变量名作为低�
 | `SPDK_URMA_TP_TYPE` | 无 | `ctp`；可设为 `rtp` |
 | `SPDK_URMA_JETTY_PRIORITY` | 无 | 自动从 `priority_info` 选择；显式值范围 `0..15` 且必须匹配 TP type |
 | `SPDK_URMA_NUMA_AFFINITY_ENABLE` | 无 | `false` |
+| `SPDK_URMA_LOG_REDIRECT` | `MC_URMA_LOG_REDIRECT` | 开启（`0/off/false/no` 关闭）；需 SDK 提供 `urma_register_log_func`，否则编译期降级为不注册 |
+
+**provider 日志重定向**：liburma 的 `urma_log()` 在未注册输出回调时丢弃全部消息，`URMA_LOG_LEVEL` 只控制过滤级别，单独设置它不会让 provider 日志落盘。当所选 SDK 声明了 `urma_register_log_func`（`configure` 探测后生成 `SPDK_CONFIG_URMA_LOG_FUNC`）时，SPDK 在 `urma_init()` **之前**通过 `pthread_once` 注册一次 sink，把 URMA/UDMA/UMMU/bondp 的日志按 syslog 级别映射到 `spdk_log()`：0–3→ERROR、4→WARN、5→NOTICE、6→INFO、7+→DEBUG。注册早于 init 是必要的，provider 驱动在 init 阶段才被打开并继承该回调。日志量由 `URMA_LOG_LEVEL` 与 SPDK 自身 log level 共同约束；设 `SPDK_URMA_LOG_REDIRECT=0` 可完全关闭。回调是进程级 last-wins，同进程 Mooncake TE 的 `UrmaRegisterLogRedirectIfEnabled()` 也注册自己的 sink，两者写入的流都会被 `kubectl logs` 捕获，任一生效均可；SPDK 不在 teardown 时注销，以保留退出阶段的驱动日志。
 
 **与 Mooncake TE 的策略口径差异（部署前必读）**：
 

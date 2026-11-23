@@ -79,7 +79,7 @@ def main():
                 api.write_text(text)
             config_dir = headers / "spdk"
             config_dir.mkdir()
-            config = ""
+            config = "#define SPDK_CONFIG_URMA_LOG_FUNC 1\n"
             if peermem:
                 config += "#define SPDK_CONFIG_URMA_PEERMEM 1\n"
             if dmabuf:
@@ -97,7 +97,12 @@ def main():
             binary = fixture / "registration"
             run([*compiler, *cflags, str(ROOT / "test/urma/memory_registration.c"),
                  str(obj), "-Wl,--gc-sections", "-pthread", "-o", str(binary)])
-            run([str(binary)])
+            # Run twice so the process-global pthread_once state starts fresh:
+            # default-on registers the sink, explicit =0 leaves it untouched.
+            clean_env = {k: v for k, v in os.environ.items()
+                         if k not in ("MC_URMA_LOG_REDIRECT", "SPDK_URMA_LOG_REDIRECT")}
+            run([str(binary)], env=clean_env)
+            run([str(binary)], env={**clean_env, "SPDK_URMA_LOG_REDIRECT": "0"})
             run([*compiler, *cflags, "-c", str(ROOT / "examples/nvme/urma_perf/urma_perf.c"),
                  "-o", str(fixture / "perf.o")])
 

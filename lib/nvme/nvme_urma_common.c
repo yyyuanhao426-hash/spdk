@@ -269,6 +269,106 @@ spdk_urma_bonding_chip_ids(bool electrical, uint8_t local, uint8_t remote, uint3
 	*dst = remote;
 }
 
+#ifdef SPDK_CONFIG_URMA_LOG_FUNC
+/* liburma's urma_log() discards every message unless an output callback has
+ * been registered; URMA_LOG_LEVEL only controls filtering.  The callback must
+ * be installed BEFORE urma_init(), because provider drivers are opened during
+ * init and inherit the sink via urma_register_log_func_to_providers().
+ *
+ * The sink is process-global and last-registration-wins.  In the master process
+ * Mooncake TE may install its own sink; both write to streams captured by
+ * kubectl logs, so either owner is usable.  We deliberately never unregister,
+ * so driver logs emitted during teardown stay visible (same policy as TE). */
+static pthread_once_t g_urma_log_once = PTHREAD_ONCE_INIT;
+
+static bool
+spdk_urma_log_redirect_enabled(void)
+{
+	const char *value = getenv("SPDK_URMA_LOG_REDIRECT");
+
+	/* Share one switch with Mooncake TE, which lives in the same process. */
+	if (value == NULL || value[0] == '\0') {
+		value = getenv("MC_URMA_LOG_REDIRECT");
+	}
+	if (value == NULL || value[0] == '\0') {
+		/* Default on: a provider ERROR line is the only way to locate an
+		 * ENOENT from a seg/token ioctl.  Volume stays bounded by
+		 * URMA_LOG_LEVEL and by SPDK's own log level. */
+		return true;
+	}
+	return strcasecmp(value, "0") != 0 &&
+	       strcasecmp(value, "off") != 0 &&
+	       strcasecmp(value, "false") != 0 &&
+	       strcasecmp(value, "no") != 0;
+}
+
+static void
+spdk_urma_log_cb(int level, char *message)
+{
+	enum spdk_log_level spdk_level;
+	const char *text = message != NULL ? message : "";
+	size_t len = strlen(text);
+
+	switch (level) {
+	case 0:		/* EMERG */
+	case 1:		/* ALERT */
+	case 2:		/* CRIT */
+	case 3:		/* ERR */
+		spdk_level = SPDK_LOG_ERROR;
+		break;
+	case 4:		/* WARNING */
+		spdk_level = SPDK_LOG_WARN;
+		break;
+	case 5:		/* NOTICE */
+		spdk_level = SPDK_LOG_NOTICE;
+		break;
+	case 6:		/* INFO */
+		spdk_level = SPDK_LOG_INFO;
+		break;
+	default:	/* DEBUG and unknown levels */
+		spdk_level = SPDK_LOG_DEBUG;
+		break;
+	}
+
+	/* liburma already prefixes the message with [URMA][file:func:line], so
+	 * pass no SPDK file/line/func.  Pass the text as an argument, never as
+	 * the format string: provider messages may contain '%'.  Trim liburma's
+	 * trailing newline because spdk_log appends its own. */
+	if (len > 0 && text[len - 1] == '\n') {
+		spdk_log(spdk_level, NULL, -1, NULL, "%.*s", (int)(len - 1), text);
+	} else {
+		spdk_log(spdk_level, NULL, -1, NULL, "%s", text);
+	}
+}
+
+static void
+spdk_urma_log_register(void)
+{
+	urma_status_t status;
+
+	if (!spdk_urma_log_redirect_enabled()) {
+		SPDK_NOTICELOG("URMA provider log redirect disabled "
+			       "(SPDK_URMA_LOG_REDIRECT=0)\n");
+		return;
+	}
+
+	status = urma_register_log_func(spdk_urma_log_cb);
+	if (status != URMA_SUCCESS) {
+		SPDK_WARNLOG("URMA provider log redirect registration failed, ret=%d\n",
+			     (int)status);
+		return;
+	}
+	SPDK_NOTICELOG("URMA provider log redirect registered "
+		       "(SPDK_URMA_LOG_REDIRECT / MC_URMA_LOG_REDIRECT)\n");
+}
+
+void
+spdk_urma_log_redirect_init(void)
+{
+	pthread_once(&g_urma_log_once, spdk_urma_log_register);
+}
+#endif /* SPDK_CONFIG_URMA_LOG_FUNC */
+
 static bool
 spdk_urma_accel_memory_enabled(void)
 {
@@ -283,6 +383,9 @@ static int spdk_urma_runtime_get(void)
 {
 	int rc = 0;
 
+#ifdef SPDK_CONFIG_URMA_LOG_FUNC
+	spdk_urma_log_redirect_init();
+#endif
 	pthread_mutex_lock(&g_runtime_mutex);
 	if (g_runtime_refs == 0) {
 		urma_status_t status = urma_init(NULL);

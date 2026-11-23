@@ -107,6 +107,9 @@ CONFIG_URMA_DIR=
 # Detected automatically: complete provider context export API.
 CONFIG_URMA_RJETTY=n
 CONFIG_URMA_SEG_CTX=n
+# Detected automatically: liburma log-callback API (provider log redirect).
+# Set SPDK_URMA_LOG_REDIRECT=0 at runtime to opt out.
+CONFIG_URMA_LOG_FUNC=n
 # Optional accelerator registration mechanisms. Neither requires CONFIG_CUDA.
 CONFIG_URMA_PEERMEM=n
 CONFIG_URMA_DMABUF=n

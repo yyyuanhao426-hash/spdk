@@ -6,6 +6,8 @@
 #include "spdk/config.h"
 #include "nvme_urma_internal.h"
 
+#include <stdarg.h>
+
 static urma_target_seg_t g_seg;
 static urma_seg_cfg_t g_cfg;
 static unsigned int g_register_calls, g_unregister_calls, g_pin_calls, g_unpin_calls;
@@ -13,14 +15,37 @@ static unsigned int g_export_calls, g_dmabuf_calls;
 static int g_register_error, g_pin_error, g_export_error, g_dmabuf_error, g_fd = -1;
 static char g_pin_handle;
 static bool g_register_without_errno;
+static enum spdk_log_level g_last_log_level;
+static char g_last_log_message[512];
+#ifdef SPDK_CONFIG_URMA_LOG_FUNC
+static urma_log_cb_t g_log_cb;
+static unsigned int g_log_register_calls;
+#endif
 
 void
 spdk_log(enum spdk_log_level level, const char *file, int line, const char *func,
 	 const char *format, ...)
 {
+	va_list args;
+
+	g_last_log_level = level;
+	va_start(args, format);
+	vsnprintf(g_last_log_message, sizeof(g_last_log_message), format, args);
+	va_end(args);
 	/* A diagnostic sink must not change the registration error returned. */
 	errno = EINVAL;
 }
+
+#ifdef SPDK_CONFIG_URMA_LOG_FUNC
+urma_status_t
+urma_register_log_func(urma_log_cb_t func)
+{
+	assert(func != NULL);
+	g_log_register_calls++;
+	g_log_cb = func;
+	return URMA_SUCCESS;
+}
+#endif
 
 
 urma_target_seg_t *
@@ -235,11 +260,54 @@ check_accelerator(void)
 #endif
 }
 
+#ifdef SPDK_CONFIG_URMA_LOG_FUNC
+static void
+check_log_redirect(void)
+{
+	const char *disabled = getenv("SPDK_URMA_LOG_REDIRECT");
+
+	spdk_urma_log_redirect_init();
+	if (disabled != NULL && strcmp(disabled, "0") == 0) {
+		/* Explicit opt-out must not touch the provider log sink. */
+		assert(g_log_register_calls == 0);
+		assert(g_last_log_level == SPDK_LOG_NOTICE);
+		return;
+	}
+	assert(g_log_register_calls == 1);
+	assert(g_log_cb != NULL);
+
+	/* Provider ERROR lines must land as SPDK errors, with liburma's trailing
+	 * newline removed; '%' in a message must never be parsed as a format. */
+	g_log_cb(3, "Failed to register pseg 6\n");
+	assert(g_last_log_level == SPDK_LOG_ERROR);
+	assert(strcmp(g_last_log_message, "Failed to register pseg 6") == 0);
+
+	g_log_cb(4, "access = 100%\n");
+	assert(g_last_log_level == SPDK_LOG_WARN);
+	assert(strcmp(g_last_log_message, "access = 100%") == 0);
+
+	g_log_cb(6, "bondp create_pctx\n");
+	assert(g_last_log_level == SPDK_LOG_INFO);
+	assert(strcmp(g_last_log_message, "bondp create_pctx") == 0);
+
+	g_log_cb(7, "debug detail\n");
+	assert(g_last_log_level == SPDK_LOG_DEBUG);
+	assert(strcmp(g_last_log_message, "debug detail") == 0);
+
+	g_log_cb(0, "no newline");
+	assert(g_last_log_level == SPDK_LOG_ERROR);
+	assert(strcmp(g_last_log_message, "no newline") == 0);
+}
+#endif
+
 int
 main(void)
 {
 	check_host();
 	check_accelerator();
+#ifdef SPDK_CONFIG_URMA_LOG_FUNC
+	check_log_redirect();
+#endif
 	puts("URMA memory registration passed");
 	return 0;
 }

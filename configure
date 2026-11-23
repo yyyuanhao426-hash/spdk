@@ -1067,6 +1067,18 @@ if [ "${CONFIG[URMA]}" = "y" ]; then
 	else
 		echo "URMA SDK lacks segment context APIs: bonding data I/O requires a newer matching SDK."
 	fi
+	# liburma's urma_log() drops every message unless a sink is registered;
+	# URMA_LOG_LEVEL only controls filtering. Probe the callback declaration.
+	# Compile-only: the symbol comes from the same liburma we already link, and
+	# a link probe would reject SDK variants whose stub lacks the callback.
+	CONFIG[URMA_LOG_FUNC]=n
+	if echo -e '#include <urma_api.h>\nint main(void) { (void)urma_register_log_func(NULL); return 0; }\n' \
+		| "${BUILD_CMD[@]}" "${urma_cflags[@]}" \
+			-Werror=implicit-function-declaration -c - 2> /dev/null; then
+		CONFIG[URMA_LOG_FUNC]=y
+	else
+		echo "URMA SDK lacks urma_register_log_func: provider logs will not be captured."
+	fi
 	if [[ "${CONFIG[URMA_PEERMEM]}" == "y" ]]; then
 		if ! echo -e '#include <urma_api.h>\nint main(void) { urma_seg_cfg_t cfg = {0}; cfg.is_gpu_seg = 1; return (int)cfg.is_gpu_seg; }\n' \
 			| "${BUILD_CMD[@]}" "${urma_cflags[@]}" -c - 2> /dev/null; then
@@ -1082,7 +1094,7 @@ if [ "${CONFIG[URMA]}" = "y" ]; then
 			exit 1
 		fi
 	fi
-	echo "Using independent URMA transport (rjetty=${CONFIG[URMA_RJETTY]}, seg_ctx=${CONFIG[URMA_SEG_CTX]}, peermem=${CONFIG[URMA_PEERMEM]}, dmabuf=${CONFIG[URMA_DMABUF]})"
+	echo "Using independent URMA transport (rjetty=${CONFIG[URMA_RJETTY]}, seg_ctx=${CONFIG[URMA_SEG_CTX]}, log_func=${CONFIG[URMA_LOG_FUNC]}, peermem=${CONFIG[URMA_PEERMEM]}, dmabuf=${CONFIG[URMA_DMABUF]})"
 fi
 
 if [[ "${CONFIG[FC]}" = "y" ]]; then
