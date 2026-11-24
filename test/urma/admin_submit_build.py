@@ -22,7 +22,8 @@ def main():
     types += source[source.index('#define NVME_URMA_REG_CACHE_SIZE'):source.index('struct nvme_urma_ctrlr {')]
     names = ('nvme_urma_qpair', 'nvme_urma_cid_alloc', 'nvme_urma_cid_free',
              'nvme_urma_reg_cache_lookup', 'nvme_urma_reg_cache_insert',
-             'nvme_urma_reg_cache_release', 'nvme_urma_admin_region_diag',
+             'nvme_urma_reg_cache_release', 'nvme_urma_request_has_transient_payload',
+             'nvme_urma_admin_region_diag',
              'nvme_urma_write_full',
              'nvme_urma_req_memory_type', 'nvme_urma_qpair_submit_request',
              'nvme_urma_ticks_to_us', 'nvme_urma_monotonic_ns',

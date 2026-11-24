@@ -364,9 +364,108 @@ bond_admin_lifecycle_test(void)
 	     "abort cleanup, external ownership; no duplicate grant");
 }
 
+/* Both queue types use the same ephemeral Fabrics Connect allocation. Model
+ * reuse after its completion, first by a 512-byte probe READ and then by a
+ * different controller's Admin Connect sharing the same device context. */
+static void
+bond_io_connect_lifetime_test(bool cross_qpair)
+{
+	urma_context_t context = {};
+	struct spdk_urma_device device = {.context = &context};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_urma_qpair io = {.device = &device,
+				     .num_entries = 32,
+				     .capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP};
+	struct nvme_urma_qpair admin = {.device = &device,
+					.num_entries = 32,
+					.capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP};
+	struct spdk_urma_capsule_cmd_frame frame;
+	unsigned base_reg = registrations, base_unreg = unregistrations;
+	unsigned callback_unreg = 0;
+	int io_fds[2], admin_fds[2];
+
+	strcpy(device.dev_name, "bonding_dev_80");
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, io_fds) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, admin_fds) == 0);
+	io.fd = io_fds[0];
+	admin.fd = admin_fds[0];
+	io.qpair.id = 1;
+	io.qpair.ctrlr = admin.qpair.ctrlr = &ctrlr;
+	io.cid_bitmap = calloc(4, 1);
+	admin.cid_bitmap = calloc(4, 1);
+	assert(io.cid_bitmap && admin.cid_bitmap);
+	TAILQ_INIT(&io.outstanding);
+	TAILQ_INIT(&admin.outstanding);
+	void *buffer = aligned_alloc(4096, 4096);
+	assert(buffer);
+	struct nvme_request connect = {.payload_type = NVME_PAYLOAD_TYPE_CONTIG,
+				       .qpair_reserved = true,
+				       .cb_fn = request_done,
+				       .cb_arg = &callback_unreg};
+	connect.cmd.opc = SPDK_NVME_OPC_FABRIC;
+	((struct spdk_nvmf_fabric_connect_cmd *)&connect.cmd)->fctype =
+	    SPDK_NVMF_FABRIC_COMMAND_CONNECT;
+	connect.payload.contig_or_cb_arg = buffer;
+	connect.payload.size = 1024;
+	reject_duplicate = true;
+	assert(nvme_urma_qpair_submit_request(&io.qpair, &connect) == 0);
+	assert(recv(io_fds[1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(unregistrations == base_unreg);
+	complete_request(&io, &connect, false);
+
+	struct nvme_request next = connect;
+	struct nvme_urma_qpair *next_q = cross_qpair ? &admin : &io;
+	int next_fd = cross_qpair ? admin_fds[1] : io_fds[1];
+	if (!cross_qpair) {
+		next.cmd.opc = SPDK_NVME_OPC_READ;
+		next.payload.size = 512;
+	}
+	int rc = nvme_urma_qpair_submit_request(&next_q->qpair, &next);
+	if (rc != 0) {
+		fprintf(stderr,
+			"RED: qid=1 Connect retained its 4KB grant; %s "
+			"at the same VA rejected rc=%d\n",
+			cross_qpair ? "another qpair's Connect" : "qid=1 READ(512B)", rc);
+		abort();
+	}
+	assert(duplicate_rejections == 0);
+	assert(unregistrations == base_unreg + 1 && callback_unreg == base_unreg + 1);
+	assert(!nvme_urma_reg_cache_lookup(&io, buffer, 1024));
+	assert(recv(next_fd, &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	complete_request(next_q, &next, false);
+	if (cross_qpair) {
+		assert(unregistrations == base_unreg + 2 && callback_unreg == base_unreg + 2);
+		assert(!nvme_urma_reg_cache_lookup(&admin, buffer, 1024));
+	} else {
+		/* Only transient Connect changed. Keep the ordinary READ grant cached. */
+		struct nvme_urma_reg_entry *entry = nvme_urma_reg_cache_lookup(&io, buffer, 512);
+		assert(entry && entry->refcount == 0);
+		assert(unregistrations == base_unreg + 1);
+		assert(nvme_urma_qpair_submit_request(&io.qpair, &next) == 0);
+		assert(registrations == base_reg + 2);
+		assert(recv(io_fds[1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+		complete_request(&io, &next, false);
+		assert(entry->refcount == 0 && unregistrations == base_unreg + 1);
+	}
+	cleanup(&io);
+	cleanup(&admin);
+	assert(registrations == base_reg + 2 && unregistrations == base_unreg + 2);
+	reject_duplicate = false;
+	free(buffer);
+	close(io_fds[0]);
+	close(io_fds[1]);
+	close(admin_fds[0]);
+	close(admin_fds[1]);
+	puts(cross_qpair ? "PASS bond I/O Connect -> another Admin Connect: shared-context VA reuse"
+			 : "PASS bond I/O Connect -> 512B READ: temporary grant released; READ "
+			   "cache retained");
+}
+
 int
 main(void)
 {
+	bond_io_connect_lifetime_test(false);
+	bond_io_connect_lifetime_test(true);
 	bond_admin_lifecycle_test();
 	identify_test(true);
 	identify_test(false);

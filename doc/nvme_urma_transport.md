@@ -819,3 +819,26 @@ Admin cache reuse and bonding I/O cache reuse. This models the duplicate-grant
 contract; it does not emulate the ARM provider or establish which earlier grant
 occupied the range in the recorded cluster. Rebuild the initiator library and
 relink the Mooncake master before validating the next attach.
+
+## 19. Fabrics Connect is transient on I/O queues too (2026-11-24)
+
+The request-owned registration rule also applies to Fabrics Connect
+(`opcode=0x7f, fctype=1`) on every bonding qpair. Admin-only gating missed the
+1KB Connect buffer on I/O queues: a following 512B READ at the same page misses
+its `(va, length)` cache entry and tries to grant the same 4KB range again.
+Another controller sharing the device context can encounter the cached grant
+as well. The Connect allocation is freed by the common fabrics cleanup for
+both Admin and I/O queues, so its registration must not remain cached in either.
+
+Ordinary I/O payloads still use the cache; external registry regions still
+retain application ownership. Raw device policy is unchanged. The existing
+`admin_region_ready`/`admin_region_release` diagnostic names are retained and
+now include I/O Connect with the actual qid instead of hard-coded qid=0.
+The segment token printed there is not a direct physical pctx TID observation.
+
+The submit regression exercises I/O Connect completion followed by same-address
+512B READ and by another qpair's Connect. Both fail with -EINVAL under the old
+Admin-only policy; both pass after the fix. It also verifies repeated ordinary
+READs continue to reuse their cached region. As before, the provider fixture
+models duplicate-grant semantics and does not prove ownership of a particular
+live UMMU table record.

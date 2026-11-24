@@ -447,7 +447,19 @@ nvme_urma_reg_cache_release(struct nvme_urma_reg_entry *entry)
 	}
 }
 
-/* Attach provenance is limited to bonding Admin payloads. Embedded Mooncake
+/* Fabrics Connect owns a temporary DMA buffer on every qpair, not only qid 0.
+ * A completed I/O Connect must not leave its page grant in the steady I/O cache. */
+static bool
+nvme_urma_request_has_transient_payload(const struct nvme_urma_qpair *uqpair,
+				      const struct nvme_request *req)
+{
+	return strncmp(uqpair->device->dev_name, "bonding", 7) == 0 &&
+	       (uqpair->qpair.id == 0 ||
+		(req->cmd.opc == SPDK_NVME_OPC_FABRIC &&
+		 SPDK_URMA_DIAG_FCTYPE(req->cmd.opc, &req->cmd) == SPDK_NVMF_FABRIC_COMMAND_CONNECT));
+}
+
+/* Attach provenance is limited to bonding Admin/Connect payloads. Embedded Mooncake
  * filters SPDK NOTICE, so these records use stderr without labelling successful
  * registrations as errors. Preserve errno around the diagnostic sink. */
 static void
@@ -458,17 +470,17 @@ nvme_urma_admin_region_diag(struct nvme_urma_qpair *uqpair, struct nvme_urma_req
 	urma_target_seg_t *tseg;
 	int saved_errno;
 
-	if (uqpair->qpair.id != 0 || ureq->region == NULL ||
-	    strncmp(uqpair->device->dev_name, "bonding", 7) != 0) {
+	if (ureq->region == NULL || !nvme_urma_request_has_transient_payload(uqpair, req)) {
 		return;
 	}
 	tseg = spdk_urma_memory_region_get_tseg(ureq->region);
 	saved_errno = errno;
 	fprintf(stderr, "URMA_DIAG role=initiator stage=%s reason=%s owner=%p context=%p "
-			"device=%s qid=0 cid=%u opcode=%u fctype=%u addr=%p data_len=%u "
+			"device=%s qid=%u cid=%u opcode=%u fctype=%u addr=%p data_len=%u "
 			"grant_addr=0x%" PRIx64 " grant_length=%" PRIu64 " region=%p "
 			"segment_token_id=%u external=%u cached=%u\n", stage, reason, uqpair,
-			uqpair->device->context, uqpair->device->dev_name, req->cmd.cid, req->cmd.opc,
+			uqpair->device->context, uqpair->device->dev_name, uqpair->qpair.id,
+			req->cmd.cid, req->cmd.opc,
 			SPDK_URMA_DIAG_FCTYPE(req->cmd.opc, &req->cmd),
 			(void *)((uintptr_t)req->payload.contig_or_cb_arg + req->payload.offset),
 			req->payload.size, (uint64_t)tseg->seg.ubva.va, (uint64_t)tseg->seg.len,
@@ -1052,12 +1064,13 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 			 * Keeping a 1KB cache entry while its 4KB grant remains live makes a
 			 * later 4KB Identify at the same VA miss this cache and re-grant the
 			 * same range. Bond pctxs reuse a TID and reject that duplicate grant.
-			 * Keep transient bond Admin registrations request-owned; completion,
+			 * Fabrics Connect uses the same temporary buffer on I/O qpairs too;
+			 * caching it can block a later 512B probe READ or another controller.
+			 * Keep bond Admin/Connect registrations request-owned; completion,
 			 * submit failure and abort already unregister uncached regions before
 			 * invoking callbacks that can free/reuse the DMA buffer. External
 			 * registry regions above retain their application-owned lifetime. */
-			bool cache_registration = qpair->id != 0 ||
-					  strncmp(uqpair->device->dev_name, "bonding", 7) != 0;
+			bool cache_registration = !nvme_urma_request_has_transient_payload(uqpair, req);
 
 			if (cache_registration) {
 				entry = nvme_urma_reg_cache_lookup(uqpair, addr, req->payload.size);
@@ -1078,7 +1091,7 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 					ureq->cache_entry = nvme_urma_reg_cache_insert(uqpair, addr,
 							req->payload.size, ureq->region);
 				}
-				/* An uncached region (bond Admin or full cache) is released by
+				/* An uncached region (bond Admin/Connect or full cache) is released by
 				 * the request's completion, submit-error or abort cleanup. */
 				uint64_t t_reg1 = spdk_get_ticks();
 				__atomic_add_fetch(&g_timing.reg_ticks, t_reg1 - t_reg0, __ATOMIC_RELAXED);
