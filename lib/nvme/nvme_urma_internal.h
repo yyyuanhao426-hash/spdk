@@ -262,6 +262,10 @@ urma_target_seg_t *spdk_urma_memory_region_get_tseg(
  * I/O 缓冲的 region，跳过 per-I/O register。按共享 urma_context 键控。 */
 int spdk_nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
 				  struct spdk_nvme_urma_memory_region *region);
+/* Acquire one owner reference to an exact whole-pool registration. */
+int spdk_urma_register_memory_pool(void *urma_context, void *addr, size_t length,
+			       enum spdk_nvme_urma_memory_type type,
+			       struct spdk_nvme_urma_memory_region **region);
 void spdk_nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region);
 struct spdk_nvme_urma_memory_region *
 spdk_nvme_urma_region_registry_find(void *urma_context, uint64_t addr, size_t length);

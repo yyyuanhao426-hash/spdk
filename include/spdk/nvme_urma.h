@@ -85,8 +85,12 @@ int spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length
  * carry the region-wide segment descriptor so the peer can import the whole
  * pool once instead of per I/O.
  *
- * The region lives until spdk_nvme_unregister_memory() (which also removes it
- * from the registry); it must outlive every I/O touching its buffers.
+ * Calls with the same context, address, length and memory kind share one
+ * registration. Each successful call acquires one owner reference and must
+ * be paired with spdk_nvme_urma_unregister_memory(), even if multiple calls
+ * return the same handle. The last release unregisters the region and removes
+ * it from the registry. Owner references must outlive all I/Os touching the pool.
+ * The caller must keep the established qpair's context alive until release.
  */
 int spdk_nvme_urma_register_memory_for_qpair(struct spdk_nvme_qpair *qpair, void *addr,
 		size_t length, enum spdk_nvme_urma_memory_type type,

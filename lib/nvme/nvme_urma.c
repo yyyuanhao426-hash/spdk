@@ -386,21 +386,20 @@ spdk_nvme_urma_register_memory_for_qpair(struct spdk_nvme_qpair *qpair, void *ad
 		size_t length, enum spdk_nvme_urma_memory_type type,
 		struct spdk_nvme_urma_memory_region **region)
 {
-	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
-	int rc;
+	struct nvme_urma_qpair *uqpair;
 
+	if (region == NULL) {
+		return -EINVAL;
+	}
+	*region = NULL;
+	if (qpair == NULL) {
+		return -EINVAL;
+	}
+	uqpair = nvme_urma_qpair(qpair);
 	if (uqpair->device == NULL) {
 		return -ENXIO;
 	}
-	rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr, length, type, region);
-	if (rc == 0) {
-		rc = spdk_nvme_urma_region_registry_add(uqpair->device->context, addr, length, *region);
-		if (rc != 0) {
-			spdk_nvme_urma_unregister_memory(*region);
-			*region = NULL;
-		}
-	}
-	return rc;
+	return spdk_urma_register_memory_pool(uqpair->device->context, addr, length, type, region);
 }
 
 /* Modified By Yida: registration cache helpers */

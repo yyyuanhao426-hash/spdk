@@ -18,6 +18,9 @@ struct spdk_nvme_urma_memory_region {
 	uint8_t *seg_ctx;
 	size_t seg_ctx_length;
 	int seg_ctx_error;
+	/* Set before publishing a whole-pool region; immutable thereafter. */
+	bool shared_pool;
+	uint32_t pool_refs;
 };
 
 static pthread_mutex_t g_provider_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -637,6 +640,10 @@ struct nvme_urma_region_entry {
 static TAILQ_HEAD(, nvme_urma_region_entry) g_region_registry =
 	TAILQ_HEAD_INITIALIZER(g_region_registry);
 static pthread_mutex_t g_region_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Serialize whole-pool acquisition through the final provider ungrant.
+ * Lock order is pool -> registry. Ordinary temporary registrations do not
+ * acquire this mutex or gain shared ownership. */
+static pthread_mutex_t g_pool_registration_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int
 spdk_nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
@@ -876,12 +883,9 @@ fail_provider:
 	return rc;
 }
 
-void
-spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
+static void
+spdk_urma_memory_region_destroy(struct spdk_nvme_urma_memory_region *region)
 {
-	if (region == NULL) {
-		return;
-	}
 	/* Modified By Yida(v7): 整池 region 注销时同步移出注册表，防悬垂采纳 */
 	spdk_nvme_urma_region_registry_remove(region);
 	if (region->target_seg != NULL) {
@@ -900,6 +904,82 @@ spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 	}
 	free(region->seg_ctx);
 	free(region);
+}
+
+int
+spdk_urma_register_memory_pool(void *urma_context, void *addr, size_t length,
+			       enum spdk_nvme_urma_memory_type type,
+			       struct spdk_nvme_urma_memory_region **region_out)
+{
+	struct spdk_nvme_urma_memory_region *region;
+	struct nvme_urma_region_entry *entry;
+	uintptr_t start = (uintptr_t)addr;
+	int rc;
+
+	if (region_out == NULL) {
+		return -EINVAL;
+	}
+	*region_out = NULL;
+	if (urma_context == NULL || addr == NULL || length == 0 ||
+	    length > UINTPTR_MAX - start || (unsigned)type >= SPDK_URMA_PROVIDER_COUNT) {
+		return -EINVAL;
+	}
+	pthread_mutex_lock(&g_pool_registration_mutex);
+	pthread_mutex_lock(&g_region_registry_mutex);
+	TAILQ_FOREACH(entry, &g_region_registry, link) {
+		region = entry->region;
+		/* Exact application range and memory kind preserve the returned
+		 * handle's get_addr/get_length and provider-pinning semantics.
+		 * Registry find() is a borrowed I/O lookup, not an ownership acquire. */
+		if (entry->context == urma_context && entry->start == start &&
+		    entry->end == start + length && region->shared_pool && region->type == type) {
+			if (region->pool_refs == UINT32_MAX) {
+				rc = -EOVERFLOW;
+			} else {
+				region->pool_refs++;
+				*region_out = region;
+				rc = 0;
+			}
+			pthread_mutex_unlock(&g_region_registry_mutex);
+			pthread_mutex_unlock(&g_pool_registration_mutex);
+			return rc;
+		}
+	}
+	pthread_mutex_unlock(&g_region_registry_mutex);
+
+	rc = spdk_nvme_urma_register_memory(urma_context, addr, length, type, &region);
+	if (rc == 0) {
+		region->shared_pool = true;
+		region->pool_refs = 1;
+		rc = spdk_nvme_urma_region_registry_add(urma_context, addr, length, region);
+		if (rc == 0) {
+			*region_out = region;
+		} else {
+			spdk_urma_memory_region_destroy(region);
+		}
+	}
+	pthread_mutex_unlock(&g_pool_registration_mutex);
+	return rc;
+}
+
+void
+spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
+{
+	if (region == NULL) {
+		return;
+	}
+	if (!region->shared_pool) {
+		spdk_urma_memory_region_destroy(region);
+		return;
+	}
+	pthread_mutex_lock(&g_pool_registration_mutex);
+	assert(region->pool_refs > 0);
+	if (--region->pool_refs == 0) {
+		/* Keep the lock through ungrant: a concurrent acquire must not
+		 * register the same range while the previous grant is still live. */
+		spdk_urma_memory_region_destroy(region);
+	}
+	pthread_mutex_unlock(&g_pool_registration_mutex);
 }
 
 void *
