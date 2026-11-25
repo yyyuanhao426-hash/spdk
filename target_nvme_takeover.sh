@@ -64,6 +64,9 @@
 #   NOF_TARGET_RPC_SOCKET / NOF_TARGET_PIDFILE / NOF_TARGET_LOGFILE 隔离运行实例
 #   NOF_TARGET_NULL_BDEV_NAME 在 Null 模式下指定 bdev 名称
 #   NOF_TARGET_HUGE_DIR 指定 pagesize=2M 的 hugetlbfs 挂载（默认 /dev/hugepages）
+#   NOF_READ_CACHE_MIB=0 关闭；>0 为单 namespace 的普通内存缓存预算（MiB）
+#   NOF_READ_CACHE_MAX_IO_KIB=256 超过此大小的请求直通，不改变原有 I/O 拆分
+#   NOF_READ_CACHE_POPULATE_ON_WRITE=0；1 在 SSD 写成功后预热（非 write-back）
 #
 # 接管前会自动检测上一次运行残留（vfio-pci 占用或游离的 NVMe 盘）并还原回
 # nvme 驱动，确保本次是全新的 unbind + bind；-r 保留为手动补救入口。
@@ -108,6 +111,10 @@ RPC_SOCKET="${NOF_TARGET_RPC_SOCKET:-/var/tmp/spdk.sock}"
 HUGE_DIR="${NOF_TARGET_HUGE_DIR:-/dev/hugepages}"
 HUGEPAGES_MODE="${NOF_HUGEPAGES_MODE:-allocate}"
 SKIP_VFIO_RESTORE="${NOF_SKIP_VFIO_RESTORE:-0}"
+READ_CACHE_MIB="${NOF_READ_CACHE_MIB:-0}"
+READ_CACHE_MAX_IO_KIB="${NOF_READ_CACHE_MAX_IO_KIB:-256}"
+READ_CACHE_POPULATE_ON_WRITE="${NOF_READ_CACHE_POPULATE_ON_WRITE:-0}"
+READ_CACHE_ENABLED="${NOF_READ_CACHE_ENABLED:-1}"
 
 # 找正在运行的 SPDK target 进程。必须按 /proc/PID/exe 的真实可执行文件判断：
 #   pgrep -f 'bin/nvmf_tgt' 会匹配"命令行里含该字符串"的任何进程（包括
@@ -191,6 +198,26 @@ case "$SKIP_VFIO_RESTORE" in
     0|1) ;;
     *) abort "NOF_SKIP_VFIO_RESTORE 只能是 0 或 1" ;;
 esac
+
+validate_readcache_config() {
+    [[ "$READ_CACHE_MIB" =~ ^(0|[1-9][0-9]{0,6})$ ]] &&
+        (( READ_CACHE_MIB <= 1048576 )) || abort "NOF_READ_CACHE_MIB 必须为 0..1048576"
+    [[ "$READ_CACHE_MAX_IO_KIB" =~ ^[1-9][0-9]{0,4}$ ]] &&
+        (( READ_CACHE_MAX_IO_KIB >= 4 && READ_CACHE_MAX_IO_KIB <= 65536 )) ||
+        abort "NOF_READ_CACHE_MAX_IO_KIB 必须为 4..65536"
+    case "$READ_CACHE_POPULATE_ON_WRITE" in
+        0|1) ;;
+        *) abort "NOF_READ_CACHE_POPULATE_ON_WRITE 必须为 0 或 1" ;;
+    esac
+    case "$READ_CACHE_ENABLED" in
+        0|1) ;;
+        *) abort "NOF_READ_CACHE_ENABLED 必须为 0 或 1" ;;
+    esac
+    if (( READ_CACHE_MIB > 0 && NULL_BDEV_MODE != 0 )); then
+        abort "readcache 实验需要真实 SSD，不能与 Null bdev 同用"
+    fi
+}
+validate_readcache_config
 
 [ "$(id -u)" -eq 0 ] || abort "必须以 root 运行（sysfs 绑定 + hugepages + 启动 nvmf_tgt）"
 
@@ -412,6 +439,12 @@ for _idx in "${!DISK_LIST[@]}"; do
 done
 else
     BASE_BDEVS+=("$NULL_BDEV_NAME")
+fi
+
+if (( READ_CACHE_MIB > 0 )); then
+    if (( RAID0_STRIP < 0 && ${#DISK_LIST[@]} != 1 )); then
+        abort "readcache 首版需要单 namespace：选择一块 SSD，或使用 -R 聚合 RAID0"
+    fi
 fi
 
 echo
@@ -700,6 +733,25 @@ run_rpc() {
     fi
 }
 
+add_nof_namespace() {
+    local base_bdev="$1" nsid="$2" export_bdev="$1"
+    local cache_args=()
+    if (( READ_CACHE_MIB > 0 )); then
+        export_bdev="NoFReadCache${nsid}"
+        cache_args=("$base_bdev" "$export_bdev" "$((READ_CACHE_MIB * 1048576))"
+            --max-io-bytes "$((READ_CACHE_MAX_IO_KIB * 1024))")
+        if [[ "$READ_CACHE_POPULATE_ON_WRITE" == 1 ]]; then
+            cache_args+=(--populate-on-write)
+        fi
+        if [[ "$READ_CACHE_ENABLED" == 0 ]]; then
+            cache_args+=(--disabled)
+        fi
+        run_rpc bdev_readcache_create "${cache_args[@]}"
+        info "readcache: $export_bdev -> $base_bdev，预算 ${READ_CACHE_MIB} MiB 普通内存"
+    fi
+    run_rpc nvmf_subsystem_add_ns "$NQN" "$export_bdev" -n "$nsid"
+}
+
 if [ -n "$IOBUF_SPEC" ]; then
     echo "=== 6) 配置 iobuf 池（startup 窗口） ==="
     run_rpc iobuf_set_options \
@@ -753,12 +805,12 @@ if [ "$RAID0_STRIP" -ge 0 ]; then
     _raid_args=(-n "$RAID_NAME" -r raid0 -b "$_bases")
     [ "$RAID0_STRIP" -gt 0 ] && _raid_args+=(-z "$RAID0_STRIP")
     run_rpc bdev_raid_create "${_raid_args[@]}"
-    run_rpc nvmf_subsystem_add_ns "$NQN" "$RAID_NAME" -n 1
+    add_nof_namespace "$RAID_NAME" 1
     info "namespace: $RAID_NAME（raid0，成员: $_bases）→ nsid 1"
 else
     # 多 namespace：每盘一个 bdev，nsid 依次 1..N（同一 subsystem 内 nsid 必须唯一）
     for _idx in "${!BASE_BDEVS[@]}"; do
-        run_rpc nvmf_subsystem_add_ns "$NQN" "${BASE_BDEVS[$_idx]}" -n $((_idx + 1))
+        add_nof_namespace "${BASE_BDEVS[$_idx]}" $((_idx + 1))
     done
 fi
 run_rpc nvmf_subsystem_add_listener "$NQN" -t URMA -f IPv4 -a "$LISTEN_IP" -s "$LISTEN_PORT"

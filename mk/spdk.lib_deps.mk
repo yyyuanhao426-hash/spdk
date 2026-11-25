@@ -157,6 +157,7 @@ DEPDIRS-bdev_null := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_nvme = $(BDEV_DEPS_THREAD) accel dma keyring nvme trace
 DEPDIRS-bdev_ocf := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_passthru := $(BDEV_DEPS_THREAD)
+DEPDIRS-bdev_readcache := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_raid := $(BDEV_DEPS_THREAD) dma trace
 ifeq ($(CONFIG_RAID5F),y)
 DEPDIRS-bdev_raid += accel

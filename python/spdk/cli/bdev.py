@@ -13,6 +13,52 @@ from spdk.rpc.cmd_parser import print_array, print_dict, print_json
 
 def add_parser(subparsers):
 
+    def bdev_readcache_create(args):
+        print_json(args.client.bdev_readcache_create(
+            base_bdev_name=args.base_bdev_name, name=args.name,
+            capacity_bytes=args.capacity_bytes, max_io_bytes=args.max_io_bytes,
+            populate_on_write=args.populate_on_write, enabled=not args.disabled))
+
+    p = subparsers.add_parser('bdev_readcache_create', help='Create a bounded host read cache bdev')
+    p.add_argument('base_bdev_name')
+    p.add_argument('name')
+    p.add_argument('capacity_bytes', type=int, help='Total cache allocation budget in bytes')
+    p.add_argument('--max-io-bytes', type=int, default=256 * 1024,
+                   help='Requests larger than this bypass the cache')
+    p.add_argument('--populate-on-write', action='store_true',
+                   help='Populate cache only after a successful, non-conflicting backend write')
+    p.add_argument('--disabled', action='store_true', help='Create wrapper in bypass mode')
+    p.set_defaults(func=bdev_readcache_create)
+
+    def bdev_readcache_delete(args):
+        print_json(args.client.bdev_readcache_delete(name=args.name))
+
+    p = subparsers.add_parser('bdev_readcache_delete', help='Delete a read cache bdev')
+    p.add_argument('name')
+    p.set_defaults(func=bdev_readcache_delete)
+
+    def bdev_readcache_get_stats(args):
+        print_dict(args.client.bdev_readcache_get_stats(name=args.name))
+
+    p = subparsers.add_parser('bdev_readcache_get_stats', help='Get read cache statistics')
+    p.add_argument('name')
+    p.set_defaults(func=bdev_readcache_get_stats)
+
+    def bdev_readcache_set_options(args):
+        print_json(args.client.bdev_readcache_set_options(
+            name=args.name, enabled=args.enabled, capacity_bytes=args.capacity_bytes,
+            populate_on_write=args.populate_on_write,
+            clear=args.clear, reset_stats=args.reset_stats))
+
+    p = subparsers.add_parser('bdev_readcache_set_options', help='Configure a read cache online')
+    p.add_argument('name')
+    p.add_argument('--enabled', action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument('--capacity-bytes', type=int)
+    p.add_argument('--populate-on-write', action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument('--clear', action='store_true')
+    p.add_argument('--reset-stats', action='store_true')
+    p.set_defaults(func=bdev_readcache_set_options)
+
     def bdev_set_options(args):
         args.client.bdev_set_options(
                                   bdev_io_pool_size=args.bdev_io_pool_size,
