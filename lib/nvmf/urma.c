@@ -723,8 +723,8 @@ nvmf_urma_rsp_tx_pool_init(struct nvmf_urma_qpair *uqpair)
 	if (uqpair->capsule_tx_count == 0) {
 		return -EINVAL;
 	}
-	uqpair->capsule_tx_slots = calloc(uqpair->capsule_tx_count,
-					  sizeof(*uqpair->capsule_tx_slots));
+	uqpair->capsule_tx_slots = spdk_urma_alloc_capsule_slots(uqpair->capsule_tx_count,
+							 sizeof(*uqpair->capsule_tx_slots));
 	if (uqpair->capsule_tx_slots == NULL) {
 		return -ENOMEM;
 	}
@@ -804,7 +804,7 @@ nvmf_urma_capsule_rx_post(struct nvmf_urma_qpair *uqpair, uint32_t count)
 		return -EINVAL;
 	}
 	uqpair->capsule_rx_count = count;
-	uqpair->capsule_rx_slots = calloc(count, sizeof(*uqpair->capsule_rx_slots));
+	uqpair->capsule_rx_slots = spdk_urma_alloc_capsule_slots(count, sizeof(*uqpair->capsule_rx_slots));
 	if (uqpair->capsule_rx_slots == NULL) {
 		uqpair->capsule_rx_count = 0;
 		return -ENOMEM;
@@ -855,9 +855,9 @@ nvmf_urma_capsule_resources_init(struct nvmf_urma_qpair *uqpair)
 {
 	int rc;
 
-	/* Keep the original ordering: allocate/register the TX pool before any
-	 * receive WR is posted, so a partial-init failure cannot leave a posted
-	 * WR naming memory that teardown is about to release. */
+	/* HELLO may already have posted RX. Initialize TX before the idempotent
+	 * RX fallback here; failures must still follow qpair drain because any
+	 * previously posted receives retain their slot/qpair lifetime references. */
 	rc = nvmf_urma_rsp_tx_pool_init(uqpair);
 	if (rc != 0) {
 		return rc;

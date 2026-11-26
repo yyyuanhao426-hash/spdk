@@ -254,6 +254,10 @@ int spdk_urma_device_poll_recv_jfc_locked(struct spdk_urma_device *device, uint3
 void spdk_urma_device_lock_recv_jfcs(struct spdk_urma_device *device);
 void spdk_urma_device_unlock_recv_jfcs(struct spdk_urma_device *device);
 uint8_t spdk_urma_memory_chip_id(const void *addr);
+/* Capsule slot arrays own complete host/grant pages. Register the logical
+ * count * slot_size bytes; free() only after unregister and WR/CR drain.
+ * Unlike DMA/iobuf allocations these are ordinary zeroed host allocations. */
+void *spdk_urma_alloc_capsule_slots(size_t count, size_t slot_size);
 urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 	struct spdk_nvme_urma_memory_region *region);
 

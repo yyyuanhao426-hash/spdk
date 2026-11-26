@@ -8,6 +8,9 @@
 
 int bdev_readcache_create(const char *base_name, const char *name, uint64_t capacity,
 			  uint64_t max_io, bool populate_on_write);
+int bdev_readcache_create_ext(const char *base_name, const char *name, uint64_t capacity,
+			      uint64_t max_io, bool populate_on_write,
+			      const struct writeback_options *writeback);
 void bdev_readcache_delete(const char *name, spdk_bdev_unregister_cb cb, void *arg);
 int bdev_readcache_get_stats(const char *name, struct readcache_stats *stats);
 int bdev_readcache_set_options(const char *name, const struct readcache_options *options);

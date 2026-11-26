@@ -4,6 +4,8 @@
 #include "spdk/thread.h"
 #include "spdk/json.h"
 #include "spdk/log.h"
+#include "spdk/env.h"
+#include "spdk/nvme_spec.h"
 #include "vbdev_readcache.h"
 
 struct readcache_bdev {
@@ -12,6 +14,7 @@ struct readcache_bdev {
 	struct spdk_bdev *base;
 	struct spdk_thread *open_thread;
 	struct readcache *cache;
+	struct writeback *writeback;
 	atomic_bool populate_on_write;
 	bool destructing;
 	atomic_bool channels_gone;
@@ -26,6 +29,9 @@ struct readcache_io {
 	struct readcache_mutation mutation;
 	struct spdk_bdev_io_wait_entry wait;
 	bool mutating;
+	bool gated;
+	bool fua_flush;
+	struct writeback_node gate;
 	TAILQ_ENTRY(readcache_io) link;
 };
 
@@ -33,10 +39,46 @@ struct readcache_channel {
 	struct spdk_io_channel *base_ch;
 	struct spdk_poller *poller;
 	TAILQ_HEAD(, readcache_io) pending;
+	TAILQ_HEAD(, readcache_io) gated;
+	TAILQ_HEAD(, readcache_background) background;
+};
+
+/* Never retain a foreground bdev_io, CID, qpair, or its iobuf after ACK. The
+ * extra wrapper channel reference keeps both device and base channel alive. */
+struct readcache_background {
+	struct readcache_bdev *dev;
+	struct spdk_io_channel *channel;
+	struct writeback_node gate;
+	struct readcache_mutation mutation;
+	struct spdk_bdev_io_wait_entry wait;
+	struct iovec iov;
+	bool submitted, mutating;
+	TAILQ_ENTRY(readcache_background) link;
 };
 
 static TAILQ_HEAD(, readcache_bdev) g_readcache = TAILQ_HEAD_INITIALIZER(g_readcache);
 static void readcache_submit_base(struct spdk_bdev_io *bio);
+static struct readcache_bdev *readcache_device(struct spdk_bdev_io *bio);
+static void readcache_start(struct readcache_io *io);
+static void readcache_background_submit(void *arg);
+
+static uint64_t
+readcache_now_us(void)
+{
+	uint64_t ticks = spdk_get_ticks(), hz = spdk_get_ticks_hz();
+
+	return ticks / hz * 1000000 + ticks % hz * 1000000 / hz;
+}
+
+static void
+readcache_gate_done(struct readcache_io *io, bool success)
+{
+	if (io->gated) {
+		writeback_leave(readcache_device(io->bio)->writeback, &io->gate, success,
+				readcache_now_us());
+		io->gated = false;
+	}
+}
 
 static int
 readcache_module_init(void)
@@ -98,6 +140,7 @@ readcache_finish_local(struct readcache_io *io)
 	/* Copy into the request's original iobuf. Cache memory is never exposed to
 	 * URMA or returned to the iobuf allocator; normal data-CQE ownership remains. */
 	readcache_release(dev->cache, &io->token);
+	readcache_gate_done(io, success);
 	spdk_bdev_io_complete(bio,
 			      success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED);
 }
@@ -107,7 +150,29 @@ readcache_poll(void *arg)
 {
 	struct readcache_channel *ch = arg;
 	struct readcache_io *io, *next;
+	struct readcache_background *bg, *bg_next;
 	int count = 0;
+	int rc;
+
+	for (bg = TAILQ_FIRST(&ch->background); bg != NULL; bg = bg_next) {
+		bg_next = TAILQ_NEXT(bg, link);
+		if (!bg->submitted && writeback_ready(bg->dev->writeback, &bg->gate,
+						     readcache_now_us()) != 0) {
+			bg->submitted = true;
+			readcache_background_submit(bg);
+			count++;
+		}
+	}
+	for (io = TAILQ_FIRST(&ch->gated); io != NULL; io = next) {
+		next = TAILQ_NEXT(io, link);
+		rc = writeback_ready(readcache_device(io->bio)->writeback, &io->gate,
+				     readcache_now_us());
+		if (rc != 0) {
+			TAILQ_REMOVE(&ch->gated, io, link);
+			readcache_start(io);
+			count++;
+		}
+	}
 
 	/* Each waiter is completed on its own channel's SPDK thread. The core only
 	 * publishes ready flags, so cross-reactor reads require no message allocation. */
@@ -148,12 +213,175 @@ readcache_end_io(struct spdk_bdev_io *bio, bool success)
 					       readcache_host_buffers(bio));
 		io->mutating = false;
 	}
+	readcache_gate_done(io, success);
+}
+
+static void
+readcache_background_finish(struct readcache_background *bg, bool success)
+{
+	struct readcache_bdev *dev = bg->dev;
+	struct spdk_io_channel *channel = bg->channel;
+	struct readcache_channel *ch = spdk_io_channel_get_ctx(channel);
+	uint64_t charge = bg->gate.charge;
+
+	if (bg->mutating) {
+		/* W2 publishes its committed payload even when R1 warming is off. */
+		readcache_end_mutation(dev->cache, &bg->mutation, &bg->iov, 1, success);
+	}
+	if (!success) {
+		readcache_record_io_error(dev->cache);
+		SPDK_ERRLOG("readcache %s: asynchronous write sequence %" PRIu64
+			    " failed; namespace requires a new experiment generation\n",
+			    dev->bdev.name, bg->gate.sequence);
+	}
+	TAILQ_REMOVE(&ch->background, bg, link);
+	spdk_dma_free(bg->iov.iov_base);
+	/* Keep the range reservation through cache publication and DMA release. */
+	writeback_leave(dev->writeback, &bg->gate, success, readcache_now_us());
+	free(bg);
+	writeback_unreserve(dev->writeback, charge);
+	spdk_put_io_channel(channel);
+}
+
+static void
+readcache_background_done(struct spdk_bdev_io *base, bool success, void *arg)
+{
+	spdk_bdev_free_io(base);
+	readcache_background_finish(arg, success);
+}
+
+static void
+readcache_background_submit(void *arg)
+{
+	struct readcache_background *bg = arg;
+	struct readcache_bdev *dev = bg->dev;
+	struct readcache_channel *ch = spdk_io_channel_get_ctx(bg->channel);
+	struct spdk_bdev_ext_io_opts opts = {.size = sizeof(opts)};
+	int rc;
+
+	if (writeback_ready(dev->writeback, &bg->gate, readcache_now_us()) < 0) {
+		readcache_background_finish(bg, false);
+		return;
+	}
+	if (!bg->mutating) {
+		readcache_begin_mutation(dev->cache, bg->gate.offset, bg->gate.length,
+					 &bg->mutation);
+		bg->mutating = true;
+	}
+	rc = spdk_bdev_writev_blocks_ext(dev->desc, ch->base_ch, &bg->iov, 1,
+					 bg->gate.offset / dev->bdev.blocklen,
+					 bg->gate.length / dev->bdev.blocklen,
+					 readcache_background_done, bg, &opts);
+	if (rc == 0) {
+		return;
+	}
+	if (rc == -ENOMEM) {
+		bg->wait.bdev = dev->base;
+		bg->wait.cb_fn = readcache_background_submit;
+		bg->wait.cb_arg = bg;
+		if (spdk_bdev_queue_io_wait(dev->base, ch->base_ch, &bg->wait) == 0) {
+			return;
+		}
+	}
+	readcache_background_finish(bg, false);
+}
+
+static bool
+readcache_early_write(struct readcache_io *io)
+{
+	struct spdk_bdev_io *bio = io->bio;
+	struct readcache_bdev *dev = readcache_device(bio);
+	struct readcache_background *bg;
+	struct readcache_channel *ch = spdk_io_channel_get_ctx(io->ch);
+	uint64_t length, copied = 0, charge, alloc_size;
+	size_t align = (size_t)1 << dev->bdev.required_alignment;
+	int i;
+
+	/* FUA and all other flags/remote buffers retain their exact strict path. */
+	if (bio->type != SPDK_BDEV_IO_TYPE_WRITE || !readcache_host_buffers(bio) ||
+	    (bio->u.bdev.nvme_cdw12.raw & SPDK_NVME_IO_FLAGS_CDW12_MASK) ||
+	    bio->u.bdev.nvme_cdw13.raw) {
+		return false;
+	}
+	length = readcache_length(bio);
+	if (!length) {
+		return false;
+	}
+	align = spdk_max(align, (size_t)4096);
+	if (length > SIZE_MAX - align - sizeof(*bg)) {
+		return false;
+	}
+	alloc_size = (length + align - 1) / align * align;
+	charge = sizeof(*bg) + alloc_size;
+	if (!writeback_reserve(dev->writeback, charge, readcache_now_us())) {
+		return false;
+	}
+	bg = calloc(1, sizeof(*bg));
+	if (!bg) {
+		goto unreserve;
+	}
+	bg->iov.iov_base = spdk_dma_malloc(alloc_size, align, NULL);
+	if (!bg->iov.iov_base) {
+		goto free_bg;
+	}
+	bg->iov.iov_len = length;
+	for (i = 0; i < bio->u.bdev.iovcnt && copied < length; i++) {
+		size_t n = spdk_min(bio->u.bdev.iovs[i].iov_len, length - copied);
+
+		if (n && !bio->u.bdev.iovs[i].iov_base) {
+			goto free_dma;
+		}
+		if (n) {
+			memcpy((char *)bg->iov.iov_base + copied, bio->u.bdev.iovs[i].iov_base, n);
+		}
+		copied += n;
+	}
+	if (copied != length) {
+		goto free_dma;
+	}
+	bg->channel = spdk_io_channel_ref(io->ch);
+	if (!bg->channel) {
+		goto free_dma;
+	}
+	assert(bg->channel == io->ch);
+	bg->dev = dev;
+	if (!writeback_enter(dev->writeback, &bg->gate, readcache_offset(bio), length, true, false,
+			     charge, readcache_now_us())) {
+		spdk_put_io_channel(bg->channel);
+		goto free_dma;
+	}
+	TAILQ_INSERT_TAIL(&ch->background, bg, link);
+	/* The channel poller submits independently on its next turn. No background
+	 * callback can ever access or complete bio after this completion. */
+	spdk_bdev_io_complete(bio, SPDK_BDEV_IO_STATUS_SUCCESS);
+	return true;
+free_dma:
+	spdk_dma_free(bg->iov.iov_base);
+free_bg:
+	free(bg);
+unreserve:
+	writeback_unreserve(dev->writeback, charge);
+	return false;
 }
 
 static void
 readcache_base_done(struct spdk_bdev_io *base_io, bool success, void *arg)
 {
 	struct spdk_bdev_io *bio = arg;
+	struct readcache_io *io = (void *)bio->driver_ctx;
+	struct readcache_bdev *dev = readcache_device(bio);
+
+	/* This fork's NVMe bdev consumes CDW12 directive bits, but does not map
+	 * its FUA bit into NVMe io_flags (RAID may drop it too). In W2, enforce
+	 * FUA by completing a real base Flush after the strict write. Hold the
+	 * mutation and range reservation through both operations and retries. */
+	if (success && dev->writeback && bio->type == SPDK_BDEV_IO_TYPE_WRITE &&
+	    (bio->u.bdev.nvme_cdw12.raw & SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS) && !io->fua_flush) {
+		spdk_bdev_free_io(base_io);
+		io->fua_flush = true;
+		readcache_submit_base(bio);
+		return;
+	}
 
 	readcache_end_io(bio, success);
 	spdk_bdev_io_complete_base_io_status(bio, base_io);
@@ -193,6 +421,11 @@ readcache_submit_base(struct spdk_bdev_io *bio)
 		opts.nvme_cdw13 = bio->u.bdev.nvme_cdw13;
 	}
 
+	if (io->fua_flush) {
+		rc = spdk_bdev_flush_blocks(dev->desc, ch->base_ch, offset, length,
+					    readcache_base_done, bio);
+		goto submitted;
+	}
 	switch (bio->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 		rc = spdk_bdev_readv_blocks_ext(dev->desc, ch->base_ch, bio->u.bdev.iovs,
@@ -223,6 +456,7 @@ readcache_submit_base(struct spdk_bdev_io *bio)
 		rc = -ENOTSUP;
 		break;
 	}
+submitted:
 	if (rc == 0) {
 		return;
 	}
@@ -249,6 +483,7 @@ readcache_read_ready(struct spdk_io_channel *channel, struct spdk_bdev_io *bio, 
 
 	if (!success) {
 		readcache_record_io_error(dev->cache);
+		readcache_gate_done(io, false);
 		spdk_bdev_io_complete(bio, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
@@ -270,15 +505,17 @@ readcache_read_ready(struct spdk_io_channel *channel, struct spdk_bdev_io *bio, 
 }
 
 static void
-readcache_submit(struct spdk_io_channel *channel, struct spdk_bdev_io *bio)
+readcache_start(struct readcache_io *io)
 {
-	struct readcache_io *io = (void *)bio->driver_ctx;
+	struct spdk_bdev_io *bio = io->bio;
 	struct readcache_bdev *dev = readcache_device(bio);
 	uint64_t offset, length;
 
-	memset(io, 0, sizeof(*io));
-	io->bio = bio;
-	io->ch = channel;
+	if (io->gated && writeback_ready(dev->writeback, &io->gate, readcache_now_us()) < 0) {
+		readcache_end_io(bio, false);
+		spdk_bdev_io_complete(bio, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
 	if (bio->type == SPDK_BDEV_IO_TYPE_READ) {
 		spdk_bdev_io_get_buf(bio, readcache_read_ready, readcache_length(bio));
 		return;
@@ -297,6 +534,33 @@ readcache_submit(struct spdk_io_channel *channel, struct spdk_bdev_io *bio)
 		break;
 	}
 	readcache_submit_base(bio);
+}
+
+static void
+readcache_submit(struct spdk_io_channel *channel, struct spdk_bdev_io *bio)
+{
+	struct readcache_io *io = (void *)bio->driver_ctx;
+	struct readcache_bdev *dev = readcache_device(bio);
+	struct readcache_channel *ch = spdk_io_channel_get_ctx(channel);
+	bool global = bio->type == SPDK_BDEV_IO_TYPE_RESET || bio->type == SPDK_BDEV_IO_TYPE_FLUSH;
+
+	memset(io, 0, sizeof(*io));
+	io->bio = bio;
+	io->ch = channel;
+	if (dev->writeback) {
+		if (readcache_early_write(io)) {
+			return;
+		}
+		writeback_enter(dev->writeback, &io->gate, global ? 0 : readcache_offset(bio),
+				global ? UINT64_MAX : readcache_length(bio),
+				bio->type != SPDK_BDEV_IO_TYPE_READ, global, 0, readcache_now_us());
+		io->gated = true;
+		if (writeback_ready(dev->writeback, &io->gate, readcache_now_us()) == 0) {
+			TAILQ_INSERT_TAIL(&ch->gated, io, link);
+			return;
+		}
+	}
+	readcache_start(io);
 }
 
 static bool
@@ -332,6 +596,8 @@ readcache_channel_create(void *ctx, void *buf)
 	struct readcache_channel *ch = buf;
 
 	TAILQ_INIT(&ch->pending);
+	TAILQ_INIT(&ch->gated);
+	TAILQ_INIT(&ch->background);
 	ch->base_ch = spdk_bdev_get_io_channel(dev->desc);
 	if (ch->base_ch == NULL) {
 		return -ENOMEM;
@@ -350,6 +616,8 @@ readcache_channel_destroy(void *ctx, void *buf)
 	struct readcache_channel *ch = buf;
 
 	assert(TAILQ_EMPTY(&ch->pending));
+	assert(TAILQ_EMPTY(&ch->gated));
+	assert(TAILQ_EMPTY(&ch->background));
 	spdk_poller_unregister(&ch->poller);
 	spdk_put_io_channel(ch->base_ch);
 }
@@ -365,6 +633,9 @@ readcache_unregister_done(void *ctx)
 	if (rc != 0) {
 		/* Never release an owner while its cache still has live references. */
 		return;
+	}
+	if (dev->writeback) {
+		writeback_destroy(dev->writeback);
 	}
 	if (dev->destructing) {
 		spdk_bdev_destruct_done(&dev->bdev, 0);
@@ -383,6 +654,7 @@ readcache_cleanup_poll(void *ctx)
 	}
 	assert(dev->open_thread == spdk_get_thread());
 	spdk_poller_unregister(&dev->cleanup_poller);
+	spdk_bdev_module_release_bdev(dev->base);
 	spdk_bdev_close(dev->desc);
 	readcache_unregister_done(dev);
 	return SPDK_POLLER_BUSY;
@@ -405,7 +677,6 @@ readcache_destruct(void *ctx)
 
 	TAILQ_REMOVE(&g_readcache, dev, link);
 	dev->destructing = true;
-	spdk_bdev_module_release_bdev(dev->base);
 	/* The descriptor and cache must outlive every channel, base I/O and merged
 	 * reader. Signal the bdev core only when the asynchronous cleanup finishes. */
 	spdk_io_device_unregister(dev, readcache_channels_gone);
@@ -427,6 +698,15 @@ readcache_write_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint64(w, "max_io_bytes", s.max_io_bytes);
 	spdk_json_write_named_bool(w, "populate_on_write", atomic_load(&dev->populate_on_write));
 	spdk_json_write_named_bool(w, "enabled", s.enabled);
+	if (dev->writeback) {
+		struct writeback_stats wb;
+
+		writeback_get_stats(dev->writeback, &wb, readcache_now_us());
+		spdk_json_write_named_string(w, "write_ack_policy", "volatile_early_ack_wait_read");
+		spdk_json_write_named_uint64(w, "dirty_capacity_bytes", wb.capacity_bytes);
+		spdk_json_write_named_uint64(w, "max_pending_writes", wb.max_pending_writes);
+		spdk_json_write_named_uint64(w, "max_dirty_age_us", wb.max_dirty_age_us);
+	}
 	spdk_json_write_object_end(w);
 }
 
@@ -465,9 +745,17 @@ readcache_base_event(enum spdk_bdev_event_type type, struct spdk_bdev *base, voi
 		const struct readcache_options options = {.has_enabled = true, .enabled = false};
 
 		readcache_configure(dev->cache, &options);
+		if (dev->writeback) {
+			writeback_poison(dev->writeback);
+		}
 		spdk_bdev_unregister(&dev->bdev, NULL, NULL);
 	} else if (type == SPDK_BDEV_EVENT_RESIZE) {
 		struct readcache_mutation mutation;
+
+		if (dev->writeback) {
+			/* A generation/geometry change cannot silently recycle dirty LBAs. */
+			writeback_poison(dev->writeback);
+		}
 
 		readcache_begin_mutation(dev->cache, 0, UINT64_MAX, &mutation);
 		readcache_end_mutation(dev->cache, &mutation, NULL, 0, false);
@@ -478,6 +766,14 @@ readcache_base_event(enum spdk_bdev_event_type type, struct spdk_bdev *base, voi
 int
 bdev_readcache_create(const char *base_name, const char *name, uint64_t capacity, uint64_t max_io,
 		      bool populate_on_write)
+{
+	return bdev_readcache_create_ext(base_name, name, capacity, max_io, populate_on_write, NULL);
+}
+
+int
+bdev_readcache_create_ext(const char *base_name, const char *name, uint64_t capacity,
+			  uint64_t max_io, bool populate_on_write,
+			  const struct writeback_options *writeback)
 {
 	struct readcache_bdev *dev;
 	int rc;
@@ -491,7 +787,10 @@ bdev_readcache_create(const char *base_name, const char *name, uint64_t capacity
 	}
 	dev->bdev.name = strdup(name);
 	dev->cache = readcache_create(capacity, max_io);
-	if (dev->bdev.name == NULL || dev->cache == NULL) {
+	if (writeback) {
+		dev->writeback = writeback_create(writeback);
+	}
+	if (dev->bdev.name == NULL || dev->cache == NULL || (writeback && !dev->writeback)) {
 		rc = -EINVAL;
 		goto free_dev;
 	}
@@ -508,12 +807,17 @@ bdev_readcache_create(const char *base_name, const char *name, uint64_t capacity
 		rc = -ENOTSUP;
 		goto close_dev;
 	}
+	if (writeback && (dev->base->required_alignment > 20 ||
+			  !spdk_bdev_io_type_supported(dev->base, SPDK_BDEV_IO_TYPE_FLUSH))) {
+		rc = -ENOTSUP;
+		goto close_dev;
+	}
 	dev->open_thread = spdk_get_thread();
 	atomic_init(&dev->populate_on_write, populate_on_write);
 	dev->bdev.product_name = "readcache";
 	dev->bdev.blocklen = dev->base->blocklen;
 	dev->bdev.blockcnt = dev->base->blockcnt;
-	dev->bdev.write_cache = dev->base->write_cache;
+	dev->bdev.write_cache = writeback != NULL || dev->base->write_cache;
 	dev->bdev.required_alignment = dev->base->required_alignment;
 	dev->bdev.optimal_io_boundary = dev->base->optimal_io_boundary;
 	dev->bdev.split_on_optimal_io_boundary = dev->base->split_on_optimal_io_boundary;
@@ -540,7 +844,6 @@ bdev_readcache_create(const char *base_name, const char *name, uint64_t capacity
 				sizeof(struct readcache_channel), name);
 	rc = spdk_bdev_register(&dev->bdev);
 	if (rc != 0) {
-		spdk_bdev_module_release_bdev(dev->base);
 		spdk_io_device_unregister(dev, readcache_channels_gone);
 		return rc;
 	}
@@ -549,6 +852,9 @@ bdev_readcache_create(const char *base_name, const char *name, uint64_t capacity
 close_dev:
 	spdk_bdev_close(dev->desc);
 free_dev:
+	if (dev->writeback) {
+		writeback_destroy(dev->writeback);
+	}
 	if (dev->cache != NULL) {
 		readcache_destroy(dev->cache);
 	}
@@ -576,6 +882,9 @@ bdev_readcache_get_stats(const char *name, struct readcache_stats *stats)
 		if (strcmp(dev->bdev.name, name) == 0) {
 			readcache_get_stats(dev->cache, stats);
 			stats->populate_on_write = atomic_load(&dev->populate_on_write);
+			if (dev->writeback) {
+				writeback_get_stats(dev->writeback, &stats->writeback, readcache_now_us());
+			}
 			return 0;
 		}
 	}

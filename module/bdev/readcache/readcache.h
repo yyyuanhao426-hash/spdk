@@ -7,6 +7,7 @@
 #include <stdatomic.h>
 #include <sys/uio.h>
 #include <sys/queue.h>
+#include "writeback.h"
 
 struct readcache;
 struct readcache_entry;
@@ -37,6 +38,7 @@ enum readcache_result {
 };
 
 struct readcache_stats {
+	struct writeback_stats writeback;
 	uint64_t read_requests, hits, miss_leaders, coalesced, bypasses;
 	uint64_t read_fills, write_fills, fill_errors, evictions, invalidations;
 	uint64_t allocated_bytes, peak_bytes, entries, active_mutations;

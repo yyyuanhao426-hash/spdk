@@ -17,7 +17,9 @@ def add_parser(subparsers):
         print_json(args.client.bdev_readcache_create(
             base_bdev_name=args.base_bdev_name, name=args.name,
             capacity_bytes=args.capacity_bytes, max_io_bytes=args.max_io_bytes,
-            populate_on_write=args.populate_on_write, enabled=not args.disabled))
+            populate_on_write=args.populate_on_write, enabled=not args.disabled,
+            write_ack_policy=args.write_ack_policy, dirty_capacity_bytes=args.dirty_capacity_bytes,
+            max_pending_writes=args.max_pending_writes, max_dirty_age_us=args.max_dirty_age_us))
 
     p = subparsers.add_parser('bdev_readcache_create', help='Create a bounded host read cache bdev')
     p.add_argument('base_bdev_name')
@@ -28,6 +30,13 @@ def add_parser(subparsers):
     p.add_argument('--populate-on-write', action='store_true',
                    help='Populate cache only after a successful, non-conflicting backend write')
     p.add_argument('--disabled', action='store_true', help='Create wrapper in bypass mode')
+    p.add_argument('--write-ack-policy', choices=['backend_complete', 'volatile_early_ack_wait_read'],
+                   default='backend_complete', help='Immutable for the lifetime of this bdev')
+    p.add_argument('--dirty-capacity-bytes', type=int, default=0,
+                   help='Separate DMA staging and metadata budget; required for early ACK')
+    p.add_argument('--max-pending-writes', type=int, default=1024)
+    p.add_argument('--max-dirty-age-us', type=int, default=1000000,
+                   help='Stop early admission while the oldest background write exceeds this age')
     p.set_defaults(func=bdev_readcache_create)
 
     def bdev_readcache_delete(args):

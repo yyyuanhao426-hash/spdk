@@ -12,6 +12,8 @@ struct rpc_readcache_create {
 	uint64_t max_io_bytes;
 	bool populate_on_write;
 	bool enabled;
+	char *write_ack_policy;
+	struct writeback_options writeback;
 };
 
 static const struct spdk_json_object_decoder create_decoders[] = {
@@ -25,13 +27,25 @@ static const struct spdk_json_object_decoder create_decoders[] = {
 	{"populate_on_write", offsetof(struct rpc_readcache_create, populate_on_write),
 	 spdk_json_decode_bool, true},
 	{"enabled", offsetof(struct rpc_readcache_create, enabled), spdk_json_decode_bool, true},
+	{"write_ack_policy", offsetof(struct rpc_readcache_create, write_ack_policy),
+	 spdk_json_decode_string, true},
+	{"dirty_capacity_bytes", offsetof(struct rpc_readcache_create, writeback.capacity_bytes),
+	 spdk_json_decode_uint64, true},
+	{"max_pending_writes", offsetof(struct rpc_readcache_create, writeback.max_pending_writes),
+	 spdk_json_decode_uint64, true},
+	{"max_dirty_age_us", offsetof(struct rpc_readcache_create, writeback.max_dirty_age_us),
+	 spdk_json_decode_uint64, true},
 };
 
 static void
 rpc_readcache_create(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
 {
-	struct rpc_readcache_create req = {.max_io_bytes = 256 * 1024, .enabled = true};
+	struct rpc_readcache_create req = {
+		.max_io_bytes = 256 * 1024, .enabled = true,
+		.writeback = {.max_pending_writes = 1024, .max_dirty_age_us = 1000000},
+	};
 	struct spdk_json_write_ctx *w;
+	bool early;
 	int rc;
 
 	if (spdk_json_decode_object(params, create_decoders, SPDK_COUNTOF(create_decoders), &req)) {
@@ -39,8 +53,17 @@ rpc_readcache_create(struct spdk_jsonrpc_request *request, const struct spdk_jso
 						 "Invalid parameters");
 		goto out;
 	}
-	rc = bdev_readcache_create(req.base_bdev_name, req.name, req.capacity_bytes,
-				   req.max_io_bytes, req.populate_on_write);
+	early = req.write_ack_policy &&
+		strcmp(req.write_ack_policy, "volatile_early_ack_wait_read") == 0;
+	if ((req.write_ack_policy && !early && strcmp(req.write_ack_policy, "backend_complete")) ||
+	    (early && !req.writeback.capacity_bytes) || (!early && req.writeback.capacity_bytes)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+					 "Invalid write policy or dirty budget");
+		goto out;
+	}
+	rc = bdev_readcache_create_ext(req.base_bdev_name, req.name, req.capacity_bytes,
+				       req.max_io_bytes, req.populate_on_write,
+				       early ? &req.writeback : NULL);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto out;
@@ -56,6 +79,7 @@ rpc_readcache_create(struct spdk_jsonrpc_request *request, const struct spdk_jso
 out:
 	free(req.base_bdev_name);
 	free(req.name);
+	free(req.write_ack_policy);
 }
 SPDK_RPC_REGISTER("bdev_readcache_create", rpc_readcache_create, SPDK_RPC_RUNTIME)
 
@@ -155,6 +179,39 @@ rpc_readcache_get_stats(struct spdk_jsonrpc_request *request, const struct spdk_
 #undef WRITE_STAT
 	spdk_json_write_named_bool(w, "enabled", s.enabled);
 	spdk_json_write_named_bool(w, "populate_on_write", s.populate_on_write);
+	spdk_json_write_named_string(w, "write_ack_policy", s.writeback.capacity_bytes ?
+				    "volatile_early_ack_wait_read" : "backend_complete");
+	spdk_json_write_named_string(w, "read_commit_level", "backend_complete");
+	spdk_json_write_named_object_begin(w, "writeback");
+#define WRITE_WB(field) spdk_json_write_named_uint64(w, #field, s.writeback.field)
+	WRITE_WB(capacity_bytes);
+	WRITE_WB(max_pending_writes);
+	WRITE_WB(max_dirty_age_us);
+	WRITE_WB(allocated_bytes);
+	WRITE_WB(peak_bytes);
+	WRITE_WB(pending);
+	WRITE_WB(pending_bytes);
+	WRITE_WB(peak_pending);
+	WRITE_WB(peak_pending_bytes);
+	WRITE_WB(max_commit_latency_us);
+	WRITE_WB(active_operations);
+	WRITE_WB(peak_operations);
+	WRITE_WB(accepted);
+	WRITE_WB(committed);
+	WRITE_WB(failed);
+	WRITE_WB(accepted_bytes);
+	WRITE_WB(committed_bytes);
+	WRITE_WB(failed_bytes);
+	WRITE_WB(backpressure);
+	WRITE_WB(read_waits);
+	WRITE_WB(read_wait_us);
+	WRITE_WB(commit_latency_us);
+	WRITE_WB(oldest_age_us);
+	WRITE_WB(last_sequence);
+#undef WRITE_WB
+	spdk_json_write_named_bool(w, "poisoned", s.writeback.poisoned);
+	spdk_json_write_named_bool(w, "throttled", s.writeback.throttled);
+	spdk_json_write_object_end(w);
 	spdk_json_write_object_end(w);
 	spdk_jsonrpc_end_result(request, w);
 out:

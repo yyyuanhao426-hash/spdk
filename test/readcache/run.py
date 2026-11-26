@@ -53,7 +53,33 @@ def target_checks():
                     if enabled == '0':
                         expected += ' --disabled'
                     assert lines == [expected, 'nvmf_subsystem_add_ns test-nqn NoFReadCache1 -n 1'], lines
-    print('PASS takeover: validation before root/bind; off path unchanged; cache exported above single SSD/RAID', flush=True)
+    for policy, dirty, slots, age, mib, ok in [
+        ('backend_complete', '0', '1024', '1000000', '512', True),
+        ('volatile_early_ack_wait_read', '64', '32', '1000', '512', True),
+        ('volatile_early_ack_wait_read', '0', '32', '1000', '512', False),
+        ('volatile_early_ack_wait_read', '64', '0', '1000', '512', False),
+        ('volatile_early_ack_wait_read', '64', '32', '0', '512', False),
+        ('volatile_early_ack_wait_read', '64', '32', '1000', '0', False),
+        ('backend_complete', '64', '32', '1000', '512', False),
+        ('typo', '0', '32', '1000', '512', False),
+        ('volatile_early_ack_wait_read', '08', '32', '1000', '512', False),
+    ]:
+        env = dict(os.environ, READ_CACHE_MIB=mib, READ_CACHE_MAX_IO_KIB='256',
+                   READ_CACHE_ENABLED='1', READ_CACHE_POPULATE_ON_WRITE='0', NULL_BDEV_MODE='0',
+                   WRITE_ACK_POLICY=policy, DIRTY_MIB=dirty, MAX_PENDING_WRITES=slots,
+                   MAX_DIRTY_AGE_US=age)
+        script = setup + validate + '\nvalidate_readcache_config\n'
+        result = subprocess.run(['bash', '-eu', '-c', script], env=env, text=True, capture_output=True)
+        assert (result.returncode == 0) == ok, (env, result.stderr)
+        if ok and policy != 'backend_complete':
+            script = setup + namespace + '\nrun_rpc() { printf "%s\\n" "$*"; };\n'
+            script += 'add_nof_namespace URMA_RAID0 1\n'
+            result = subprocess.run(['bash', '-eu', '-c', script], env=dict(env, NQN='test'),
+                                    text=True, capture_output=True, check=True)
+            assert '--write-ack-policy volatile_early_ack_wait_read' in result.stdout
+            assert '--dirty-capacity-bytes 67108864' in result.stdout
+            assert '--max-pending-writes 32 --max-dirty-age-us 1000' in result.stdout
+    print('PASS takeover: validation before root/bind, unchanged off path, SSD/RAID export and W2 budgets/policy', flush=True)
 
 
 def main():
@@ -73,9 +99,10 @@ def main():
     if args.thread_sanitize:
         flags += ['-fsanitize=thread', '-fno-omit-frame-pointer', '-no-pie']
     with tempfile.TemporaryDirectory(prefix='spdk-readcache-test-') as tmp:
-        for name in ('core', 'bdev', 'rpc'):
+        for name in ('core', 'bdev', 'rpc', 'writeback'):
             binary = str(Path(tmp) / name)
             subprocess.run(flags + (['-Wno-pointer-sign'] if name == 'rpc' else []) + [str(ROOT / 'module/bdev/readcache/readcache.c'),
+                str(ROOT / 'module/bdev/readcache/writeback.c'),
                 str(ROOT / f'test/readcache/{name}.c'),
                 *([str(p) for p in sorted((ROOT / 'lib/json').glob('*.c'))] if name == 'rpc' else []),
                 '-Wl,--gc-sections',
@@ -85,6 +112,7 @@ def main():
         subprocess.run(flags + ['-fsyntax-only',
             *[str(p) for p in sorted((ROOT / 'module/bdev/readcache').glob('*.c'))]], check=True)
     subprocess.run(['bash', '-n', str(ROOT / 'target_nvme_takeover.sh')], check=True)
+    subprocess.run(['python3', str(ROOT / 'test/readcache/experiment.py')], check=True)
     target_checks()
     # --dry-run here belongs only to SPDK's RPC serializer: it does not connect
     # to a target. No benchmark runner or SSH helper is invoked.
@@ -97,6 +125,13 @@ def main():
         'bdev_readcache_set_options', 'Cache0', '--no-enabled', '--clear', '--reset-stats'],
         cwd=ROOT, text=True, capture_output=True, check=True)
     assert '"enabled": false' in result.stdout and '"clear": true' in result.stdout
+    result = subprocess.run(['python3', str(ROOT / 'scripts/rpc.py'), '--dry-run',
+        'bdev_readcache_create', 'URMA_RAID0', 'Cache0', '536870912',
+        '--write-ack-policy', 'volatile_early_ack_wait_read', '--dirty-capacity-bytes', '67108864',
+        '--max-pending-writes', '32', '--max-dirty-age-us', '1000'],
+        cwd=ROOT, text=True, capture_output=True, check=True)
+    assert '"write_ack_policy": "volatile_early_ack_wait_read"' in result.stdout
+    assert '"dirty_capacity_bytes": 67108864' in result.stdout
     print('PASS production module/RPC syntax, takeover syntax and CLI request serialization', flush=True)
 
 

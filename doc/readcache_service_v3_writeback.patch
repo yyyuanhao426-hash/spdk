@@ -1,0 +1,1091 @@
+--- a/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-rank/service.json
++++ b/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-rank/service.json
+@@ -40,6 +40,14 @@
+     "NOF_HUGEPAGES_2MI_GIB": "40",
+     "NOF_NODE_PREP_TIMEOUT": "180",
+     "urma_dev": "bond",
+-    "VSEGMENT_MEMBER_COUNT": "9"
++    "VSEGMENT_MEMBER_COUNT": "9",
++    "NOF_READ_CACHE_MIB": "0",
++    "NOF_READ_CACHE_MAX_IO_KIB": "256",
++    "NOF_READ_CACHE_ENABLED": "1",
++    "NOF_READ_CACHE_POPULATE_ON_WRITE": "0",
++    "NOF_WRITE_ACK_POLICY": "backend_complete",
++    "NOF_DIRTY_MIB": "0",
++    "NOF_MAX_PENDING_WRITES": "1024",
++    "NOF_MAX_DIRTY_AGE_US": "1000000"
+   }
+ }
+--- a/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-rank/start.sh
++++ b/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-rank/start.sh
+@@ -79,6 +79,14 @@
+ export SSD_COUNT="${SSD_COUNT:-1}"
+ export VSEGMENT_MEMBER_COUNT="${VSEGMENT_MEMBER_COUNT:-9}"
+ export TARGET_CPU_MASK="${TARGET_CPU_MASK:-auto}"
++export NOF_READ_CACHE_MIB="${NOF_READ_CACHE_MIB:-0}"
++export NOF_READ_CACHE_MAX_IO_KIB="${NOF_READ_CACHE_MAX_IO_KIB:-256}"
++export NOF_READ_CACHE_ENABLED="${NOF_READ_CACHE_ENABLED:-1}"
++export NOF_READ_CACHE_POPULATE_ON_WRITE="${NOF_READ_CACHE_POPULATE_ON_WRITE:-0}"
++export NOF_WRITE_ACK_POLICY="${NOF_WRITE_ACK_POLICY:-backend_complete}"
++export NOF_DIRTY_MIB="${NOF_DIRTY_MIB:-0}"
++export NOF_MAX_PENDING_WRITES="${NOF_MAX_PENDING_WRITES:-1024}"
++export NOF_MAX_DIRTY_AGE_US="${NOF_MAX_DIRTY_AGE_US:-1000000}"
+ 
+ # Node preparation runs on the controller, before any SPDK workload is created.
+ NOF_HUGEPAGES_2MI_GIB="${NOF_HUGEPAGES_2MI_GIB:-40}"
+@@ -189,6 +197,38 @@
+ validate_positive_integer "SSD_COUNT" "$SSD_COUNT"
+ validate_positive_integer "NOF_HUGEPAGES_2MI_GIB" "$NOF_HUGEPAGES_2MI_GIB"
+ validate_positive_integer "NOF_NODE_PREP_TIMEOUT" "$NOF_NODE_PREP_TIMEOUT"
++validate_readcache_parameters() {
++    local NOF_WRITE_ACK_POLICY="${NOF_WRITE_ACK_POLICY:-backend_complete}"
++    local NOF_DIRTY_MIB="${NOF_DIRTY_MIB:-0}"
++    local NOF_MAX_PENDING_WRITES="${NOF_MAX_PENDING_WRITES:-1024}"
++    local NOF_MAX_DIRTY_AGE_US="${NOF_MAX_DIRTY_AGE_US:-1000000}"
++    [[ "$NOF_DIRTY_MIB" =~ ^(0|[1-9][0-9]{0,6})$ ]] &&
++        (( NOF_DIRTY_MIB <= 1048576 )) || die "NOF_DIRTY_MIB 必须为 0..1048576"
++    [[ "$NOF_MAX_PENDING_WRITES" =~ ^[1-9][0-9]{0,6}$ ]] &&
++        (( NOF_MAX_PENDING_WRITES <= 1048576 )) || die "NOF_MAX_PENDING_WRITES 必须为 1..1048576"
++    [[ "$NOF_MAX_DIRTY_AGE_US" =~ ^[1-9][0-9]{0,9}$ ]] &&
++        (( NOF_MAX_DIRTY_AGE_US <= 3600000000 )) || die "NOF_MAX_DIRTY_AGE_US 必须为 1..3600000000"
++    case "$NOF_WRITE_ACK_POLICY" in
++        backend_complete)
++            (( NOF_DIRTY_MIB == 0 )) || die "同步写模式不能设置 NOF_DIRTY_MIB" ;;
++        volatile_early_ack_wait_read)
++            (( NOF_READ_CACHE_MIB > 0 && NOF_DIRTY_MIB > 0 )) ||
++                die "提前确认需要 NOF_READ_CACHE_MIB 和 NOF_DIRTY_MIB" ;;
++        *) die "NOF_WRITE_ACK_POLICY 无效" ;;
++    esac
++    [[ "$NOF_READ_CACHE_MIB" =~ ^(0|[1-9][0-9]{0,6})$ ]] &&
++        (( NOF_READ_CACHE_MIB <= 1048576 )) || die "NOF_READ_CACHE_MIB 必须为 0..1048576"
++    [[ "$NOF_READ_CACHE_MAX_IO_KIB" =~ ^[1-9][0-9]{0,4}$ ]] &&
++        (( NOF_READ_CACHE_MAX_IO_KIB >= 4 && NOF_READ_CACHE_MAX_IO_KIB <= 65536 )) ||
++        die "NOF_READ_CACHE_MAX_IO_KIB 必须为 4..65536"
++    [[ "$NOF_READ_CACHE_ENABLED" =~ ^[01]$ && "$NOF_READ_CACHE_POPULATE_ON_WRITE" =~ ^[01]$ ]] ||
++        die "readcache ENABLED/POPULATE_ON_WRITE 必须为 0 或 1"
++    [[ "$BDEV_MODE" == nvme || "$NOF_READ_CACHE_MIB" == 0 ]] ||
++        die "readcache 需要真实 SSD，不能与 Null bdev 同用"
++}
++validate_readcache_parameters
++INFO "readcache: ${NOF_READ_CACHE_MIB} MiB, enabled=${NOF_READ_CACHE_ENABLED}, policy=${NOF_WRITE_ACK_POLICY}, dirty=${NOF_DIRTY_MIB} MiB"
++
+ validate_positive_integer "VSEGMENT_MEMBER_COUNT" "$VSEGMENT_MEMBER_COUNT"
+ [[ "$TARGET_CPU_MASK" == auto || "$TARGET_CPU_MASK" =~ ^0x[0-9a-fA-F]+$ ]] || die "TARGET_CPU_MASK 必须为 auto 或十六进制 CPU mask"
+ [[ "$STORE_PER_NODE" == 1 ]] || die "NoF rank 要求 STORE_PER_NODE=1"
+@@ -503,7 +543,7 @@
+         STORE_MANAGED_LABEL_VALUE="${STORE_MANAGED_LABEL_VALUE}" \
+         STORE_SLOT_LABEL_KEY="${STORE_SLOT_LABEL_KEY}" \
+         envsubst \
+-            '${MOONCAKE_NAMESPACE_UID} ${MOONCAKE_NAMESPACE} ${MOONCAKE_IMAGE} ${MOONCAKE_LOG_PATH} ${STORE_DAEMONSET_NAME} ${STORE_SLOT} ${STORE_MANAGED_LABEL_KEY} ${STORE_MANAGED_LABEL_VALUE} ${STORE_SLOT_LABEL_KEY} ${MOONCAKE_SCRIPT_CONFIGMAP} ${BDEV_MODE} ${SSD_COUNT} ${TARGET_CPU_MASK} ${urma_dev}' \
++            '${MOONCAKE_NAMESPACE_UID} ${MOONCAKE_NAMESPACE} ${MOONCAKE_IMAGE} ${MOONCAKE_LOG_PATH} ${STORE_DAEMONSET_NAME} ${STORE_SLOT} ${STORE_MANAGED_LABEL_KEY} ${STORE_MANAGED_LABEL_VALUE} ${STORE_SLOT_LABEL_KEY} ${MOONCAKE_SCRIPT_CONFIGMAP} ${BDEV_MODE} ${SSD_COUNT} ${TARGET_CPU_MASK} ${urma_dev} ${NOF_READ_CACHE_MIB} ${NOF_READ_CACHE_MAX_IO_KIB} ${NOF_READ_CACHE_ENABLED} ${NOF_READ_CACHE_POPULATE_ON_WRITE} ${NOF_WRITE_ACK_POLICY} ${NOF_DIRTY_MIB} ${NOF_MAX_PENDING_WRITES} ${NOF_MAX_DIRTY_AGE_US}' \
+             < "$STORE_TEMPLATE_YAML" > "$rendered"
+ 
+         INFO "Apply Store DaemonSet: ${ds_name}"
+--- a/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-rank/04-store-daemonset.yaml
++++ b/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-rank/04-store-daemonset.yaml
+@@ -66,6 +66,22 @@
+               value: "${SSD_COUNT}"
+             - name: TARGET_CPU_MASK
+               value: "${TARGET_CPU_MASK}"
++            - name: NOF_READ_CACHE_MIB
++              value: "${NOF_READ_CACHE_MIB}"
++            - name: NOF_READ_CACHE_MAX_IO_KIB
++              value: "${NOF_READ_CACHE_MAX_IO_KIB}"
++            - name: NOF_READ_CACHE_ENABLED
++              value: "${NOF_READ_CACHE_ENABLED}"
++            - name: NOF_READ_CACHE_POPULATE_ON_WRITE
++              value: "${NOF_READ_CACHE_POPULATE_ON_WRITE}"
++            - name: NOF_WRITE_ACK_POLICY
++              value: "${NOF_WRITE_ACK_POLICY}"
++            - name: NOF_DIRTY_MIB
++              value: "${NOF_DIRTY_MIB}"
++            - name: NOF_MAX_PENDING_WRITES
++              value: "${NOF_MAX_PENDING_WRITES}"
++            - name: NOF_MAX_DIRTY_AGE_US
++              value: "${NOF_MAX_DIRTY_AGE_US}"
+             - name: MASTER_ENDPOINT
+               value: "mooncake-master.${MOONCAKE_NAMESPACE}.svc.cluster.local:17701"
+           ports:
+--- a/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-rank/scripts/k8s-run_mooncake_nof_target.sh
++++ b/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-rank/scripts/k8s-run_mooncake_nof_target.sh
+@@ -98,6 +98,24 @@
+     fi
+ }
+ 
++require_readcache_support() {
++    if [[ "${NOF_WRITE_ACK_POLICY:-backend_complete}" == volatile_early_ack_wait_read ]]; then
++        if ! grep -q 'NOF_WRITE_ACK_POLICY' "$SPDK/target_nvme_takeover.sh" ||
++           ! grep -q -- '--dirty-capacity-bytes' "$SPDK/target_nvme_takeover.sh"; then
++            echo 'Selected image lacks W2 early-ACK support; rebuild the SPDK runtime image' >&2
++            exit 1
++        fi
++    fi
++    if [[ "${NOF_READ_CACHE_MIB:-0}" != 0 ]]; then
++        if ! grep -q '^READ_CACHE_ENABLED=' "$SPDK/target_nvme_takeover.sh" ||
++           ! grep -q 'bdev_readcache_create' "$SPDK/target_nvme_takeover.sh"; then
++            echo 'Selected image lacks readcache v2 takeover support; rebuild the SPDK runtime image' >&2
++            exit 1
++        fi
++    fi
++}
++require_readcache_support
++
+ case "${BDEV_MODE:-nvme}" in
+     null) args+=(-Z) ;;
+     nvme)
+--- a/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-recall/service.json
++++ b/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-recall/service.json
+@@ -39,6 +39,14 @@
+     "TARGET_CPU_MASK": "auto",
+     "NOF_HUGEPAGES_2MI_GIB": "40",
+     "NOF_NODE_PREP_TIMEOUT": "180",
+-    "urma_dev": "bond"
++    "urma_dev": "bond",
++    "NOF_READ_CACHE_MIB": "0",
++    "NOF_READ_CACHE_MAX_IO_KIB": "256",
++    "NOF_READ_CACHE_ENABLED": "1",
++    "NOF_READ_CACHE_POPULATE_ON_WRITE": "0",
++    "NOF_WRITE_ACK_POLICY": "backend_complete",
++    "NOF_DIRTY_MIB": "0",
++    "NOF_MAX_PENDING_WRITES": "1024",
++    "NOF_MAX_DIRTY_AGE_US": "1000000"
+   }
+ }
+--- a/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-recall/start.sh
++++ b/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-recall/start.sh
+@@ -77,6 +77,14 @@
+ export urma_dev="${urma_dev:-bond}"
+ export SSD_COUNT="${SSD_COUNT:-2}"
+ export TARGET_CPU_MASK="${TARGET_CPU_MASK:-auto}"
++export NOF_READ_CACHE_MIB="${NOF_READ_CACHE_MIB:-0}"
++export NOF_READ_CACHE_MAX_IO_KIB="${NOF_READ_CACHE_MAX_IO_KIB:-256}"
++export NOF_READ_CACHE_ENABLED="${NOF_READ_CACHE_ENABLED:-1}"
++export NOF_READ_CACHE_POPULATE_ON_WRITE="${NOF_READ_CACHE_POPULATE_ON_WRITE:-0}"
++export NOF_WRITE_ACK_POLICY="${NOF_WRITE_ACK_POLICY:-backend_complete}"
++export NOF_DIRTY_MIB="${NOF_DIRTY_MIB:-0}"
++export NOF_MAX_PENDING_WRITES="${NOF_MAX_PENDING_WRITES:-1024}"
++export NOF_MAX_DIRTY_AGE_US="${NOF_MAX_DIRTY_AGE_US:-1000000}"
+ 
+ # Node preparation runs on the controller, before any SPDK workload is created.
+ NOF_HUGEPAGES_2MI_GIB="${NOF_HUGEPAGES_2MI_GIB:-40}"
+@@ -190,6 +198,38 @@
+ validate_positive_integer "MONITOR_TOLERANCE" "${MONITOR_TOLERANCE}"
+ validate_positive_integer "RE_DUMP_INTERVAL" "${RE_DUMP_INTERVAL}"
+ validate_positive_integer "NOF_MOUNT_WAIT_TIMEOUT" "${NOF_MOUNT_WAIT_TIMEOUT}"
++validate_readcache_parameters() {
++    local NOF_WRITE_ACK_POLICY="${NOF_WRITE_ACK_POLICY:-backend_complete}"
++    local NOF_DIRTY_MIB="${NOF_DIRTY_MIB:-0}"
++    local NOF_MAX_PENDING_WRITES="${NOF_MAX_PENDING_WRITES:-1024}"
++    local NOF_MAX_DIRTY_AGE_US="${NOF_MAX_DIRTY_AGE_US:-1000000}"
++    [[ "$NOF_DIRTY_MIB" =~ ^(0|[1-9][0-9]{0,6})$ ]] &&
++        (( NOF_DIRTY_MIB <= 1048576 )) || die "NOF_DIRTY_MIB 必须为 0..1048576"
++    [[ "$NOF_MAX_PENDING_WRITES" =~ ^[1-9][0-9]{0,6}$ ]] &&
++        (( NOF_MAX_PENDING_WRITES <= 1048576 )) || die "NOF_MAX_PENDING_WRITES 必须为 1..1048576"
++    [[ "$NOF_MAX_DIRTY_AGE_US" =~ ^[1-9][0-9]{0,9}$ ]] &&
++        (( NOF_MAX_DIRTY_AGE_US <= 3600000000 )) || die "NOF_MAX_DIRTY_AGE_US 必须为 1..3600000000"
++    case "$NOF_WRITE_ACK_POLICY" in
++        backend_complete)
++            (( NOF_DIRTY_MIB == 0 )) || die "同步写模式不能设置 NOF_DIRTY_MIB" ;;
++        volatile_early_ack_wait_read)
++            (( NOF_READ_CACHE_MIB > 0 && NOF_DIRTY_MIB > 0 )) ||
++                die "提前确认需要 NOF_READ_CACHE_MIB 和 NOF_DIRTY_MIB" ;;
++        *) die "NOF_WRITE_ACK_POLICY 无效" ;;
++    esac
++    [[ "$NOF_READ_CACHE_MIB" =~ ^(0|[1-9][0-9]{0,6})$ ]] &&
++        (( NOF_READ_CACHE_MIB <= 1048576 )) || die "NOF_READ_CACHE_MIB 必须为 0..1048576"
++    [[ "$NOF_READ_CACHE_MAX_IO_KIB" =~ ^[1-9][0-9]{0,4}$ ]] &&
++        (( NOF_READ_CACHE_MAX_IO_KIB >= 4 && NOF_READ_CACHE_MAX_IO_KIB <= 65536 )) ||
++        die "NOF_READ_CACHE_MAX_IO_KIB 必须为 4..65536"
++    [[ "$NOF_READ_CACHE_ENABLED" =~ ^[01]$ && "$NOF_READ_CACHE_POPULATE_ON_WRITE" =~ ^[01]$ ]] ||
++        die "readcache ENABLED/POPULATE_ON_WRITE 必须为 0 或 1"
++    [[ "$BDEV_MODE" == nvme || "$NOF_READ_CACHE_MIB" == 0 ]] ||
++        die "readcache 需要真实 SSD，不能与 Null bdev 同用"
++}
++validate_readcache_parameters
++INFO "readcache: ${NOF_READ_CACHE_MIB} MiB, enabled=${NOF_READ_CACHE_ENABLED}, policy=${NOF_WRITE_ACK_POLICY}, dirty=${NOF_DIRTY_MIB} MiB"
++
+ [[ "$TARGET_CPU_MASK" == auto || "$TARGET_CPU_MASK" =~ ^0x[0-9a-fA-F]+$ ]] || die "TARGET_CPU_MASK 必须为十六进制 CPU mask"
+ [[ "$MOONCAKE_MASTER_REPLICAS" == 1 ]] || die "NoF 服务只支持一个 master"
+ [[ "$MOONCAKE_NAMESPACE" == mooncake-nof-* ]] || die "NoF 服务只能部署到 mooncake-nof-* namespace"
+@@ -502,7 +542,7 @@
+         STORE_MANAGED_LABEL_VALUE="${STORE_MANAGED_LABEL_VALUE}" \
+         STORE_SLOT_LABEL_KEY="${STORE_SLOT_LABEL_KEY}" \
+         envsubst \
+-            '${MOONCAKE_NAMESPACE_UID} ${MOONCAKE_NAMESPACE} ${MOONCAKE_IMAGE} ${MOONCAKE_LOG_PATH} ${STORE_DAEMONSET_NAME} ${STORE_SLOT} ${STORE_MANAGED_LABEL_KEY} ${STORE_MANAGED_LABEL_VALUE} ${STORE_SLOT_LABEL_KEY} ${MOONCAKE_SCRIPT_CONFIGMAP} ${BDEV_MODE} ${SSD_COUNT} ${DISKS_PER_POD} ${TARGET_CPU_MASK} ${urma_dev}' \
++            '${MOONCAKE_NAMESPACE_UID} ${MOONCAKE_NAMESPACE} ${MOONCAKE_IMAGE} ${MOONCAKE_LOG_PATH} ${STORE_DAEMONSET_NAME} ${STORE_SLOT} ${STORE_MANAGED_LABEL_KEY} ${STORE_MANAGED_LABEL_VALUE} ${STORE_SLOT_LABEL_KEY} ${MOONCAKE_SCRIPT_CONFIGMAP} ${BDEV_MODE} ${SSD_COUNT} ${DISKS_PER_POD} ${TARGET_CPU_MASK} ${urma_dev} ${NOF_READ_CACHE_MIB} ${NOF_READ_CACHE_MAX_IO_KIB} ${NOF_READ_CACHE_ENABLED} ${NOF_READ_CACHE_POPULATE_ON_WRITE} ${NOF_WRITE_ACK_POLICY} ${NOF_DIRTY_MIB} ${NOF_MAX_PENDING_WRITES} ${NOF_MAX_DIRTY_AGE_US}' \
+             < "$STORE_TEMPLATE_YAML" > "$rendered"
+         INFO "部署 Store DaemonSet ${ds_name}（每个可调度节点一个 Pod）..."
+         if ! kubectl apply -f "$rendered"; then
+--- a/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-recall/04-store-daemonset.yaml
++++ b/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-recall/04-store-daemonset.yaml
+@@ -70,6 +70,22 @@
+               value: "${DISKS_PER_POD}"
+             - name: TARGET_CPU_MASK
+               value: "${TARGET_CPU_MASK}"
++            - name: NOF_READ_CACHE_MIB
++              value: "${NOF_READ_CACHE_MIB}"
++            - name: NOF_READ_CACHE_MAX_IO_KIB
++              value: "${NOF_READ_CACHE_MAX_IO_KIB}"
++            - name: NOF_READ_CACHE_ENABLED
++              value: "${NOF_READ_CACHE_ENABLED}"
++            - name: NOF_READ_CACHE_POPULATE_ON_WRITE
++              value: "${NOF_READ_CACHE_POPULATE_ON_WRITE}"
++            - name: NOF_WRITE_ACK_POLICY
++              value: "${NOF_WRITE_ACK_POLICY}"
++            - name: NOF_DIRTY_MIB
++              value: "${NOF_DIRTY_MIB}"
++            - name: NOF_MAX_PENDING_WRITES
++              value: "${NOF_MAX_PENDING_WRITES}"
++            - name: NOF_MAX_DIRTY_AGE_US
++              value: "${NOF_MAX_DIRTY_AGE_US}"
+             - name: MASTER_ENDPOINT
+               value: "mooncake-master.${MOONCAKE_NAMESPACE}.svc.cluster.local:17701"
+           ports:
+--- a/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-recall/scripts/k8s-run_mooncake_nof_target.sh
++++ b/Services-Deployment-main-bare_nof_modify_pressure_v3/services/k8s-2-mooncake-deployment-recall/scripts/k8s-run_mooncake_nof_target.sh
+@@ -99,6 +99,24 @@
+     fi
+ }
+ 
++require_readcache_support() {
++    if [[ "${NOF_WRITE_ACK_POLICY:-backend_complete}" == volatile_early_ack_wait_read ]]; then
++        if ! grep -q 'NOF_WRITE_ACK_POLICY' "$SPDK/target_nvme_takeover.sh" ||
++           ! grep -q -- '--dirty-capacity-bytes' "$SPDK/target_nvme_takeover.sh"; then
++            echo 'Selected image lacks W2 early-ACK support; rebuild the SPDK runtime image' >&2
++            exit 1
++        fi
++    fi
++    if [[ "${NOF_READ_CACHE_MIB:-0}" != 0 ]]; then
++        if ! grep -q '^READ_CACHE_ENABLED=' "$SPDK/target_nvme_takeover.sh" ||
++           ! grep -q 'bdev_readcache_create' "$SPDK/target_nvme_takeover.sh"; then
++            echo 'Selected image lacks readcache v2 takeover support; rebuild the SPDK runtime image' >&2
++            exit 1
++        fi
++    fi
++}
++require_readcache_support
++
+ case "${BDEV_MODE:-null}" in
+     null) segment_count=1; args+=(-Z) ;;
+     nvme)
+--- /dev/null
++++ b/Services-Deployment-main-bare_nof_modify_pressure_v3/tests/test_nof_readcache.py
+@@ -0,0 +1,62 @@
++"""Exercise only the pure validation function; never run the deployment script."""
++import json
++import os
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++DEFAULTS = dict(NOF_READ_CACHE_MIB='0', NOF_READ_CACHE_MAX_IO_KIB='256',
++                NOF_READ_CACHE_ENABLED='1', NOF_READ_CACHE_POPULATE_ON_WRITE='0')
++
++
++class ReadcacheDeploymentTests(unittest.TestCase):
++    def test_enabling_cache_refuses_an_old_image_before_takeover(self):
++        source = (ROOT / 'services/'
++                  'k8s-2-mooncake-deployment-rank/scripts/k8s-run_mooncake_nof_target.sh').read_text()
++        function = re.search(r'require_readcache_support\(\) \{.*?\n\}', source, re.S).group()
++        with tempfile.TemporaryDirectory() as work:
++            path = Path(work) / 'target_nvme_takeover.sh'
++            for script, enabled, allowed in [
++                ('old script\n', '0', True), ('old script\n', '512', False),
++                ('READ_CACHE_ENABLED=1\nbdev_readcache_create\n', '512', True)]:
++                path.write_text(script)
++                result = subprocess.run(['bash', '-eu', '-c', function + '\nrequire_readcache_support'],
++                    env=dict(os.environ, SPDK=work, NOF_READ_CACHE_MIB=enabled), capture_output=True)
++                self.assertEqual(result.returncode == 0, allowed)
++
++    def test_parameters_reach_both_v3_targets(self):
++        for version in ('v3',):
++            for role in ('rank', 'recall'):
++                base = ROOT / 'services' / f'k8s-2-mooncake-deployment-{role}'
++                spec = json.loads((base / 'service.json').read_text())
++                start = (base / 'start.sh').read_text()
++                template = (base / '04-store-daemonset.yaml').read_text()
++                whitelist = re.search(r"envsubst\s*\\\s*'([^']+)'", start).group(1)
++                for key, value in DEFAULTS.items():
++                    self.assertEqual(spec['variables'][key], value)
++                    self.assertIn('export ' + key + '=', start)
++                    self.assertIn('${' + key + '}', whitelist)
++                    self.assertIn(f'- name: {key}\n              value: "${{{key}}}"', template)
++                match = re.search(r'validate_readcache_parameters\(\) \{.*?\n\}', start, re.S)
++                self.assertIsNotNone(match)
++                cases = [({}, True), ({'NOF_READ_CACHE_MIB': '512'}, True),
++                         ({'NOF_READ_CACHE_MIB': '512', 'NOF_READ_CACHE_ENABLED': '0'}, True),
++                         ({'NOF_READ_CACHE_MIB': '-1'}, False),
++                         ({'NOF_READ_CACHE_MIB': '08'}, False),
++                         ({'NOF_READ_CACHE_MAX_IO_KIB': '0'}, False),
++                         ({'NOF_READ_CACHE_ENABLED': 'yes'}, False),
++                         ({'NOF_READ_CACHE_POPULATE_ON_WRITE': '2'}, False),
++                         ({'BDEV_MODE': 'null', 'NOF_READ_CACHE_MIB': '512'}, False)]
++                for changes, allowed in cases:
++                    env = dict(os.environ, BDEV_MODE='nvme', **DEFAULTS)
++                    env.update(changes)
++                    code = 'die() { exit 1; };\n' + match.group() + '\nvalidate_readcache_parameters\n'
++                    result = subprocess.run(['bash', '-eu', '-c', code], env=env, capture_output=True)
++                    self.assertEqual(result.returncode == 0, allowed, (version, role, changes))
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- /dev/null
++++ b/Services-Deployment-main-bare_nof_modify_pressure_v3/tests/test_nof_writeback.py
+@@ -0,0 +1,60 @@
++"""Validate W2 plumbing without running startup, SSH, kubectl or disk takeover."""
++import json
++import os
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++DEFAULTS = dict(NOF_WRITE_ACK_POLICY='backend_complete', NOF_DIRTY_MIB='0',
++                NOF_MAX_PENDING_WRITES='1024', NOF_MAX_DIRTY_AGE_US='1000000')
++
++
++class WritebackDeploymentTests(unittest.TestCase):
++    def test_configuration_is_explicit_and_default_off(self):
++        for role in ('rank', 'recall'):
++            base = ROOT / 'services' / f'k8s-2-mooncake-deployment-{role}'
++            spec = json.loads((base / 'service.json').read_text())
++            source = (base / 'start.sh').read_text()
++            template = (base / '04-store-daemonset.yaml').read_text()
++            whitelist = re.search(r"envsubst\s*\\\s*'([^']+)'", source).group(1)
++            for key, value in DEFAULTS.items():
++                self.assertEqual(spec['variables'][key], value)
++                self.assertIn('export ' + key + '=', source)
++                self.assertIn('${' + key + '}', whitelist)
++                self.assertIn(f'- name: {key}\n              value: "${{{key}}}"', template)
++            validate = re.search(r'validate_readcache_parameters\(\) \{.*?\n\}', source, re.S).group()
++            for changes, allowed in [({}, True), ({'NOF_DIRTY_MIB': '64'}, False),
++                ({'NOF_WRITE_ACK_POLICY': 'volatile_early_ack_wait_read', 'NOF_DIRTY_MIB': '64'}, True),
++                ({'NOF_WRITE_ACK_POLICY': 'volatile_early_ack_wait_read'}, False),
++                ({'NOF_MAX_PENDING_WRITES': '0'}, False), ({'NOF_MAX_DIRTY_AGE_US': '0'}, False),
++                ({'NOF_WRITE_ACK_POLICY': 'typo'}, False), ({'NOF_DIRTY_MIB': '08'}, False)]:
++                env = dict(os.environ, NOF_READ_CACHE_MIB='512', NOF_READ_CACHE_MAX_IO_KIB='256',
++                           NOF_READ_CACHE_ENABLED='1', NOF_READ_CACHE_POPULATE_ON_WRITE='0',
++                           BDEV_MODE='nvme', **DEFAULTS)
++                env.update(changes)
++                result = subprocess.run(['bash', '-eu', '-c', 'die() { exit 1; };\n' +
++                    validate + '\nvalidate_readcache_parameters'], env=env, capture_output=True)
++                self.assertEqual(result.returncode == 0, allowed, (role, changes))
++
++    def test_old_readcache_image_cannot_silently_ignore_w2(self):
++        for role in ('rank', 'recall'):
++            source = (ROOT / 'services' / f'k8s-2-mooncake-deployment-{role}' /
++                      'scripts/k8s-run_mooncake_nof_target.sh').read_text()
++            check = re.search(r'require_readcache_support\(\) \{.*?\n\}', source, re.S).group()
++            with tempfile.TemporaryDirectory() as tmp:
++                script = Path(tmp) / 'target_nvme_takeover.sh'
++                for content, allowed in [
++                    ('READ_CACHE_ENABLED=1\nbdev_readcache_create\n', False),
++                    ('READ_CACHE_ENABLED=1\nbdev_readcache_create\nNOF_WRITE_ACK_POLICY\n--dirty-capacity-bytes\n', True)]:
++                    script.write_text(content)
++                    result = subprocess.run(['bash', '-eu', '-c', check + '\nrequire_readcache_support'],
++                        env=dict(os.environ, SPDK=tmp, NOF_READ_CACHE_MIB='512',
++                                 NOF_WRITE_ACK_POLICY='volatile_early_ack_wait_read'), capture_output=True)
++                    self.assertEqual(result.returncode == 0, allowed)
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/mp-yh_bare_nof_v3/benchmark.py
++++ b/mp-yh_bare_nof_v3/benchmark.py
+@@ -2302,12 +2302,36 @@
+         ("thread_get_stats.json", ["thread_get_stats"]),
+         ("bdev_get_bdevs.json", ["bdev_get_bdevs"]),
+     ]
++    bdevs_snapshot = []
+     for filename, args in snapshots:
+         out, rc = controller_run(
+             controller, rpc_prefix + args, check=False, timeout=60)
+         if rc != 0:
+             out += "\n[rc={}]\n".format(rc)
+         _write_text(os.path.join(pod_dir, filename), out)
++        if filename == "bdev_get_bdevs.json" and rc == 0:
++            try:
++                bdevs_snapshot = json.loads(out)
++            except (ValueError, TypeError):
++                pass
++
++    # Discover wrappers from the target itself; do not require a workload JSON
++    # or a guessed bdev name. Older images without readcache keep normal pulls.
++    for bdev in bdevs_snapshot if isinstance(bdevs_snapshot, list) else []:
++        if not isinstance(bdev, dict) or not isinstance(bdev.get("driver_specific"), dict):
++            continue
++        if "readcache" not in bdev["driver_specific"]:
++            continue
++        name = bdev.get("name")
++        if not isinstance(name, str) or not name:
++            continue
++        out, rc = controller_run(controller, rpc_prefix + ["bdev_readcache_get_stats", name],
++                                 check=False, timeout=60)
++        if rc != 0:
++            out += "\n[rc={}]\n".format(rc)
++        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
++        _write_text(os.path.join(pod_dir, "readcache_{}.json".format(safe_name)), out)
++
+ 
+     out, rc = controller_run(
+         controller, ["-n", cfg["namespace"], "exec", pod, "--", "sh", "-c",
+--- /dev/null
++++ b/mp-yh_bare_nof_v3/scripts/readcache_experiment.py
+@@ -0,0 +1,187 @@
++#!/usr/bin/env python3
++"""Read-only Kubernetes cache snapshots and guarded before/after comparison."""
++import argparse
++from datetime import datetime, timezone
++import json
++from pathlib import Path
++import subprocess
++
++
++COUNTERS = ('read_requests', 'hits', 'coalesced', 'miss_leaders', 'bypasses',
++            'read_bytes', 'hit_bytes', 'coalesced_bytes', 'miss_bytes', 'bypass_bytes',
++            'fill_errors', 'io_errors', 'evictions', 'invalidations', 'write_fills',
++            'bypass_disabled', 'bypass_oversize', 'bypass_mutation', 'bypass_budget',
++            'bypass_alloc', 'bypass_invalid', 'bypass_external')
++
++
++def command_json(argv):
++    result = subprocess.run(argv, text=True, capture_output=True, timeout=120)
++    if result.returncode:
++        raise RuntimeError(f'command failed rc={result.returncode}: {result.stderr[-600:]}')
++    return json.loads(result.stdout)
++
++
++def snapshot(namespaces, context=None, rpc_path='/home/mooncake/spdk/scripts/rpc.py',
++             rpc_socket='/var/tmp/spdk.sock', require_cache=False, run=command_json):
++    kubectl = ['kubectl'] + (['--context', context] if context else [])
++    result = {'schema': 1, 'created_utc': datetime.now(timezone.utc).isoformat(),
++              'targets': {}, 'errors': []}
++    for namespace in namespaces:
++        try:
++            pods = run(kubectl + ['-n', namespace, 'get', 'pods', '-l',
++                                  'app=mooncake-store', '-o', 'json'])['items']
++            if not pods:
++                raise ValueError('no target Pods found')
++        except (RuntimeError, ValueError, KeyError) as exc:
++            result['errors'].append(f'{namespace}: {exc}')
++            continue
++        for pod in pods:
++            name = pod['metadata']['name']
++            key = f'{namespace}/{name}'
++            try:
++                if pod.get('status', {}).get('phase') != 'Running':
++                    raise ValueError('target Pod is not Running')
++                prefix = kubectl + ['-n', namespace, 'exec', name, '--', rpc_path, '-s', rpc_socket]
++                bdevs = run(prefix + ['bdev_get_bdevs'])
++                io = run(prefix + ['bdev_get_iostat'])
++                wrappers = {}
++                for bdev in bdevs:
++                    driver = bdev.get('driver_specific', {}).get('readcache')
++                    if driver is None:
++                        continue
++                    wrappers[bdev['name']] = {
++                        'uuid': bdev['uuid'], 'base_bdev': driver['base_bdev_name'],
++                        'stats': run(prefix + ['bdev_readcache_get_stats', bdev['name']])}
++                if require_cache and not wrappers:
++                    raise ValueError('no readcache bdev exported by this target')
++                containers = pod.get('status', {}).get('containerStatuses', [])
++                identity = sorted((c['name'], c.get('imageID'), c.get('restartCount'),
++                                   c.get('state', {}).get('running', {}).get('startedAt'))
++                                  for c in containers)
++                result['targets'][key] = {'uid': pod['metadata']['uid'],
++                    'containers': identity, 'caches': wrappers, 'iostat': io}
++            except (RuntimeError, ValueError, KeyError, TypeError) as exc:
++                result['errors'].append(f'{key}: {exc}')
++    return result
++
++
++def nonnegative_int(value, key):
++    if type(value) is not int or value < 0:
++        raise ValueError(f'invalid nonnegative counter {key}')
++    return value
++
++
++def compare(before, after, minimum_avoidance=0.0):
++    report = {'valid': True, 'errors': [], 'caches': {}}
++    report['errors'].extend(before.get('errors', []) + after.get('errors', []))
++    if before.get('schema') != 1 or after.get('schema') != 1:
++        report['errors'].append('unsupported snapshot schema')
++    old_targets, new_targets = before.get('targets', {}), after.get('targets', {})
++    if set(old_targets) != set(new_targets):
++        report['errors'].append('target set changed between snapshots')
++    for key in sorted(set(old_targets) & set(new_targets)):
++        old, new = old_targets[key], new_targets[key]
++        if old['uid'] != new['uid'] or old['containers'] != new['containers']:
++            report['errors'].append(f'{key}: Pod/container restarted or image changed')
++            continue
++        if set(old['caches']) != set(new['caches']):
++            report['errors'].append(f'{key}: cache bdev set changed')
++            continue
++        for name in old['caches']:
++            label = key + '/' + name
++            a, b = old['caches'][name], new['caches'][name]
++            try:
++                if a['uuid'] != b['uuid'] or a['base_bdev'] != b['base_bdev']:
++                    raise ValueError('bdev identity changed')
++                s0, s1 = a['stats'], b['stats']
++                for field in ('stats_epoch', 'generation', 'enabled', 'populate_on_write',
++                              'capacity_bytes', 'max_io_bytes'):
++                    if s0[field] != s1[field]:
++                        raise ValueError(f'{field} changed; start a new measurement window')
++                for field in ('write_ack_policy', 'read_commit_level'):
++                    if s0.get(field, 'backend_complete') != s1.get(field, 'backend_complete'):
++                        raise ValueError(f'{field} changed; start a new measurement window')
++                delta = {}
++                for field in COUNTERS:
++                    delta[field] = nonnegative_int(s1[field], field) - nonnegative_int(s0[field], field)
++                    if delta[field] < 0:
++                        raise ValueError(f'counter {field} decreased')
++                for suffix, fields in [('requests', ('hits', 'coalesced', 'miss_leaders', 'bypasses')),
++                                       ('bytes', ('hit_bytes', 'coalesced_bytes', 'miss_bytes', 'bypass_bytes'))]:
++                    if delta['read_' + suffix] != sum(delta[f] for f in fields):
++                        raise ValueError(f'read {suffix} accounting mismatch')
++                if delta['fill_errors'] or delta['io_errors']:
++                    raise ValueError('cache/backend read failures occurred')
++                if nonnegative_int(s1['allocated_bytes'], 'allocated_bytes') > s1['capacity_bytes']:
++                    raise ValueError('live allocation exceeds cache budget')
++                if nonnegative_int(s1['pinned_bytes'], 'pinned_bytes') > s1['allocated_bytes']:
++                    raise ValueError('pinned bytes exceed live allocation')
++                if not delta['read_bytes']:
++                    raise ValueError('no read bytes observed; cannot assess cache')
++                avoided = (delta['hit_bytes'] + delta['coalesced_bytes']) / delta['read_bytes']
++                if avoided < minimum_avoidance:
++                    raise ValueError(f'accounted read avoidance {avoided:.3f} below {minimum_avoidance:.3f}')
++                entry = {'delta': delta, 'accounted_read_avoidance': avoided,
++                         'allocated_bytes': s1['allocated_bytes'], 'pinned_bytes': s1['pinned_bytes']}
++                # RAID-level bytes and member-SSD bytes must not be added together.
++                # Report only this wrapper's immediate base for each window.
++                base = a['base_bdev']
++                i0 = {d['name']: d for d in old['iostat']['bdevs']}[base]
++                i1 = {d['name']: d for d in new['iostat']['bdevs']}[base]
++                entry['base_iostat_delta'] = {}
++                for field in ('bytes_read', 'bytes_written', 'num_read_ops'):
++                    value = nonnegative_int(i1[field], field) - nonnegative_int(i0[field], field)
++                    if value < 0:
++                        raise ValueError(f'base {field} decreased')
++                    entry['base_iostat_delta'][field] = value
++                report['caches'][label] = entry
++            except (ValueError, KeyError, TypeError) as exc:
++                report['errors'].append(f'{label}: {exc}')
++    if not report['caches']:
++        report['errors'].append('no comparable cache read activity')
++    report['valid'] = not report['errors']
++    return report
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    commands = parser.add_subparsers(dest='action', required=True)
++    capture = commands.add_parser('snapshot')
++    capture.add_argument('--namespace', action='append', required=True)
++    capture.add_argument('--context')
++    capture.add_argument('--rpc-path', default='/home/mooncake/spdk/scripts/rpc.py')
++    capture.add_argument('--rpc-socket', default='/var/tmp/spdk.sock')
++    capture.add_argument('--require-cache', action='store_true')
++    capture.add_argument('--output', type=Path, required=True)
++    diff = commands.add_parser('compare')
++    diff.add_argument('before', type=Path)
++    diff.add_argument('after', type=Path)
++    diff.add_argument('--minimum-avoidance', type=float, default=0.0)
++    diff.add_argument('--output', type=Path)
++    diff.add_argument('--writeback', action='store_true',
++                      help='Also require W2 activity, drain, accounting and error checks')
++    args = parser.parse_args()
++    if args.action == 'snapshot':
++        data = snapshot(args.namespace, args.context, args.rpc_path, args.rpc_socket, args.require_cache)
++        valid = not data['errors']
++    else:
++        if not 0 <= args.minimum_avoidance <= 1:
++            parser.error('--minimum-avoidance must be between 0 and 1')
++        before, after = json.loads(args.before.read_text()), json.loads(args.after.read_text())
++        data = compare(before, after, args.minimum_avoidance)
++        if args.writeback:
++            from readcache_writeback_check import check
++            data['writeback'] = check(before, after)
++            data['errors'].extend(data['writeback']['errors'])
++            data['valid'] = data['valid'] and data['writeback']['valid']
++        valid = data['valid']
++    text = json.dumps(data, ensure_ascii=False, indent=2) + '\n'
++    if args.output:
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        args.output.write_text(text)
++    print(text, end='')
++    raise SystemExit(0 if valid else 1)
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ b/mp-yh_bare_nof_v3/webui/tests/test_nof_readcache_experiment.py
+@@ -0,0 +1,98 @@
++"""Replay snapshot/compare with JSON fixtures; never invoke kubectl or SSH."""
++import copy
++import importlib.util
++from pathlib import Path
++import unittest
++
++PATH = Path(__file__).resolve().parents[2] / 'scripts/readcache_experiment.py'
++SPEC = importlib.util.spec_from_file_location('readcache_experiment', PATH)
++MODULE = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(MODULE)
++
++
++def stats():
++    return dict.fromkeys(MODULE.COUNTERS, 0) | dict(
++        stats_epoch=1, generation=1, enabled=True, populate_on_write=False,
++        capacity_bytes=131072, max_io_bytes=4096, allocated_bytes=12000, pinned_bytes=0)
++
++
++def fixture():
++    return {'schema': 1, 'errors': [], 'targets': {'rank/target': {
++        'uid': 'pod-uid', 'containers': [('target', 'image-id', 0, 'started')],
++        'caches': {'cache': {'uuid': 'cache-uuid', 'base_bdev': 'raid', 'stats': stats()}},
++        'iostat': {'bdevs': [{'name': 'raid', 'bytes_read': 0, 'bytes_written': 0, 'num_read_ops': 0}]}}}}
++
++
++class ReadcacheExperimentTests(unittest.TestCase):
++    def snapshots(self):
++        before = fixture()
++        after = copy.deepcopy(before)
++        target = after['targets']['rank/target']
++        target['caches']['cache']['stats'].update(read_requests=10, miss_leaders=1,
++            coalesced=9, read_bytes=40960, miss_bytes=4096, coalesced_bytes=36864)
++        target['iostat']['bdevs'][0].update(bytes_read=4096, bytes_written=4096, num_read_ops=1)
++        return before, after
++
++    def test_fanout_window_and_base_bytes(self):
++        report = MODULE.compare(*self.snapshots(), minimum_avoidance=0.8)
++        self.assertTrue(report['valid'], report['errors'])
++        result = report['caches']['rank/target/cache']
++        self.assertEqual(result['accounted_read_avoidance'], 0.9)
++        self.assertEqual(result['base_iostat_delta']['bytes_read'], 4096)
++
++    def test_restart_reset_mode_change_and_invalid_counters_are_rejected(self):
++        for change in ('uid', 'epoch', 'enabled', 'budget', 'failure', 'accounting', 'uuid'):
++            with self.subTest(change=change):
++                before, after = self.snapshots()
++                target = after['targets']['rank/target']
++                s = target['caches']['cache']['stats']
++                if change == 'uid':
++                    target['uid'] = 'new-pod'
++                elif change == 'epoch':
++                    s['stats_epoch'] += 1
++                elif change == 'enabled':
++                    s['enabled'] = False
++                elif change == 'budget':
++                    s['allocated_bytes'] = s['capacity_bytes'] + 1
++                elif change == 'failure':
++                    s['fill_errors'] = 1
++                elif change == 'accounting':
++                    s['read_requests'] += 1
++                else:
++                    target['caches']['cache']['uuid'] = 'recreated'
++                self.assertFalse(MODULE.compare(before, after)['valid'])
++
++    def test_no_activity_and_missing_targets_are_not_success(self):
++        before, after = self.snapshots()
++        self.assertFalse(MODULE.compare(before, before)['valid'])
++        after['targets'] = {}
++        self.assertFalse(MODULE.compare(before, after)['valid'])
++
++    def test_collector_is_read_only_and_records_identity(self):
++        commands = []
++
++        def fake(argv):
++            commands.append(argv)
++            if 'get' in argv:
++                return {'items': [{'metadata': {'name': 'target', 'uid': 'pod-uid'},
++                    'status': {'phase': 'Running', 'containerStatuses': [
++                        {'name': 'target', 'restartCount': 0, 'imageID': 'image-id'}]}}]}
++            if 'bdev_get_bdevs' in argv:
++                return [{'name': 'cache', 'uuid': 'cache-uuid',
++                         'driver_specific': {'readcache': {'base_bdev_name': 'raid'}}}]
++            if 'bdev_get_iostat' in argv:
++                return fixture()['targets']['rank/target']['iostat']
++            if 'bdev_readcache_get_stats' in argv:
++                return stats()
++            raise AssertionError(argv)
++
++        result = MODULE.snapshot(['rank'], require_cache=True, run=fake)
++        self.assertEqual(result['errors'], [])
++        self.assertEqual(result['targets']['rank/target']['uid'], 'pod-uid')
++        self.assertEqual(len(commands), 4)
++        self.assertTrue(all(command[0] == 'kubectl' for command in commands))
++        self.assertFalse(any('bdev_readcache_set_options' in command for command in commands))
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/mp-yh_bare_nof_v3/webui/tests/test_nof_target_logs.py
++++ b/mp-yh_bare_nof_v3/webui/tests/test_nof_target_logs.py
+@@ -12,6 +12,30 @@
+ 
+ 
+ class TargetLogTests(unittest.TestCase):
++    def test_cache_stats_are_discovered_and_safe_to_write(self):
++        cfg = bm._target_log_config({'k8s': {'target_namespace': 'test',
++                                              'controller_workspace': '/work'}})
++
++        def fake_run(_controller, args, **kwargs):
++            if 'bdev_get_bdevs' in args:
++                return json.dumps([{'name': 'NoFReadCache1', 'driver_specific': {'readcache': {}}},
++                                   {'name': '../../bad', 'driver_specific': {'readcache': {}}},
++                                   {'name': 'Nvme0n1', 'driver_specific': {'nvme': {}}}]), 0
++            if 'bdev_readcache_get_stats' in args:
++                return '{"read_requests": 10, "coalesced": 9}', 0
++            return '', 0
++
++        with tempfile.TemporaryDirectory() as local:
++            with patch.object(bm, 'controller_run', side_effect=fake_run) as run, \
++                 patch.object(bm, 'controller_exec', side_effect=AssertionError), \
++                 patch.object(bm, 'log'):
++                bm._pull_one_target_logs({}, cfg, 'target', '/stage', local)
++            data = json.loads((Path(local) / 'target/readcache_NoFReadCache1.json').read_text())
++            self.assertEqual(data['coalesced'], 9)
++            calls = [c.args[1] for c in run.call_args_list if 'bdev_readcache_get_stats' in c.args[1]]
++            self.assertEqual(len(calls), 2)
++            self.assertEqual(len(list(Path(local).rglob('readcache_*.json'))), 2)
++
+     def test_recall_profiles_collect_both_slots_without_requiring_raid(self):
+         for size in ('2node', '16node'):
+             with self.subTest(size=size):
+--- /dev/null
++++ b/mp-yh_bare_nof_v3/scripts/readcache_writeback_check.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: BSD-3-Clause
++"""Validate W2 drain/accounting using MP v2 readcache_experiment snapshots.
++
++This command only reads local JSON files. It does not connect to a cluster.
++"""
++import argparse
++import json
++from pathlib import Path
++
++
++POLICY = 'volatile_early_ack_wait_read'
++COUNTERS = ('accepted', 'committed', 'failed', 'accepted_bytes', 'committed_bytes',
++            'failed_bytes', 'backpressure', 'read_waits', 'read_wait_us', 'commit_latency_us')
++
++
++def integer(value):
++    if type(value) is not int or value < 0:
++        raise ValueError('expected a nonnegative integer')
++    return value
++
++
++def check(before, after):
++    report = {'valid': False, 'errors': [], 'caches': {}, 'write_unit': 'bdev_request'}
++    try:
++        if before['schema'] != 1 or after['schema'] != 1:
++            raise ValueError('unsupported MP snapshot schema')
++        if before['errors'] or after['errors']:
++            raise ValueError('snapshot contains collection errors')
++        if not before['targets'] or set(before['targets']) != set(after['targets']):
++            raise ValueError('empty or changed target set')
++        for key, old in before['targets'].items():
++            new = after['targets'][key]
++            if old['uid'] != new['uid'] or old['containers'] != new['containers']:
++                raise ValueError(f'{key}: target restarted or image changed')
++            if not old['caches'] or set(old['caches']) != set(new['caches']):
++                raise ValueError(f'{key}: empty or changed cache set')
++            for name, a in old['caches'].items():
++                label = f'{key}/{name}'
++                b = new['caches'][name]
++                if a['uuid'] != b['uuid'] or a['base_bdev'] != b['base_bdev']:
++                    raise ValueError(f'{label}: bdev identity changed')
++                s0, s1 = a['stats'], b['stats']
++                for field in ('stats_epoch', 'generation', 'enabled', 'populate_on_write',
++                              'capacity_bytes', 'max_io_bytes', 'write_ack_policy', 'read_commit_level'):
++                    if s0[field] != s1[field]:
++                        raise ValueError(f'{label}: {field} changed')
++                if s1['write_ack_policy'] != POLICY or s1['read_commit_level'] != 'backend_complete':
++                    raise ValueError(f'{label}: W2 is not enabled')
++                w0, w1 = s0['writeback'], s1['writeback']
++                for field in ('capacity_bytes', 'max_pending_writes', 'max_dirty_age_us'):
++                    if integer(w0[field]) != integer(w1[field]) or not w1[field]:
++                        raise ValueError(f'{label}: invalid or changed dirty configuration')
++                for s in (s0, s1):
++                    w = s['writeback']
++                    for suffix in ('', '_bytes'):
++                        if integer(w['accepted' + suffix]) != sum(integer(w[f + suffix]) for f in
++                                                                 ('committed', 'failed', 'pending')):
++                            raise ValueError(f'{label}: write accounting mismatch')
++                    if w['poisoned'] is not False or integer(w['failed']):
++                        raise ValueError(f'{label}: asynchronous write failure or poisoned device')
++                    if (integer(w['pending']) or integer(w['pending_bytes']) or
++                            integer(w['allocated_bytes']) or integer(w['active_operations'])):
++                        raise ValueError(f'{label}: measurement endpoint is not drained')
++                    if integer(w['peak_bytes']) > w['capacity_bytes']:
++                        raise ValueError(f'{label}: dirty budget exceeded')
++                    if integer(s['allocated_bytes']) > s['capacity_bytes']:
++                        raise ValueError(f'{label}: CLEAN budget exceeded')
++                delta = {field: integer(w1[field]) - integer(w0[field]) for field in COUNTERS}
++                if min(delta.values()) < 0 or not delta['accepted']:
++                    raise ValueError(f'{label}: decreased counters or no early-ACK activity')
++                for field in ('io_errors', 'fill_errors'):
++                    if integer(s1[field]) != integer(s0[field]):
++                        raise ValueError(f'{label}: I/O errors during measurement')
++                report['caches'][label] = {'delta': delta, 'dirty_peak_bytes': w1['peak_bytes'],
++                                           'max_commit_latency_us': w1['max_commit_latency_us']}
++    except (KeyError, TypeError, ValueError) as exc:
++        report['errors'].append(str(exc))
++    report['valid'] = bool(report['caches']) and not report['errors']
++    return report
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('before', type=Path)
++    parser.add_argument('after', type=Path)
++    args = parser.parse_args()
++    result = check(json.loads(args.before.read_text()), json.loads(args.after.read_text()))
++    print(json.dumps(result, indent=2))
++    raise SystemExit(0 if result['valid'] else 1)
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ b/mp-yh_bare_nof_v3/webui/tests/test_nof_writeback_experiment.py
+@@ -0,0 +1,68 @@
++"""Exercise W2 compare CLI using local snapshots; no remote commands."""
++import copy
++import importlib.util
++import json
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[2]
++SPEC = importlib.util.spec_from_file_location('readcache_experiment_w2', ROOT / 'scripts/readcache_experiment.py')
++MODULE = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(MODULE)
++
++
++def snapshots():
++    s = dict.fromkeys(MODULE.COUNTERS, 0) | dict(
++        stats_epoch=1, generation=1, enabled=True, populate_on_write=False,
++        capacity_bytes=131072, max_io_bytes=4096, allocated_bytes=12000, pinned_bytes=0,
++        write_ack_policy='volatile_early_ack_wait_read', read_commit_level='backend_complete')
++    s['writeback'] = dict.fromkeys(('accepted', 'committed', 'failed', 'accepted_bytes',
++        'committed_bytes', 'failed_bytes', 'backpressure', 'read_waits', 'read_wait_us',
++        'commit_latency_us', 'pending', 'pending_bytes', 'allocated_bytes', 'peak_bytes',
++        'max_commit_latency_us', 'active_operations'), 0)
++    s['writeback'].update(capacity_bytes=65536, max_pending_writes=32, max_dirty_age_us=1000,
++                          poisoned=False)
++    before = {'schema': 1, 'errors': [], 'targets': {'rank/target': {
++        'uid': 'uid1', 'containers': [['target', 'image', 0]],
++        'caches': {'wb': {'uuid': 'uuid1', 'base_bdev': 'raid', 'stats': s}},
++        'iostat': {'bdevs': [{'name': 'raid', 'bytes_read': 0, 'bytes_written': 0, 'num_read_ops': 0}]}}}}
++    after = copy.deepcopy(before)
++    a = after['targets']['rank/target']['caches']['wb']['stats']
++    a.update(read_requests=10, hits=10, read_bytes=40960, hit_bytes=40960)
++    a['writeback'].update(accepted=1, committed=1, accepted_bytes=4096,
++                          committed_bytes=4096, peak_bytes=8192)
++    return before, after
++
++
++class WritebackExperimentTests(unittest.TestCase):
++    def test_cli_requires_drained_error_free_w2(self):
++        for fault in (None, 'pending', 'failed', 'active_operations', 'poisoned', 'restart', 'idle'):
++            before, after = snapshots()
++            s = after['targets']['rank/target']['caches']['wb']['stats']
++            if fault == 'poisoned':
++                s['writeback']['poisoned'] = True
++            elif fault == 'restart':
++                after['targets']['rank/target']['uid'] = 'uid2'
++            elif fault == 'idle':
++                s['writeback'] = copy.deepcopy(before['targets']['rank/target']['caches']['wb']['stats']['writeback'])
++            elif fault:
++                s['writeback'][fault] = 1
++            with tempfile.TemporaryDirectory() as tmp:
++                a, b = Path(tmp) / 'before.json', Path(tmp) / 'after.json'
++                a.write_text(json.dumps(before)); b.write_text(json.dumps(after))
++                result = subprocess.run([sys.executable, str(ROOT / 'scripts/readcache_experiment.py'),
++                    'compare', str(a), str(b), '--writeback'], text=True, capture_output=True)
++                self.assertEqual(result.returncode, 0 if fault is None else 1, (fault, result.stderr))
++                self.assertEqual(json.loads(result.stdout)['valid'], fault is None)
++
++    def test_policy_change_rejected_by_normal_compare(self):
++        before, after = snapshots()
++        after['targets']['rank/target']['caches']['wb']['stats']['write_ack_policy'] = 'backend_complete'
++        self.assertFalse(MODULE.compare(before, after)['valid'])
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- /dev/null
++++ b/READCACHE_V3_VALIDATION.md
+@@ -0,0 +1,159 @@
++# SPDK readcache 开发交付与分阶段验收
++
++2026-11-25。使用 `Services-Deployment-main-bare_nof_modify_pressure_v3` 和 `mp-yh_bare_nof_v3`。本轮仅接线 v3；v1/v2 保留。原 rank/recall kvtest JSON、base_qps、盘数选择均保留。
++
++## 软件交付
++
++- SPDK 独立 readcache bdev：跨 channel 缓存及在途读合并、包含范围命中、写入失效、可选写成功预热、预算及 pin 引用管理。
++- 在线启停、清空、容量调整、统计重置及写预热开关；不可满足的缩容返回 EBUSY，组合配置失败时不改开关。
++- 代次隔离：清空/关闭前的读完成不会重新发布旧 entry，旧写不会在重新启用后预热旧代次。
++- 异步销毁：等待 channel 与请求排空，关闭 descriptor 后再通知 SPDK 完成。创建时预留 owner-thread 清理 poller，关闭过程无需临时分配跨线程消息。
++- Service 参数透传、MP v3 结束快照、只读 before/after 采证及校验工具。
++
++此版本复用原请求 iobuf 发送，缓存本身是普通 host 内存。不改 URMA grant/import 生命周期。数据必须由某个 entry 完整覆盖才能直接命中；没有实现把多个不相交 entry 拼成一次命中，也不主动放大读盘范围或改变请求拆分。NUMA 分片、OCF 对照和直接缓存 → URMA 零拷贝仍是有独立测量前提的后续优化，不作为当前版本已实现功能。
++
++## 构建与配置位置
++
++重编 `~/nof/spdk`，将新 bdev 模块、`scripts/rpc.py` 及 Python CLI、`target_nvme_takeover.sh` 一并打入 runtime 镜像。先按既有 k8s-0/k8s-1 流程构建、分发，再在 Service 中选择该镜像。新增模块必须链接进 `nvmf_tgt`，只替换 Python 脚本不能启用缓存。
++
++在 rank/recall 的 Service 变量中分别设置；每个 recall target 都使用相同的每 target 预算：
++
++| 参数 | 默认 | 说明 |
++|---|---:|---|
++| `NOF_READ_CACHE_MIB` | `0` | 不创建缓存包装；正数才创建，单位 MiB/target |
++| `NOF_READ_CACHE_MAX_IO_KIB` | `256` | 大于此值的单次 NVMe 请求直接读盘 |
++| `NOF_READ_CACHE_ENABLED` | `1` | 已创建包装的初始启用状态；`0` 为包装直通对照 |
++| `NOF_READ_CACHE_POPULATE_ON_WRITE` | `0` | `1` 在 SSD 写成功后尝试预热，仍非 write-back |
++
++入口是两套 `services/k8s-2-mooncake-deployment-{rank,recall}/service.json`；`start.sh` 会校验、渲染到 `04-store-daemonset.yaml`，再由 target 启动脚本继承。设置在 MP client 的 env 中不会作用于 target。
++
++512 MiB 是实验起点，不是已验证最优值。rank 一个 target、recall 两个 target 全开时，每节点缓存预算共 1536 MiB 普通内存，另加分配器和运行开销。现有普通 memory request/limit 及 hugepages 不自动增加或减少。`allocated_bytes` 是活跃分配尺寸，不等于 RSS；在线缩容也不保证 libc 立即将页归还系统。
++
++## 阶段 0：构建、基线通路
++
++1. 两套 Service 均 `NOF_READ_CACHE_MIB=0`，选择自己要测的 SSD_COUNT；先分别确认 rank、recall 的 master 挂载成功，再测并行。CPU/memory pressure 保持关闭。
++2. 保持原场景的对象大小、QPS、副本和读写操作，记录成功率、数据校验、时延、底层读写字节。
++3. 在 target Pod 内检查新镜像的 RPC/CLI：`rpc_get_methods` 应包含 `bdev_readcache_create`、`bdev_readcache_set_options`、`bdev_readcache_get_stats`、`bdev_readcache_delete`。缓存未创建时，`bdev_get_bdevs` 中没有 readcache 属于预期。
++
++本阶段只确认新二进制没有破坏原通路，不能得出缓存收益结论。NoF 是 host target buffer 路线；GPU/外部 memory domain 缓存、metadata/DIF、zoned、ZCOPY、ABORT、COPY 和 NVMe passthrough 不在支持范围。
++
++## 阶段 1：包装直通开销
++
++先只测 rank。Service 设置 MIB=512、MAX_IO_KIB=256、ENABLED=0、POPULATE_ON_WRITE=0，按正常服务停止/启动流程部署。应导出 `NoFReadCache1`，其 base 为 `URMA_RAID0` 或单盘 `Nvme0n1`。
++
++照原 JSON 跑一次，比较阶段 0。同一包装保持真实 SSD 后端；`bypass_disabled` 应随读增加，hits/coalesced 为 0。若此阶段就有新增错误或明显额外时延，先保留日志排查，不向后续阶段归因。
++
++## 阶段 2：冷读合并与读缓存
++
++可将 Service ENABLED=1 后正常部署，或在已经创建包装的目标上在线切换。以下命令由用户在 controller 上执行，`NS` 按角色选择，不修改磁盘：
++
++```bash
++NS=mooncake-nof-rank
++for pod in $(kubectl -n "$NS" get pods -l app=mooncake-store -o name); do
++  kubectl -n "$NS" exec "$pod" -- /home/mooncake/spdk/scripts/rpc.py \
++    -s /var/tmp/spdk.sock bdev_readcache_set_options NoFReadCache1 \
++    --enabled --no-populate-on-write --clear --reset-stats || break
++done
++```
++
++切换在测试停止时执行，再开始新的测量窗口。在线选项不更新 Pod env；重新部署后的初值由 Service 变量决定。
++
++在 MP v3 根目录采集，before 后再启动 MP 测试，测试结束后采 after：
++
++```bash
++python3 scripts/readcache_experiment.py snapshot \
++  --namespace mooncake-nof-rank --require-cache --output cache-before.json
++# 在现有界面运行原 rank 场景，等待测试完成
++python3 scripts/readcache_experiment.py snapshot \
++  --namespace mooncake-nof-rank --require-cache --output cache-after.json
++python3 scripts/readcache_experiment.py compare cache-before.json cache-after.json \
++  --output cache-report.json
++```
++
++通过条件：应用成功率和内容校验通过；`io_errors`/`fill_errors` 不增加；活跃缓存分配不超预算；hits 或 coalesced 增加；RAID/NVMe 实际读字节相对基线下降。十个同时 cold reader 理想是一个 miss leader、九个 coalesced；若 reader 错峰到达，则可能是一个 miss、九个 hit。两者都可减少读盘。
++
++报告的 `accounted_read_avoidance=(hit_bytes+coalesced_bytes)/read_bytes` 是缓存计数推导值。`base_iostat_delta` 单独给出直接后端读写量，不把 RAID 与其成员 SSD 字节相加。快照是依次采集，边界在途请求会带来偏差；高命中率或计数报告有效不等于应用数据校验、SSD 吞吐和 P99 都已通过。
++
++MP 自带的结束采集会在每个 target 的 `target_logs/<pod>/readcache_<bdev>.json` 保存统计，无需修改 cluster 或 kvtest JSON。before/after 工具额外保存 Pod UID、容器 imageID/重启信息、bdev UUID、代次及统计 epoch，用于拒绝混批对比。
++
++## 阶段 3：写成功预热
++
++在与阶段 2 相同的磁盘、QPS、对象大小和线程配置下，把上面的 `--no-populate-on-write` 改为 `--populate-on-write`；或在 Service 中设 POPULATE_ON_WRITE=1。
++
++重新清空并重置统计，重新采 before/after。观察 write_fills、读盘字节、写时延和 CPU。写依然经过 SSD，写成功之后才预热。重叠写曾发生冲突时会跳过预热；不能将“最后收到完成通知的写”当成介质最终值。
++
++## 阶段 4：rank + recall 并行
++
++recall 同样按阶段 1–3 验证后，再同时开启。before/after 各加一项 `--namespace mooncake-nof-recall` 即可同时采两套 Service 的所有 target。
++
++仍保持原 rank base_qps=105 和自己选择的 SSD_COUNT；比较时保持两套服务各自盘数不变。recall 的双副本和 notify_count=1 与 rank fan-out=10 不同，应分别看命中率和底层读取。若缓存降低 SSD 读取但 P99 没降，继续检查网络、CPU、内存复制及并行干扰，不能仅凭命中率宣称优化有效。
++
++## 阶段 5：容量、生命周期和压力
++
++1. 在稳定单独/并行结果基础上，分别测 256、512、1024 MiB；先停止测量，再调整容量并开始新窗口：
++
++   ```bash
++   # 在目标 Pod 内，调用自己的 RPC socket
++   /home/mooncake/spdk/scripts/rpc.py -s /var/tmp/spdk.sock \
++     bdev_readcache_set_options NoFReadCache1 --capacity-bytes 268435456 --clear --reset-stats
++   ```
++
++   若被 pin 的活跃内存无法满足缩容，则返回 EBUSY，配置保持原值；等待请求排空后重试。
++2. 用正常 Service 停止流程验证回收，重建后冷缓存开始；重新采新 before。不要对跨 Pod 重启、bdev 重建、统计重置或配置切换的快照计算性能差值。
++3. 再分别加入 CPU pressure、memory pressure、两者组合，维持各组配置一致。
++
++关闭有两种含义：`bdev_readcache_set_options NoFReadCache1 --no-enabled --clear` 是保留包装的在线旁路；Service MIB=0 并正常重新部署是恢复无包装基线。删除 bdev 需先移除 namespace/消费者，删除不会自动把同一 namespace 切回 base。
++
++## 本地测试与后续优化
++
++本地专项使用生产缓存核心、真实 bdev 适配、真实 RPC handler 和 SPDK JSON 库；后端、SPDK 调度及响应 envelope 是模拟的。还覆盖十线程合并、2 万次差分读写、在线清空/缩容、延迟销毁和错误路径。未替代完整镜像构建、实际 URMA CQE、掉线与 SSD 验证。
++
++本轮交付的是可部署、可控制和可采证的块缓存版本。零拷贝需要新增独立 DMA/注册池及 CQE 级引用设计；NUMA 分片、cache-line 多段拼接等策略应由本轮采证结果决定，避免在同一轮同时改变缓存、传输和调度。
++
++
++## W2：易失性提前写确认 + 提交前读屏障
++
++已在 `urma_enable_v3` 实现，必须显式选择；默认仍为 `backend_complete`。
++先验证 rank R0/R1，再在 rank Service v3 的变量中增加：
++
++```text
++NOF_READ_CACHE_MIB=512
++NOF_READ_CACHE_MAX_IO_KIB=256
++NOF_WRITE_ACK_POLICY=volatile_early_ack_wait_read
++NOF_DIRTY_MIB=64
++NOF_MAX_PENDING_WRITES=1024
++NOF_MAX_DIRTY_AGE_US=1000000
++```
++
++上述容量只是试验起点，必须把 dirty DMA 预算加入 target 大页余量；不从原 iobuf
++额度借用。Pod 普通内存/hugepages request 和 limit 不自动修改。写策略与 dirty 额度
++创建后不可在线切换；CLEAN disable/clear 不会取消写屏障或丢弃后台数据。
++
++W2 提前确认前完整复制数据到独立 DMA 缓冲。所有读先等待先行重叠写完成，再从
++CLEAN 缓存或 SSD 读取；后续覆盖写不能无限推迟已接纳读。不同范围可并行。
++FUA 写等待底层写成功及真实 Flush；Flush/Reset 等待 namespace 先行操作。
++预算、槽位或最大年龄触发时，新写按有序同步路径完成。后台错误会锁定整个
++wrapper，后续读/写/Flush 返回错误，不能回读旧 SSD 数据冒充成功；需结束批次、
++失效相关上层 segment/位置，并重建新批次。target 崩溃后的易失数据允许丢失，
++未实现自动上层恢复。
++
++在 `mp-yh_bare_nof_v3` 目录使用现有 snapshot 命令，停止 writer/reader 并等待排空后：
++
++```bash
++python3 scripts/readcache_experiment.py compare cache-before.json cache-after.json \
++  --writeback --output cache-report.json
++# 也可仅检查 W2 排空和守恒，不评估 CLEAN 读复用：
++python3 scripts/readcache_writeback_check.py cache-before.json cache-after.json
++```
++
++要求所有目标身份/配置不变，accepted=committed+failed+pending，字节数同样守恒；
++前后采样均 pending=0、allocated_bytes=0、active_operations=0，failed=0、poisoned=false。
++writeback 生命周期计数不随 CLEAN stats reset 清零；不要跨代次混批。
++MP 结束快照自动保存 writeback 字段，`compare --writeback` 还会拒绝没有提前确认活动的
++批次。普通 compare 只评估 CLEAN 缓存，W2 验收必须加 --writeback。
++
++正式 workload JSON 保持上传提交的原值（当前 rank/recall duration=30），不自动延长，
++不修改 raw/bond 选择、盘数或 QPS。另做版本化 payload 的内容验收；size 校验不能检测
++旧值。W2 对象由多个子请求组成，bdev 计数不代表完整对象 committed，也不代表
++真实网络 ACK 时刻。真实 NVMe/URMA、断链/停止/崩溃恢复、writer 到全部 reader 的
++事件 P99 仍需上机验收，不能用本地模拟回归宣称性能已验证。

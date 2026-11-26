@@ -67,6 +67,9 @@
 #   NOF_READ_CACHE_MIB=0 关闭；>0 为单 namespace 的普通内存缓存预算（MiB）
 #   NOF_READ_CACHE_MAX_IO_KIB=256 超过此大小的请求直通，不改变原有 I/O 拆分
 #   NOF_READ_CACHE_POPULATE_ON_WRITE=0；1 在 SSD 写成功后预热（非 write-back）
+#   NOF_WRITE_ACK_POLICY=backend_complete；可选 volatile_early_ack_wait_read（易失实验）
+#   NOF_DIRTY_MIB=0 独立 DMA/元数据预算；提前确认必须显式设置并增加大页额度
+#   NOF_MAX_PENDING_WRITES=1024；NOF_MAX_DIRTY_AGE_US=1000000
 #
 # 接管前会自动检测上一次运行残留（vfio-pci 占用或游离的 NVMe 盘）并还原回
 # nvme 驱动，确保本次是全新的 unbind + bind；-r 保留为手动补救入口。
@@ -115,6 +118,10 @@ READ_CACHE_MIB="${NOF_READ_CACHE_MIB:-0}"
 READ_CACHE_MAX_IO_KIB="${NOF_READ_CACHE_MAX_IO_KIB:-256}"
 READ_CACHE_POPULATE_ON_WRITE="${NOF_READ_CACHE_POPULATE_ON_WRITE:-0}"
 READ_CACHE_ENABLED="${NOF_READ_CACHE_ENABLED:-1}"
+WRITE_ACK_POLICY="${NOF_WRITE_ACK_POLICY:-backend_complete}"
+DIRTY_MIB="${NOF_DIRTY_MIB:-0}"
+MAX_PENDING_WRITES="${NOF_MAX_PENDING_WRITES:-1024}"
+MAX_DIRTY_AGE_US="${NOF_MAX_DIRTY_AGE_US:-1000000}"
 
 # 找正在运行的 SPDK target 进程。必须按 /proc/PID/exe 的真实可执行文件判断：
 #   pgrep -f 'bin/nvmf_tgt' 会匹配"命令行里含该字符串"的任何进程（包括
@@ -200,6 +207,11 @@ case "$SKIP_VFIO_RESTORE" in
 esac
 
 validate_readcache_config() {
+    # Defaults also allow this helper to be independently sourced for validation.
+    WRITE_ACK_POLICY="${WRITE_ACK_POLICY:-backend_complete}"
+    DIRTY_MIB="${DIRTY_MIB:-0}"
+    MAX_PENDING_WRITES="${MAX_PENDING_WRITES:-1024}"
+    MAX_DIRTY_AGE_US="${MAX_DIRTY_AGE_US:-1000000}"
     [[ "$READ_CACHE_MIB" =~ ^(0|[1-9][0-9]{0,6})$ ]] &&
         (( READ_CACHE_MIB <= 1048576 )) || abort "NOF_READ_CACHE_MIB 必须为 0..1048576"
     [[ "$READ_CACHE_MAX_IO_KIB" =~ ^[1-9][0-9]{0,4}$ ]] &&
@@ -216,6 +228,22 @@ validate_readcache_config() {
     if (( READ_CACHE_MIB > 0 && NULL_BDEV_MODE != 0 )); then
         abort "readcache 实验需要真实 SSD，不能与 Null bdev 同用"
     fi
+    [[ "$DIRTY_MIB" =~ ^(0|[1-9][0-9]{0,6})$ ]] &&
+        (( DIRTY_MIB <= 1048576 )) || abort "NOF_DIRTY_MIB 必须为 0..1048576"
+    [[ "$MAX_PENDING_WRITES" =~ ^[1-9][0-9]{0,6}$ ]] &&
+        (( MAX_PENDING_WRITES <= 1048576 )) || abort "NOF_MAX_PENDING_WRITES 必须为 1..1048576"
+    [[ "$MAX_DIRTY_AGE_US" =~ ^[1-9][0-9]{0,9}$ ]] &&
+        (( MAX_DIRTY_AGE_US <= 3600000000 )) || abort "NOF_MAX_DIRTY_AGE_US 必须为 1..3600000000"
+    case "$WRITE_ACK_POLICY" in
+        backend_complete)
+            (( DIRTY_MIB == 0 )) || abort "同步写模式不能设置 NOF_DIRTY_MIB"
+            ;;
+        volatile_early_ack_wait_read)
+            (( READ_CACHE_MIB > 0 && DIRTY_MIB > 0 )) ||
+                abort "提前确认需要显式设置 NOF_READ_CACHE_MIB 和 NOF_DIRTY_MIB"
+            ;;
+        *) abort "NOF_WRITE_ACK_POLICY 无效" ;;
+    esac
 }
 validate_readcache_config
 
@@ -746,8 +774,16 @@ add_nof_namespace() {
         if [[ "$READ_CACHE_ENABLED" == 0 ]]; then
             cache_args+=(--disabled)
         fi
+        if [[ "${WRITE_ACK_POLICY:-backend_complete}" == volatile_early_ack_wait_read ]]; then
+            cache_args+=(--write-ack-policy "$WRITE_ACK_POLICY"
+                --dirty-capacity-bytes "$((DIRTY_MIB * 1048576))"
+                --max-pending-writes "$MAX_PENDING_WRITES" --max-dirty-age-us "$MAX_DIRTY_AGE_US")
+        fi
         run_rpc bdev_readcache_create "${cache_args[@]}"
         info "readcache: $export_bdev -> $base_bdev，预算 ${READ_CACHE_MIB} MiB 普通内存"
+        if [[ "${WRITE_ACK_POLICY:-backend_complete}" == volatile_early_ack_wait_read ]]; then
+            info "write policy: $WRITE_ACK_POLICY，独立 dirty DMA/元数据预算 ${DIRTY_MIB} MiB；读等待 backend complete"
+        fi
     fi
     run_rpc nvmf_subsystem_add_ns "$NQN" "$export_bdev" -n "$nsid"
 }

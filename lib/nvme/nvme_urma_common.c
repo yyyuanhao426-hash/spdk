@@ -7,6 +7,42 @@
 
 #define SPDK_URMA_PROVIDER_COUNT (SPDK_NVME_URMA_MEM_XDS + 1)
 
+void *
+spdk_urma_alloc_capsule_slots(size_t count, size_t slot_size)
+{
+	long host_page = sysconf(_SC_PAGESIZE);
+	size_t alignment, bytes;
+	void *slots;
+	int rc;
+
+	/* Registration expands to 4K grant pages. A calloc array can share its
+	 * first/last page with another qpair's RX or TX array, causing overlapping
+	 * live grants on bonding contexts (Doc 65). Own complete pages at both
+	 * ends, including when the host uses pages larger than the grant granule. */
+	if (host_page <= 0 || count == 0 || slot_size == 0) {
+		errno = EINVAL;
+		return NULL;
+	}
+	alignment = spdk_max((size_t)host_page, (size_t)4096);
+	if ((alignment & (alignment - 1)) != 0 || count > SIZE_MAX / slot_size) {
+		errno = EOVERFLOW;
+		return NULL;
+	}
+	bytes = count * slot_size;
+	if (bytes > SIZE_MAX - (alignment - 1)) {
+		errno = EOVERFLOW;
+		return NULL;
+	}
+	bytes = SPDK_ALIGN_CEIL(bytes, alignment);
+	rc = posix_memalign(&slots, alignment, bytes);
+	if (rc != 0) {
+		errno = rc;
+		return NULL;
+	}
+	memset(slots, 0, bytes);
+	return slots;
+}
+
 struct spdk_nvme_urma_memory_region {
 	void *addr;
 	size_t length;

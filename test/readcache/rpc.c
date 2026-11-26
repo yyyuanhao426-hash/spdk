@@ -151,7 +151,52 @@ main(void)
 	result = invoke("bdev_readcache_get_stats", "{\"name\":\"cache\"}");
 	assert(result.error == -ENODEV);
 	assert(!opens && !claims && !io_devices && !framework_registered);
+	result = invoke("bdev_readcache_create",
+			"{\"base_bdev_name\":\"base\",\"name\":\"wb\",\"capacity_bytes\":131072,"
+			"\"write_ack_policy\":\"volatile_early_ack_wait_read\"}");
+	assert(result.error == SPDK_JSONRPC_ERROR_INVALID_PARAMS && !opens);
+	result = invoke("bdev_readcache_create",
+			"{\"base_bdev_name\":\"base\",\"name\":\"wb\",\"capacity_bytes\":131072,"
+			"\"write_ack_policy\":\"typo\"}");
+	assert(result.error == SPDK_JSONRPC_ERROR_INVALID_PARAMS && !opens);
+	result = invoke("bdev_readcache_create",
+			"{\"base_bdev_name\":\"base\",\"name\":\"wb\",\"capacity_bytes\":131072,"
+			"\"dirty_capacity_bytes\":65536}");
+	assert(result.error == SPDK_JSONRPC_ERROR_INVALID_PARAMS && !opens);
+	result = invoke("bdev_readcache_create",
+			"{\"base_bdev_name\":\"base\",\"name\":\"wb\",\"capacity_bytes\":131072,"
+			"\"write_ack_policy\":\"volatile_early_ack_wait_read\","
+			"\"dirty_capacity_bytes\":65536,\"max_pending_writes\":0}");
+	assert(result.error == -EINVAL && !opens);
+	result = invoke("bdev_readcache_create",
+			"{\"base_bdev_name\":\"base\",\"name\":\"wb\",\"capacity_bytes\":131072,"
+			"\"write_ack_policy\":\"volatile_early_ack_wait_read\","
+			"\"dirty_capacity_bytes\":65536,\"max_pending_writes\":12,\"max_dirty_age_us\":456}");
+	assert(!result.error && framework_registered->write_cache);
+	result = invoke("bdev_readcache_get_stats", "{\"name\":\"wb\"}");
+	assert(!result.error &&
+	       strstr(result.output, "\"write_ack_policy\":\"volatile_early_ack_wait_read\""));
+	assert(strstr(result.output, "\"max_pending_writes\":12"));
+	assert(strstr(result.output, "\"max_dirty_age_us\":456"));
+	{
+		struct spdk_json_write_ctx *w;
+		struct spdk_jsonrpc_request saved = {};
+
+		w = spdk_json_write_begin(output, &saved, 0);
+		spdk_json_write_object_begin(w);
+		readcache_write_config(framework_registered, w);
+		spdk_json_write_object_end(w);
+		assert(!spdk_json_write_end(w));
+		assert(strstr(saved.output, "\"dirty_capacity_bytes\":65536"));
+		assert(strstr(saved.output, "\"max_pending_writes\":12"));
+		assert(strstr(saved.output, "\"max_dirty_age_us\":456"));
+	}
+	result = invoke("bdev_readcache_set_options",
+			"{\"name\":\"wb\",\"write_ack_policy\":\"backend_complete\"}");
+	assert(result.error == SPDK_JSONRPC_ERROR_INVALID_PARAMS); /* cannot change VWC live */
+	result = invoke("bdev_readcache_delete", "{\"name\":\"wb\"}");
+	assert(!result.error && !opens && !claims && !io_devices);
 	puts("PASS production RPC + real SPDK JSON: create/configure/stats/delete, invalid types, "
-	     "unknown fields and atomic error handling");
+	     "unknown fields, atomic error handling, W2 validation and saved configuration");
 	return 0;
 }

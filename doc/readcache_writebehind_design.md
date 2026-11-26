@@ -2,7 +2,9 @@
 
 2026-11-25 design snapshot. Canonical long-term plan: `~/nof/docs/spdk/readcache-plan-2026-11-24.md`.
 
-Current implementation: read caching and write-completion warming only. The early-ACK policy below is planned, not implemented or enabled.
+Current implementation: R0/R1 plus opt-in W2 volatile early ACK and read barriers.
+Local simulated-backend validation is implemented; real SSD/URMA acceptance and
+performance are pending. See the implementation record below and [usage](readcache.md).
 
 ## 2026-11-25 场景确认与新增写路径构想（当前有效约束）
 
@@ -25,7 +27,7 @@ Current implementation: read caching and write-completion warming only. The earl
 |---|---|---|---|
 | R0：读时填充 | 底层写完成后 | 冷读从 SSD 填入 target 缓存；其余 reader hit 或合并等待同一冷读 | 已实现 |
 | R1：写成功后预热 | 底层写完成后 | 已写数据在完成时进入 CLEAN 缓存，reader 可能从第一次就命中 | 已实现，populate-on-write |
-| W2：易失性提前确认 + 读屏障 | target 完整接收、独立保有数据并成功接纳后台写后 | reader 可提前到达，但必须等待对应写达到提交条件，随后从 CLEAN 缓存或 SSD 返回 | 本次新增设计，尚未实现或开启 |
+| W2：易失性提前确认 + 读屏障 | target 完整接收、独立保有数据并成功接纳后台写后 | reader 可提前到达，但必须等待对应写达到提交条件，随后从 CLEAN 缓存或 SSD 返回 | 已实现，显式 opt-in；实机验收待做 |
 
 W2 仍需给 writer 发送一条前台成功的 NoF/NVMe completion，writer 才能继续 pipeline；变化是该 completion 代表 target 已接纳而非底层已完成。后台提交结果独立记录，不能稍后对已复用的同一 CID 再完成一次。
 
@@ -36,7 +38,7 @@ W2 仍需给 writer 发送一条前台成功的 NoF/NVMe completion，writer 才
 - **允许 reader 等待。** 要求是返回读数据之前，对应写已完成；不要求 reader 到达之前或 Notify 之前就完成。实现采用更容易验证的强约束：对应提交完成之前，不向 reader 发出数据传输。
 - **实验允许丢失窗口。** writer 提前成功后，若 target 在后台写完成前崩溃，尚未提交的数据允许丢失，必须单独记录。不能把提前成功描述为已经持久化或具有抗故障承诺。
 - 以上是用户已经给出的实验约束，不再将是否允许 reader 等待、是否接受该丢失窗口列为待确认问题。
-- 当前软件仍按 R0/R1 的原写完成时点返回，W2 不因已有读缓存开关而自动生效。
+- 默认仍按 R0/R1 的原写完成时点返回；W2 需要独立选择写策略与脏预算，不因已有读缓存开关而自动生效。
 
 ### “写完成”与“持久化”的术语
 
@@ -71,7 +73,7 @@ sequenceDiagram
     T-->>R: 分别返回10份数据
 ```
 
-该图展示 reader 比写完成更早到达的一种合法时序；若读到达时已经提交，则直接读 CLEAN 缓存。不能依赖 Notify 的网络耗时碰巧长于 SSD 写入耗时。当前源码会在写进行时让读走 backend bypass；这个行为在 R0/R1 中保持原有并发块 I/O 语义，但**W2 必须改为先检查脏范围并等待，不能沿用直通旧 SSD 数据的路径**。
+该图展示 reader 比写完成更早到达的一种合法时序；若读到达时已经提交，则直接读 CLEAN 缓存。不能依赖 Notify 的网络耗时碰巧长于 SSD 写入耗时。R0/R1 在写进行时让读走 backend bypass，保持原有并发块 I/O 语义。W2 在进入该路径前通过独立范围队列等待，不会直通旧 SSD 数据。
 
 时序不变量：
 
@@ -101,13 +103,13 @@ clean缓存预算 ≈ 每target唯一数据速率 × 十个reader的复用时间
 dirty 数据不能按普通 LRU 丢弃。达到配额/高水位必须在提前确认之前背压、转同步路径或拒绝接纳，并保证已有后台写继续排空。目标不是用不断增长的内存把过载隐藏起来。
 
 
-### 阶段 4：易失性提前写确认 + 读屏障（新增，待开发）
+### 阶段 4：易失性提前写确认 + 读屏障（设计约束）
 
 本阶段按用户已确认的实验约束推进：允许 reader 等待；允许 ACK 后、后台提交前因 target 崩溃而丢失的数据窗口。它是新写策略，不是当前读缓存功能已经具备的行为。实施优先级是先验证 R0/R1，再实现/验证 W2，最后按测量决定是否需要阶段 5 的直接缓存发 URMA。
 
 #### W0：固定接口和可观测的语义
 
-拟议配置名称仅用于设计，不是当前已有环境变量或 RPC：
+以下为原设计接口；首版实际接口及收敛项见末尾实现记录：
 
 | 设计接口 | 初值/约束 | 含义 |
 |---|---|---|
@@ -197,4 +199,70 @@ dirty 数据不能按普通 LRU 丢弃。达到配额/高水位必须在提前�
 
 事件耗时在同一时钟域计算，跨节点用有时钟同步证明的时间戳或单点事件关联，不直接相减未同步时钟。现有平均/P99 分项、成功数不足以推导整个事件的 P99；需增加关联采证。
 
-**本阶段完成判据：**提前确认确实发生在 backend 完成之前；所有正常读的数据 post 都晚于其依赖提交；内容/版本正确；dirty 内存与队列有界；排空和故障可见性符合已确认语义；端到端收益有证据。当前状态为“设计已具体化，代码未实现”，不能用已有读缓存 19 组回归代替 W2 验证。
+**本阶段完成判据：**提前确认确实发生在 backend 完成之前；所有正常读的数据 post 都晚于其依赖提交；内容/版本正确；dirty 内存与队列有界；排空和故障可见性符合已确认语义；端到端收益有证据。本节为验收约束；首版实现状态见末尾记录，不能用本地回归替代真实 SSD/URMA 的 W2 验证。
+
+
+## 2026-11-25 W2 首版实现记录
+
+已实现独立 DMA staging、前台提前确认、跨 channel 范围队列、读等待与后写公平排序、
+不重叠范围并行、提交后 CLEAN 预热、FUA 写后真实 Flush 严格路径、全 namespace Flush/Reset、
+UNMAP/WRITE_ZEROES 顺序、有界字节/操作数预算、90%/70% 滞回与最大年龄准入回退、
+后台错误计数及整设备 fail-closed、独立 channel 引用和延迟释放 base claim。
+
+接口为 create 时设置 `write_ack_policy=volatile_early_ack_wait_read`、
+`dirty_capacity_bytes`、`max_pending_writes`、`max_dirty_age_us`；
+默认仍是 `backend_complete`。写策略与 dirty 额度不可在线修改；CLEAN 在线控制保留。
+首版将 RANGE_ERROR 收敛为整个 wrapper 的 POISONED，无范围自动恢复。
+其状态与 writeback 生命周期计数不能由 CLEAN clear/reset 清除。
+
+具体代码在 `module/bdev/readcache/writeback.[ch]` 和 `vbdev_readcache.c`；
+RPC、CLI、takeover 环境变量及采证检查器已接线。
+`doc/readcache_service_v3_writeback.patch` 保存 Service v3 rank/recall 的本地配置接线，
+默认关闭，不改变 MP 正式 workload 或 QPS。大页/普通内存配额仍需按独立 dirty DMA
+预算实测配置；不自动修改 Pod 资源。
+
+本地测试覆盖 10/64 reader、ACK 后释放/覆盖原请求与源 buffer、多范围读、部分覆盖写、
+十线程 10000 次排序、全部读绕过路径、FUA/Flush/UNMAP/置零/Reset、配额和年龄回退、
+DMA 分配失败、ENOMEM/队列/提交/完成故障、正常删除/resize/热移除，以及快照误批拒绝。
+`test/readcache/run.py` 同时保留原 20000 次差分读写与原 R0/R1/RPC 回归。
+
+真实 NVMe DMA/URMA、qpair 断开与 target 正常停止/强杀、非正常重启后的上层 segment
+代次隔离、版本化对象内容校验、完整对象 committed 关联、ACK/提交事件外拉和事件 P99
+仍是实机/上层验收工作。首版无自动跨崩溃恢复，也未做阶段 5 缓存直发 URMA。
+因此状态是“W2 软件首版已实现并通过本地验证，未默认启用，真实性能待验证”。
+
+
+本轮最终审计与验证：
+
+- NVMf 向 bdev 写入时保留完整 CDW12，低 16 位是 NLB；普通写的提前确认准入忽略
+  这些块数位，高位特殊标志仍走同步路径。已补多块写带真实 NLB 的测试。
+- 当前 NVMe bdev 的 `bdev_nvme_writev()` 将 directive 与 DIF flags 传到设备，未映射
+  传入 CDW12 的 FUA 位；W2 因此在 FUA 写成功后发起真实 base Flush，直到 Flush
+  成功才完成原写，覆盖 Flush ENOMEM 重试与失败。该措施不修改默认 R0/R1 行为。
+- `active_operations` 核算后台写及全部前台保留，包含同步回退/FUA/读/Flush/Reset；
+  W2 快照验收必须为零，避免把仅 dirty 队列为空误认为整个 wrapper 排空。
+- `python3 test/readcache/run.py`、`--sanitize`（ASan/UBSan/LSan）与真实模块静态库编译
+  通过。原 whole-pool、handshake、admin-submit 本地 URMA 回归通过。
+- Service v3 rank/recall 接线已写回；新增 W2 两项及原 readcache 两项测试通过。
+  staged 全套 70 项有 1 项既有失败：停止清理测试未包含 `purge` 事件；原目录复现相同
+  失败，未修改此无关行为。正式 MP workload 未改，不执行部署、commit 或 push。
+
+
+## 配置归属纠正：只接线已拉取的 v3
+
+按用户最新指示，已撤回本轮对 Service v2 的 W2 修改和新增测试。v2 原有修改保留，
+在撤回后记录 758 个 v1/v2 文件哈希，迁移后逐项校验不变。
+GDR main 已快进至用户上传的 `cb769185`（add k8s bare nof v3）。
+
+本轮接线目标为 `Bare_Nof_Without_Vsegment/` 下的：
+
+- `Services-Deployment-main-bare_nof_modify_pressure_v3`：rank/recall 的 R0/R1/W2 参数、
+  校验、envsubst、Pod env 与旧镜像检查，默认 readcache=0、W2 关闭。
+- `mp-yh_bare_nof_v3`：缓存自动发现与结束快照、before/after 采集、
+  W2 守恒/排空检查器和 `compare --writeback`，包含本地 fixture/CLI 测试。
+- 新 `READCACHE_V3_VALIDATION.md`：独立于原 v2 指南，说明三种模式和实机验收约束。
+
+保留该提交全部 109 个 benchmark JSON 配置；rank/recall duration=30、QPS=105/35，
+recall raw/bond 选择、盘数和 pressure 参数均不修改。
+既有 Service stop 清理测试缺 purge，MP 有两项旧测试仍期望 recall=bond 而配置为 raw；
+均在未修改 v3 基线上复现，未用本轮改动覆盖这些选择。未启动部署、SSH 或性能实验。

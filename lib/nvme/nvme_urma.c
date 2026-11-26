@@ -811,8 +811,8 @@ nvme_urma_capsule_resources_init(struct nvme_urma_qpair *uqpair)
 		 * 只会用它的前 capsule_rx_count 项。地址进 CR user_ctx，必须
 		 * 活到 qpair 销毁，中途断连/重连不释放。 */
 		uqpair->capsule_rx_slots_cap = uqpair->capsule_rx_count;
-		uqpair->capsule_rx_slots = calloc(uqpair->capsule_rx_slots_cap,
-						  sizeof(*uqpair->capsule_rx_slots));
+		uqpair->capsule_rx_slots = spdk_urma_alloc_capsule_slots(uqpair->capsule_rx_slots_cap,
+								 sizeof(*uqpair->capsule_rx_slots));
 	}
 	uqpair->pending_rsps = calloc(uqpair->capsule_rx_count, sizeof(*uqpair->pending_rsps));
 	if (uqpair->capsule_rx_slots == NULL || uqpair->pending_rsps == NULL) {
@@ -884,8 +884,8 @@ nvme_urma_tx_pool_init(struct nvme_urma_qpair *uqpair)
 		return 0;
 	}
 	if (uqpair->capsule_tx_slots == NULL) {
-		uqpair->capsule_tx_slots =
-		    calloc(uqpair->num_entries, sizeof(*uqpair->capsule_tx_slots));
+		uqpair->capsule_tx_slots = spdk_urma_alloc_capsule_slots(uqpair->num_entries,
+								 sizeof(*uqpair->capsule_tx_slots));
 		if (uqpair->capsule_tx_slots == NULL) {
 			return -ENOMEM;
 		}

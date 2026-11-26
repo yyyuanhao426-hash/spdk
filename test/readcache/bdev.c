@@ -10,6 +10,10 @@ static unsigned int reads, writes, pending_count, completed;
 static uintptr_t current_channel;
 static int submit_error, queue_error;
 static bool fail_get_buf;
+static bool fail_dma;
+static uint64_t test_now_us = 1;
+static unsigned int dma_live, channel_holds;
+static struct spdk_io_channel *held_channels[128];
 static struct spdk_bdev_io_wait_entry *queued;
 
 /* Typed local SPDK framework mocks. Production create/delete callbacks below
@@ -65,8 +69,75 @@ spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 void
 spdk_put_io_channel(struct spdk_io_channel *ch)
 {
+	unsigned int i;
+
+	for (i = 0; i < SPDK_COUNTOF(held_channels); i++) {
+		if (held_channels[i] == ch) {
+			held_channels[i] = NULL;
+			channel_holds--;
+			return;
+		}
+	}
 	free(ch);
 }
+
+struct spdk_io_channel *
+spdk_io_channel_ref(struct spdk_io_channel *ch)
+{
+	unsigned int i;
+
+	for (i = 0; i < SPDK_COUNTOF(held_channels); i++) {
+		if (!held_channels[i]) {
+			held_channels[i] = ch;
+			channel_holds++;
+			return ch;
+		}
+	}
+	assert(false);
+	return NULL;
+}
+
+uint64_t
+spdk_get_ticks(void)
+{
+	return test_now_us;
+}
+
+uint64_t
+spdk_get_ticks_hz(void)
+{
+	return 1000000;
+}
+
+void *
+spdk_dma_malloc(size_t size, size_t align, uint64_t *unused)
+{
+	void *p = NULL;
+
+	if (fail_dma) {
+		fail_dma = false;
+		return NULL;
+	}
+	assert(!posix_memalign(&p, align, size));
+	dma_live++;
+	return p;
+}
+
+void
+spdk_dma_free(void *p)
+{
+	assert(p && dma_live);
+	dma_live--;
+	free(p);
+}
+
+#ifndef READCACHE_REAL_JSON
+void
+spdk_log(enum spdk_log_level level, const char *file, const int line, const char *func,
+	 const char *format, ...)
+{
+}
+#endif
 
 struct spdk_poller *
 spdk_poller_register_named(spdk_poller_fn fn, void *ctx, uint64_t period, const char *name)
@@ -290,7 +361,7 @@ static struct {
 	spdk_bdev_io_completion_cb cb;
 	void *arg;
 	uintptr_t channel;
-	unsigned char read_data[BLOCK];
+	unsigned char read_data[BLOCK * 8];
 } pending[IOS];
 
 void
@@ -336,7 +407,8 @@ backend(struct spdk_io_channel *ch, uint64_t offset, uint64_t length, struct iov
 	pending[pending_count].arg = arg;
 	pending[pending_count].channel = current_channel;
 	if (type == SPDK_BDEV_IO_TYPE_READ) {
-		memcpy(pending[pending_count].read_data, disk + offset * BLOCK, BLOCK);
+		assert(offset + length <= 8);
+		memcpy(pending[pending_count].read_data, disk + offset * BLOCK, length * BLOCK);
 	}
 	pending_count++;
 	reads += type == SPDK_BDEV_IO_TYPE_READ;
@@ -359,8 +431,15 @@ spdk_bdev_writev_blocks_ext(struct spdk_bdev_desc *d, struct spdk_io_channel *ch
 			    spdk_bdev_io_completion_cb cb, void *arg,
 			    struct spdk_bdev_ext_io_opts *opts)
 {
+	int rc;
+
 	assert(cnt == 1);
-	return backend(ch, offset, length, iov, SPDK_BDEV_IO_TYPE_WRITE, cb, arg);
+	rc = backend(ch, offset, length, iov, SPDK_BDEV_IO_TYPE_WRITE, cb, arg);
+	if (!rc) {
+		pending[pending_count - 1].bio->u.bdev.nvme_cdw12 = opts->nvme_cdw12;
+		pending[pending_count - 1].bio->u.bdev.nvme_cdw13 = opts->nvme_cdw13;
+	}
+	return rc;
 }
 
 #define BACKEND_RANGE(fn, type)                                                                    \
@@ -427,12 +506,13 @@ finish(unsigned int index, bool success)
 	current_channel = pending[index].channel;
 	if (success) {
 		if (bio->type == SPDK_BDEV_IO_TYPE_READ) {
-			memcpy(bio->u.bdev.iovs[0].iov_base, pending[index].read_data, BLOCK);
+			memcpy(bio->u.bdev.iovs[0].iov_base, pending[index].read_data,
+			       bio->u.bdev.num_blocks * BLOCK);
 		} else if (bio->type == SPDK_BDEV_IO_TYPE_WRITE) {
-			memcpy(data, bio->u.bdev.iovs[0].iov_base, BLOCK);
+			memcpy(data, bio->u.bdev.iovs[0].iov_base, bio->u.bdev.num_blocks * BLOCK);
 		} else if (bio->type == SPDK_BDEV_IO_TYPE_UNMAP ||
 			   bio->type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES) {
-			memset(data, 0, BLOCK);
+			memset(data, 0, bio->u.bdev.num_blocks * BLOCK);
 		}
 	}
 	bio->internal.status = success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED;
@@ -573,7 +653,7 @@ delayed_lifecycle(void)
 	assert(pending_count == 1);
 	defer_unregister = true;
 	bdev_readcache_delete("delayed", deleted, &result);
-	assert(result == -999 && opens == 1 && io_devices == 1 && !claims);
+	assert(result == -999 && opens == 1 && io_devices == 1 && claims == 1);
 	finish(0, true);
 	current_channel = (uintptr_t)b;
 	readcache_poll(spdk_io_channel_get_ctx(b));
@@ -616,6 +696,8 @@ main(void)
 		assert(channels[i]);
 		ch = spdk_io_channel_get_ctx(channels[i]);
 		TAILQ_INIT(&ch->pending);
+		TAILQ_INIT(&ch->gated);
+		TAILQ_INIT(&ch->background);
 		ch->base_ch = channels[i];
 	}
 	memset(disk, 0x11, sizeof(disk));
