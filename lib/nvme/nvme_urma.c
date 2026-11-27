@@ -33,6 +33,7 @@ struct nvme_urma_timing {
 	uint64_t release_count;
 	uint64_t total_ticks;    /* submit + completion round-trip */
 	uint64_t total_count;
+	uint64_t host_copy_in_ticks, host_copy_out_ticks, host_copy_bytes;
 };
 
 static struct nvme_urma_timing g_timing;
@@ -143,6 +144,7 @@ nvme_urma_monotonic_ns(void)
 static void
 nvme_urma_timing_dump(void)
 {
+	struct spdk_urma_host_memory_stats host;
 	uint64_t hz = spdk_get_ticks_hz();
 	uint64_t reg = __atomic_load_n(&g_timing.reg_ticks, __ATOMIC_RELAXED);
 	uint64_t reg_n = __atomic_load_n(&g_timing.reg_count, __ATOMIC_RELAXED);
@@ -155,6 +157,8 @@ nvme_urma_timing_dump(void)
 	uint64_t rel_n = __atomic_load_n(&g_timing.release_count, __ATOMIC_RELAXED);
 	uint64_t tot = __atomic_load_n(&g_timing.total_ticks, __ATOMIC_RELAXED);
 	uint64_t tot_n = __atomic_load_n(&g_timing.total_count, __ATOMIC_RELAXED);
+	uint64_t copy_in = __atomic_load_n(&g_timing.host_copy_in_ticks, __ATOMIC_RELAXED);
+	uint64_t copy_out = __atomic_load_n(&g_timing.host_copy_out_ticks, __ATOMIC_RELAXED);
 
 	/* Modified By Yida: use printf instead of SPDK_NOTICELOG — urma_perf's
 	 * default log level filters NOTICE, but results are printed via printf
@@ -173,6 +177,22 @@ nvme_urma_timing_dump(void)
 	       rel, rel_n, rel_n ? rel / rel_n * 1000000000ULL / hz : 0, rel * 1000 / hz);
 	printf("  TOTAL (submit+compl):  %lu ticks, n=%lu, avg=%lu us, total=%lu ms\n",
 	       tot, tot_n, tot_n ? tot / tot_n * 1000000ULL / hz : 0, tot * 1000 / hz);
+	spdk_urma_get_host_memory_stats(&host);
+	printf("  host staging: acquire=%" PRIu64 " hit=%" PRIu64 " fallback=%" PRIu64
+	       " release=%" PRIu64 " register=%" PRIu64 " unregister=%" PRIu64 "\n",
+	       host.staging_acquires, host.staging_hits, host.staging_fallbacks,
+	       host.staging_releases, host.staging_registers, host.staging_unregisters);
+	printf("  host staging lock: wait_ns=%" PRIu64 " hold_ns=%" PRIu64 "\n",
+	       host.staging_lock_wait_ns, host.staging_lock_hold_ns);
+	printf("  host release lock: wait_ns=%" PRIu64 " hold_ns=%" PRIu64 "\n",
+	       host.release_lock_wait_ns, host.release_lock_hold_ns);
+	printf("  provider unregister: count=%" PRIu64 " total_ns=%" PRIu64 "\n",
+	       host.provider_unregisters, host.provider_unregister_ns);
+	printf("  provider register: count=%" PRIu64 " total_ns=%" PRIu64
+	       " region_cleanup_ns=%" PRIu64 "\n",
+	       host.provider_registers, host.provider_register_ns, host.region_cleanup_ns);
+	printf("  host copies: in_ticks=%" PRIu64 " out_ticks=%" PRIu64 " bytes=%" PRIu64 "\n",
+	       copy_in, copy_out, __atomic_load_n(&g_timing.host_copy_bytes, __ATOMIC_RELAXED));
 	if (tot > 0) {
 		printf("  breakdown: reg=%.1f%% send=%.1f%% compl=%.1f%% release=%.1f%%\n",
 		       100.0 * reg / tot, 100.0 * send / tot,
@@ -259,6 +279,7 @@ struct nvme_urma_req {
 	struct spdk_nvme_urma_memory_region *region;
 	/* Only partially overlapping, unregistered HOST payloads need staging. */
 	void *bounce_buffer;
+	struct spdk_urma_host_staging_slot *staging_slot;
 	/* Modified By Yida: cache entry when region is cached (NULL if not cached) */
 	struct nvme_urma_reg_entry *cache_entry; /* NULL if not cached */
 	/* Modified By Yida(v7): region 来自整池注册表采纳——release 不得 unregister */
@@ -1007,6 +1028,20 @@ nvme_urma_acquire_request_memory(struct nvme_urma_qpair *uqpair,
 	struct nvme_request *req = ureq->req;
 	int rc;
 
+	/* No application registration is retained: only SPDK-owned pages persist.
+	 * Explicit whole-pool registrations were already adopted by the caller. */
+	if (uqpair->qpair.id != 0 &&
+	    (req->cmd.opc == SPDK_NVME_OPC_READ || req->cmd.opc == SPDK_NVME_OPC_WRITE)) {
+		void *staged;
+
+		rc = spdk_urma_host_staging_acquire(uqpair->device, req->payload.size,
+				&ureq->staging_slot, &staged, &ureq->region);
+		if (rc == 0) {
+			ureq->bounce_buffer = staged;
+			ureq->region_external = true;
+			goto copy_payload;
+		}
+	}
 	rc = spdk_urma_acquire_host_memory(uqpair->device->context, *addr,
 					 req->payload.size, &ureq->region);
 	if (rc != -EADDRINUSE) {
@@ -1019,10 +1054,19 @@ nvme_urma_acquire_request_memory(struct nvme_urma_qpair *uqpair,
 	if (ureq->bounce_buffer == NULL) {
 		return -ENOMEM;
 	}
+copy_payload:
 	if (spdk_nvme_opc_get_data_transfer(req->cmd.opc) & SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
+		uint64_t copy_start = spdk_get_ticks();
+
 		memcpy(ureq->bounce_buffer, *addr, req->payload.size);
+		__atomic_add_fetch(&g_timing.host_copy_in_ticks,
+				   spdk_get_ticks() - copy_start, __ATOMIC_RELAXED);
+		__atomic_add_fetch(&g_timing.host_copy_bytes, req->payload.size, __ATOMIC_RELAXED);
 	}
 	*addr = ureq->bounce_buffer;
+	if (ureq->staging_slot != NULL) {
+		return 0;
+	}
 	return spdk_urma_acquire_host_memory(uqpair->device->context, *addr,
 					   req->payload.size, &ureq->region);
 }
@@ -1037,7 +1081,11 @@ nvme_urma_release_request_memory(struct nvme_urma_qpair *uqpair,
 		nvme_urma_admin_region_diag(uqpair, ureq, "admin_region_release", reason);
 		spdk_nvme_urma_unregister_memory(ureq->region);
 	}
-	free(ureq->bounce_buffer);
+	if (ureq->staging_slot != NULL) {
+		spdk_urma_host_staging_release(ureq->staging_slot);
+	} else {
+		free(ureq->bounce_buffer);
+	}
 }
 
 static int
@@ -1289,8 +1337,13 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 	     SPDK_NVME_DATA_CONTROLLER_TO_HOST)) {
 		void *dest = (void *)((uintptr_t)ureq->req->payload.contig_or_cb_arg +
 				     ureq->req->payload.offset);
+		uint64_t copy_start = spdk_get_ticks();
 
 		memcpy(dest, ureq->bounce_buffer, ureq->req->payload.size);
+		__atomic_add_fetch(&g_timing.host_copy_out_ticks,
+				   spdk_get_ticks() - copy_start, __ATOMIC_RELAXED);
+		__atomic_add_fetch(&g_timing.host_copy_bytes,
+				   ureq->req->payload.size, __ATOMIC_RELAXED);
 	}
 	nvme_urma_release_request_memory(uqpair, ureq, "completion");
 	t_rel1 = spdk_get_ticks();

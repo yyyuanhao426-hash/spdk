@@ -167,6 +167,21 @@ struct spdk_urma_transport_opts {
 	bool electrical_network;
 };
 
+struct spdk_urma_host_staging_pool;
+struct spdk_urma_host_staging_slot;
+
+#define SPDK_URMA_HOST_STAGING_DEFAULT_SLOTS 128
+#define SPDK_URMA_HOST_STAGING_DEFAULT_BYTES (256 * 1024)
+
+struct spdk_urma_host_memory_stats {
+	uint64_t staging_acquires, staging_hits, staging_fallbacks, staging_releases;
+	uint64_t staging_registers, staging_unregisters;
+	uint64_t staging_lock_wait_ns, staging_lock_hold_ns;
+	uint64_t release_lock_wait_ns, release_lock_hold_ns;
+	uint64_t provider_unregisters, provider_unregister_ns;
+	uint64_t provider_registers, provider_register_ns, region_cleanup_ns;
+};
+
 struct spdk_urma_device {
 	urma_context_t *context;
 	urma_device_attr_t attr;
@@ -191,7 +206,22 @@ struct spdk_urma_device {
 	uint32_t refs;
 	TAILQ_ENTRY(spdk_urma_device) link;
 	struct spdk_memory_domain *memory_domain;
+	/* Owned by the shared device, never by an application payload or qpair. */
+	struct spdk_urma_host_staging_pool *host_staging;
+	uint32_t host_staging_slots, host_staging_slot_bytes;
+	bool host_staging_configured;
 };
+
+/* Bounded persistent HOST staging, used only for unregistered bonding data.
+ * -ENOTSUP/-EAGAIN/allocation errors allow the caller's transient fallback.
+ * A slot remains owned until response completion or drained abort. */
+int spdk_urma_host_staging_acquire(struct spdk_urma_device *device, size_t length,
+		struct spdk_urma_host_staging_slot **slot, void **addr,
+		struct spdk_nvme_urma_memory_region **region);
+void spdk_urma_host_staging_release(struct spdk_urma_host_staging_slot *slot);
+/* False quarantines the device: a busy slot or failed ungrant is never freed. */
+bool spdk_urma_host_staging_fini(struct spdk_urma_device *device);
+void spdk_urma_get_host_memory_stats(struct spdk_urma_host_memory_stats *stats);
 
 /* HELLO owns the provider bytes until every peer jetty has been imported. */
 int spdk_urma_hello_data_length(const struct spdk_urma_endpoint_desc *desc,
