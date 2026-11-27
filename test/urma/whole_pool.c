@@ -15,7 +15,7 @@
 static pthread_mutex_t provider_mutex = PTHREAD_MUTEX_INITIALIZER;
 static urma_target_seg_t *active[64];
 static unsigned registrations, unregistrations, duplicate_grants, pin_calls, unpin_calls;
-static bool fail_registration;
+static bool fail_registration, fail_unregistration;
 static _Thread_local unsigned fail_calloc_on;
 
 void *__real_calloc(size_t count, size_t size);
@@ -75,6 +75,9 @@ urma_register_seg(urma_context_t *context, urma_seg_cfg_t *cfg)
 urma_status_t
 urma_unregister_seg(urma_target_seg_t *segment)
 {
+	if (fail_unregistration) {
+		return URMA_FAIL;
+	}
 	pthread_mutex_lock(&provider_mutex);
 	for (unsigned i = 0; i < SPDK_COUNTOF(active); i++) {
 		if (active[i] == segment) {
@@ -196,6 +199,9 @@ struct thread_args {
 	pthread_barrier_t *barrier;
 	bool release;
 	bool io;
+	bool staging;
+	struct spdk_urma_host_staging_slot *slot;
+	void *addr;
 	int rc;
 };
 
@@ -205,7 +211,14 @@ thread_operation(void *arg)
 	struct thread_args *args = arg;
 	pthread_barrier_wait(args->barrier);
 	if (args->release) {
-		spdk_nvme_urma_unregister_memory(args->region);
+		if (args->staging) {
+			spdk_urma_host_staging_release(args->slot);
+		} else {
+			spdk_nvme_urma_unregister_memory(args->region);
+		}
+	} else if (args->staging) {
+		args->rc = spdk_urma_host_staging_acquire(args->qpair->device, 4096,
+				&args->slot, &args->addr, &args->region);
 	} else if (args->io) {
 		args->rc = spdk_urma_acquire_host_memory(args->qpair->device->context,
 						      POOL_ADDR, 4096, &args->region);
@@ -434,6 +447,84 @@ check_io_concurrent(void)
 }
 
 static void
+check_staging(void)
+{
+	struct pool_fixture fixture;
+	struct thread_args args[ENDPOINTS] = {}, releases[ENDPOINTS] = {};
+	struct spdk_urma_host_staging_slot *slot;
+	struct spdk_nvme_urma_memory_region *region;
+	void *addr;
+	unsigned before_reg = registrations, before_unreg = unregistrations, successes = 0;
+
+	fixture_init(&fixture);
+	assert(setenv("SPDK_URMA_HOST_STAGING_SLOTS", "4", 1) == 0);
+	assert(setenv("SPDK_URMA_HOST_STAGING_SLOT_BYTES", "4096", 1) == 0);
+	for (unsigned i = 0; i < ENDPOINTS; i++) {
+		args[i].qpair = &fixture.qpairs[i];
+		args[i].staging = true;
+	}
+	run_threads(args, ENDPOINTS);
+	for (unsigned i = 0; i < ENDPOINTS; i++) {
+		if (args[i].rc == 0) {
+			for (unsigned j = 0; j < successes; j++) {
+				assert(args[i].addr != releases[j].addr);
+				assert(args[i].region == releases[j].region);
+			}
+			releases[successes] = args[i];
+			releases[successes++].release = true;
+		} else {
+			assert(args[i].rc == -EAGAIN && args[i].slot == NULL);
+		}
+	}
+	assert(successes == 4 && registrations == before_reg + 1);
+	assert(!spdk_urma_host_staging_fini(&fixture.device));
+	run_threads(releases, successes);
+	assert(unregistrations == before_unreg);
+	/* Failed ungrant retains pages and prevents the pool from being reused. */
+	fail_unregistration = true;
+	assert(!spdk_urma_host_staging_fini(&fixture.device));
+	fail_unregistration = false;
+	assert(spdk_urma_host_staging_acquire(&fixture.device, 4096,
+			&slot, &addr, &region) == -ENOTSUP);
+	assert(unregistrations == before_unreg);
+	assert(spdk_urma_host_staging_fini(&fixture.device));
+	assert(unregistrations == before_unreg + 1);
+	/* Cold allocation/registration failure can retry without stale state. */
+	fail_calloc_on = 1;
+	assert(spdk_urma_host_staging_acquire(&fixture.device, 4096,
+			&slot, &addr, &region) == -ENOMEM);
+	assert(fixture.device.host_staging == NULL);
+	fail_registration = true;
+	assert(spdk_urma_host_staging_acquire(&fixture.device, 4096,
+			&slot, &addr, &region) == -ENOENT);
+	fail_registration = false;
+	assert(fixture.device.host_staging == NULL);
+	assert(spdk_urma_host_staging_acquire(&fixture.device, 4096, &slot, &addr, &region) == 0);
+	spdk_urma_host_staging_release(slot);
+	assert(spdk_urma_host_staging_fini(&fixture.device));
+	const char *invalid[][2] = {
+		{"0", "4096"}, {"-1", "4096"}, {"abc", "4096"}, {"4097", "4096"},
+		{"4", "0"}, {"4", "393216"}, {"4", "16777216"}, {"4096", "8388608"},
+	};
+	for (unsigned i = 0; i < SPDK_COUNTOF(invalid); i++) {
+		assert(setenv("SPDK_URMA_HOST_STAGING_SLOTS", invalid[i][0], 1) == 0);
+		assert(setenv("SPDK_URMA_HOST_STAGING_SLOT_BYTES", invalid[i][1], 1) == 0);
+		assert(spdk_urma_host_staging_acquire(&fixture.device, 4096,
+				&slot, &addr, &region) == -ENOTSUP);
+		assert(fixture.device.host_staging == NULL);
+		assert(spdk_urma_host_staging_fini(&fixture.device));
+	}
+	struct spdk_urma_host_memory_stats stats;
+	spdk_urma_get_host_memory_stats(&stats);
+	assert(stats.staging_registers == 2 && stats.staging_unregisters == 2);
+	assert(stats.staging_hits == 5 && stats.staging_fallbacks >= 4);
+	assert(stats.provider_unregisters > 0 && stats.provider_unregister_ns > 0);
+	assert(registrations == unregistrations && duplicate_grants == 0);
+	puts("PASS staging: concurrent unique slots/one grant, bounded capacity, disabled/invalid "
+	     "config, allocation/provider retry, busy close and failed-ungrant retention");
+}
+
+static void
 check_memory_type(void)
 {
 	struct pool_fixture fixture;
@@ -471,6 +562,7 @@ main(void)
 	check_failures();
 	check_io_ownership();
 	check_io_concurrent();
+	check_staging();
 	check_memory_type();
 	/* The only rejected grant was the intentional HOST/CUDA type-isolation control. */
 	assert(registrations == unregistrations && duplicate_grants == 1);

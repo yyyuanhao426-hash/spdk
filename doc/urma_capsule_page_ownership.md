@@ -177,9 +177,79 @@ flags 拒绝；modern/legacy SDK 三份 transport 源码编译、原 capsule 池
 ASan/UBSan/LeakSanitizer 在获授权的沙箱外本地运行，以避开 socketpair/LSan
 沙箱限制。它们不能替代实际 ARM UMDK、镜像链接和设备验收。
 
-性能上，未整池注册的 basic 在最后一个在途引用完成后会真正 unregister，下一
+在 `eb180742a` 阶段，未整池注册的 basic 在最后一个在途引用完成后会真正 unregister，下一
 次请求需要重新注册；部分重叠会增加复制，跨 context 注册也使用进程级共享锁。
 这修正生命周期，不承诺 basic 吞吐与原长期缓存相同。高吞吐仍优先使用显式
 应用整池注册；该路径不增加逐 I/O 注册/复制。本次未部署或测量实机性能。
 验收应使用同一新版 runtime，在原 b1t1 bonding 配置下先通过 prepare-store
 和读回，再跑 recall/rank，并核对 grant/register_failed 与内容正确性。
+
+## Doc 77 续：SPDK 自有的固定注册 host staging 池
+
+2026-11-27，公共实现同时适用于 v2/v3，wire 仍为 v7。Doc 77 的 1557 样本恢复了
+10,984 个完整对象，每组释放累计均值 1307.152 µs，占 child 组跨度 2426.150 µs
+约 53.88%。这是本地释放区间的实测，不能全部归为一个 ioctl，也不能外推为
+关闭 stage 后 1705 轮的精确分段。本地先用真实提交/完成代码复现了结构性成本：
+32 个顺序 256 KiB child，发生 32 次注册和 32 次注销。
+
+现在未显式整池注册的 bonding HOST READ/WRITE，优先从共享 device 持有的池中
+借用 slot。池是 SPDK 自己分配、长期拥有的完整 host 页，不缓存应用地址。
+第一次合适的数据请求才分配并注册一次；同一 device/context 的所有 qpair 共用。
+WRITE 提交前从应用 payload/offset 复制到 slot；成功 READ 在回调前复制回去；
+错误 READ 和 abort 不回写。slot 只在完成、提交失败或排空后中止时归还，不随
+命令发送立即复用。NVMe 响应完成与 capsule SEND slot 的独立生命周期保持。
+
+显式 whole-pool 注册优先级更高，仍是直接传输；Admin/Connect、raw、accelerator
+不启用这个自动池。没有合适 slot、容量用尽或池创建失败时，回退到上一节的
+请求引用/重叠 staging 路径，不无限增大池，也不靠队列重试等待别的 qpair 释放。
+池元数据/内存分配失败可重试；已注册但导出失败的池保持所有权并停用，直到
+检查过 provider ungrant 返回成功才能释放页面。
+
+以下环境变量在每个共享 device 首次使用时读取，后续不在线调整：
+
+| 参数 | 默认与范围 |
+|---|---|
+| `SPDK_URMA_HOST_STAGING_SLOTS` | 默认 128；0 禁用、恢复逐请求路径；最多 4096 |
+| `SPDK_URMA_HOST_STAGING_SLOT_BYTES` | 默认 262144；4 KiB..8 MiB 的 2 次幂 |
+| 总容量 | 两者乘积最多 256 MiB；默认每共享 context 32 MiB 普通 host 内存 |
+
+参数无效时记录一次错误并使用安全回退。池与 target iobuf、业务 chunk、readcache
+预算独立，不自动从 `-I/-O` 推测。默认覆盖 Doc 77 的 256 KiB child；更大的实际
+命令会回退，不能仅看对象大小判断是否命中。显式整池流量不会为这个池分配内存。
+
+池的 segment 以稳定段语义发送（非 TRANSIENT），所以 target 复用已有的全段
+import 缓存，不再为每个 child import/unimport。所有 qpair 完成 drain、共享 device
+最后一个引用关闭后才注销自有池。slot 仍忙或 provider ungrant 失败时，保留
+device/context/页面并报告 quarantine，不能继续销毁这些资源；永久失败并不
+等于已经释放，可能保留资源直到进程退出。
+
+### 观测和回归
+
+`spdk_nvme_urma_dump_timing()` 的既有汇总出口新增以下累计项，不新增逐 I/O printf：
+
+- `host staging`：acquire/hit/fallback/release、池注册/注销次数。
+- `host staging lock`：池锁等待及锁内纳秒；锁内包含首次初始化成本。
+- `host release lock`：回退/整池引用释放时原注册锁的等待与锁内纳秒。
+- `provider register/unregister`：普通 URMA 注册和注销调用次数/总纳秒；
+  `region_cleanup_ns` 是注销之后的元数据/provider 清理区间。DMA-BUF 注册不在
+  普通 register 计时中。
+- `host copies`：写入/读回累计 tick 和字节数；按汇总头部 hz 换算时间。
+
+这些是进程累计值，需要按同窗差分，锁内时间含 provider 时间，不能相加当成
+互不重叠的分段。新计时本身有开销；stage 请求标志触发的既有逐 I/O 文本没有
+在本轮统一移除，做性能 A/B 时仍须核对实际日志开关。
+
+回归入口沿用前节命令。`admin_submit_build.py --transport-ref eb180742a` 对新
+32-child 回归预期失败，当前代码应通过。当前覆盖一次池注册/退出一次注销、
+跨 lane 正确读回、写复制、错误/abort 不回写、池满及大请求回退、显式整池直达、
+提交失败、初始化/导出失败后的所有权。`whole_pool_build.py` 增加 8 线程抢 4 个
+slot、独占地址、共用 grant、并发归还、忙时禁止释放、注销失败保留/重试、
+容量及参数边界；modern/legacy 配置均编译。原 capsule、accelerator 注册、
+HELLO/target 数据路径和 iobuf 回归保留。
+
+本地验证证明调用次数与生命周期，未模拟 ARM provider 的实测 15/41 µs，也未
+证明吞吐达到 raw。新增 host 复制、32 MiB/context 内存及锁成本需要实机量化。
+下一轮应保持盘数、strip、业务 chunk、日志和并发一致，用上述环境变量将池
+关闭/开启做 A/B，核对真实 data_len=256 KiB、pool hit、provider 调用差分、
+首请求/稳态分别统计，再验证内容与长期并发。Doc 76 的大并发 CONNECT/health
+gate 问题未由本轮本地测试定案。

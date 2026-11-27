@@ -63,6 +63,58 @@ struct spdk_nvme_urma_memory_region {
 	TAILQ_ENTRY(spdk_nvme_urma_memory_region) io_link;
 };
 
+struct spdk_urma_host_staging_slot {
+	struct spdk_urma_host_staging_pool *pool;
+	void *addr;
+	bool busy;
+};
+
+struct spdk_urma_host_staging_pool {
+	void *buffer;
+	struct spdk_nvme_urma_memory_region *region;
+	uint32_t count, slot_bytes, used, next;
+	bool unusable;
+	struct spdk_urma_host_staging_slot slots[];
+};
+
+static pthread_mutex_t g_host_staging_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct spdk_urma_host_memory_stats g_host_memory_stats;
+
+#define URMA_HOST_STAT_ADD(field, value) \
+	__atomic_fetch_add(&g_host_memory_stats.field, (value), __ATOMIC_RELAXED)
+
+static uint64_t
+spdk_urma_memory_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+void
+spdk_urma_get_host_memory_stats(struct spdk_urma_host_memory_stats *stats)
+{
+#define COPY_STAT(field) \
+	stats->field = __atomic_load_n(&g_host_memory_stats.field, __ATOMIC_RELAXED)
+	COPY_STAT(staging_acquires);
+	COPY_STAT(staging_hits);
+	COPY_STAT(staging_fallbacks);
+	COPY_STAT(staging_releases);
+	COPY_STAT(staging_registers);
+	COPY_STAT(staging_unregisters);
+	COPY_STAT(staging_lock_wait_ns);
+	COPY_STAT(staging_lock_hold_ns);
+	COPY_STAT(release_lock_wait_ns);
+	COPY_STAT(release_lock_hold_ns);
+	COPY_STAT(provider_unregisters);
+	COPY_STAT(provider_unregister_ns);
+	COPY_STAT(provider_registers);
+	COPY_STAT(provider_register_ns);
+	COPY_STAT(region_cleanup_ns);
+#undef COPY_STAT
+}
+
 static pthread_mutex_t g_provider_mutex = PTHREAD_MUTEX_INITIALIZER;
 static const struct spdk_nvme_urma_memory_provider *g_providers[SPDK_URMA_PROVIDER_COUNT];
 static uint32_t g_provider_refs[SPDK_URMA_PROVIDER_COUNT];
@@ -861,7 +913,12 @@ spdk_nvme_urma_register_memory(void *urma_context, void *addr, size_t length,
 		/* Do not attribute a provider failure without errno to a previous
 		 * syscall (for example ENOENT from device discovery). */
 		errno = 0;
+		uint64_t register_start = spdk_urma_memory_now_ns();
+
 		region->target_seg = urma_register_seg(urma_context, &cfg);
+		URMA_HOST_STAT_ADD(provider_registers, 1);
+		URMA_HOST_STAT_ADD(provider_register_ns,
+				   spdk_urma_memory_now_ns() - register_start);
 		if (region->target_seg != NULL && type != SPDK_NVME_URMA_MEM_HOST) {
 			SPDK_URMA_STAT_INC(peer_memory_registrations);
 		}
@@ -928,11 +985,18 @@ fail_provider:
 static void
 spdk_urma_memory_region_destroy(struct spdk_nvme_urma_memory_region *region)
 {
+	uint64_t cleanup_start;
+
 	/* Modified By Yida(v7): 整池 region 注销时同步移出注册表，防悬垂采纳 */
 	spdk_nvme_urma_region_registry_remove(region);
 	if (region->target_seg != NULL) {
+		uint64_t start = spdk_urma_memory_now_ns();
+
 		urma_unregister_seg(region->target_seg);
+		URMA_HOST_STAT_ADD(provider_unregisters, 1);
+		URMA_HOST_STAT_ADD(provider_unregister_ns, spdk_urma_memory_now_ns() - start);
 	}
+	cleanup_start = spdk_urma_memory_now_ns();
 	/* Modified by Yin: 注销路径补 close 释放 dma-buf fd，防每 I/O 泄漏 */
 	if (region->dmabuf_fd >= 0) {
 		close(region->dmabuf_fd);
@@ -946,6 +1010,7 @@ spdk_urma_memory_region_destroy(struct spdk_nvme_urma_memory_region *region)
 	}
 	free(region->seg_ctx);
 	free(region);
+	URMA_HOST_STAT_ADD(region_cleanup_ns, spdk_urma_memory_now_ns() - cleanup_start);
 }
 
 int
@@ -1007,6 +1072,8 @@ spdk_urma_register_memory_pool(void *urma_context, void *addr, size_t length,
 void
 spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 {
+	uint64_t start, locked;
+
 	if (region == NULL) {
 		return;
 	}
@@ -1014,7 +1081,10 @@ spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 		spdk_urma_memory_region_destroy(region);
 		return;
 	}
+	start = spdk_urma_memory_now_ns();
 	pthread_mutex_lock(&g_registration_mutex);
+	locked = spdk_urma_memory_now_ns();
+	URMA_HOST_STAT_ADD(release_lock_wait_ns, locked - start);
 	assert(region->owner_refs > 0);
 	if (--region->owner_refs == 0) {
 		/* Keep the lock through ungrant: a concurrent acquire must not
@@ -1024,7 +1094,192 @@ spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 		}
 		spdk_urma_memory_region_destroy(region);
 	}
+	URMA_HOST_STAT_ADD(release_lock_hold_ns, spdk_urma_memory_now_ns() - locked);
 	pthread_mutex_unlock(&g_registration_mutex);
+}
+
+static bool
+spdk_urma_host_staging_env(const char *name, uint32_t fallback, uint32_t *value)
+{
+	const char *text = getenv(name);
+	char *end;
+	unsigned long long parsed;
+
+	if (text == NULL) {
+		*value = fallback;
+		return true;
+	}
+	if (*text < '0' || *text > '9') {
+		return false;
+	}
+	errno = 0;
+	parsed = strtoull(text, &end, 10);
+	if (errno != 0 || *end != '\0' || parsed > UINT32_MAX) {
+		return false;
+	}
+	*value = (uint32_t)parsed;
+	return true;
+}
+
+int
+spdk_urma_host_staging_acquire(struct spdk_urma_device *device, size_t length,
+		struct spdk_urma_host_staging_slot **slot, void **addr,
+		struct spdk_nvme_urma_memory_region **region)
+{
+	struct spdk_urma_host_staging_pool *pool;
+	uint64_t start = spdk_urma_memory_now_ns(), locked;
+	int rc = -ENOTSUP;
+
+	if (device == NULL || device->context == NULL || slot == NULL || addr == NULL ||
+	    region == NULL || length == 0) {
+		return -EINVAL;
+	}
+	*slot = NULL;
+	*addr = NULL;
+	*region = NULL;
+	URMA_HOST_STAT_ADD(staging_acquires, 1);
+	pthread_mutex_lock(&g_host_staging_mutex);
+	locked = spdk_urma_memory_now_ns();
+	URMA_HOST_STAT_ADD(staging_lock_wait_ns, locked - start);
+	if (strncmp(device->dev_name, "bonding", 7) != 0) {
+		goto out;
+	}
+	if (!device->host_staging_configured) {
+		uint32_t count = 0, bytes = 0;
+
+		device->host_staging_configured = true;
+		if (!spdk_urma_host_staging_env("SPDK_URMA_HOST_STAGING_SLOTS",
+					      SPDK_URMA_HOST_STAGING_DEFAULT_SLOTS, &count) ||
+		    !spdk_urma_host_staging_env("SPDK_URMA_HOST_STAGING_SLOT_BYTES",
+					      SPDK_URMA_HOST_STAGING_DEFAULT_BYTES, &bytes) ||
+		    count > 4096 || bytes < 4096 || bytes > (8u << 20) ||
+		    (bytes & (bytes - 1)) != 0 || (uint64_t)count * bytes > (256u << 20)) {
+			SPDK_ERRLOG("Invalid URMA HOST staging configuration; "
+				    "using transient registrations\n");
+			count = 0;
+		}
+		device->host_staging_slots = count;
+		device->host_staging_slot_bytes = bytes;
+	}
+	if (device->host_staging_slots == 0 || length == 0 ||
+	    length > device->host_staging_slot_bytes) {
+		goto out;
+	}
+	pool = device->host_staging;
+	if (pool == NULL) {
+		pool = calloc(1, sizeof(*pool) + device->host_staging_slots * sizeof(*pool->slots));
+		if (pool == NULL) {
+			rc = -ENOMEM;
+			goto out;
+		}
+		pool->count = device->host_staging_slots;
+		pool->slot_bytes = device->host_staging_slot_bytes;
+		pool->buffer = spdk_urma_alloc_capsule_slots(pool->count, pool->slot_bytes);
+		if (pool->buffer == NULL) {
+			free(pool);
+			rc = -ENOMEM;
+			goto out;
+		}
+		rc = spdk_nvme_urma_register_memory(device->context, pool->buffer,
+				(size_t)pool->count * pool->slot_bytes,
+				SPDK_NVME_URMA_MEM_HOST, &pool->region);
+		if (rc != 0) {
+			free(pool->buffer);
+			free(pool);
+			goto out;
+		}
+		device->host_staging = pool;
+		URMA_HOST_STAT_ADD(staging_registers, 1);
+		/* Retain ownership even after export failure: final teardown must
+		 * check ungrant success before these registered pages can be freed. */
+		if (pool->region->seg_ctx_error != 0) {
+			rc = pool->region->seg_ctx_error;
+			pool->unusable = true;
+			goto out;
+		}
+		for (uint32_t i = 0; i < pool->count; i++) {
+			pool->slots[i].pool = pool;
+			pool->slots[i].addr = (char *)pool->buffer + (size_t)i * pool->slot_bytes;
+		}
+	}
+	if (pool->unusable) {
+		rc = -ENOTSUP;
+		goto out;
+	}
+	rc = -EAGAIN;
+	for (uint32_t i = 0; i < pool->count; i++) {
+		uint32_t index = pool->next++ % pool->count;
+		struct spdk_urma_host_staging_slot *candidate = &pool->slots[index];
+
+		if (!candidate->busy) {
+			candidate->busy = true;
+			pool->used++;
+			*slot = candidate;
+			*addr = candidate->addr;
+			*region = pool->region;
+			URMA_HOST_STAT_ADD(staging_hits, 1);
+			rc = 0;
+			break;
+		}
+	}
+out:
+	if (rc != 0) {
+		URMA_HOST_STAT_ADD(staging_fallbacks, 1);
+	}
+	URMA_HOST_STAT_ADD(staging_lock_hold_ns, spdk_urma_memory_now_ns() - locked);
+	pthread_mutex_unlock(&g_host_staging_mutex);
+	return rc;
+}
+
+void
+spdk_urma_host_staging_release(struct spdk_urma_host_staging_slot *slot)
+{
+	uint64_t start = spdk_urma_memory_now_ns(), locked;
+
+	pthread_mutex_lock(&g_host_staging_mutex);
+	locked = spdk_urma_memory_now_ns();
+	URMA_HOST_STAT_ADD(staging_lock_wait_ns, locked - start);
+	assert(slot->busy && slot->pool->used > 0);
+	slot->busy = false;
+	slot->pool->used--;
+	URMA_HOST_STAT_ADD(staging_releases, 1);
+	URMA_HOST_STAT_ADD(staging_lock_hold_ns, spdk_urma_memory_now_ns() - locked);
+	pthread_mutex_unlock(&g_host_staging_mutex);
+}
+
+bool
+spdk_urma_host_staging_fini(struct spdk_urma_device *device)
+{
+	struct spdk_urma_host_staging_pool *pool;
+	uint64_t start;
+	urma_status_t status;
+
+	pthread_mutex_lock(&g_host_staging_mutex);
+	pool = device->host_staging;
+	if (pool != NULL) {
+		if (pool->used != 0) {
+			pthread_mutex_unlock(&g_host_staging_mutex);
+			return false;
+		}
+		start = spdk_urma_memory_now_ns();
+		status = urma_unregister_seg(pool->region->target_seg);
+		URMA_HOST_STAT_ADD(provider_unregisters, 1);
+		URMA_HOST_STAT_ADD(provider_unregister_ns, spdk_urma_memory_now_ns() - start);
+		if (status != URMA_SUCCESS) {
+			pool->unusable = true;
+			pthread_mutex_unlock(&g_host_staging_mutex);
+			return false;
+		}
+		pool->region->target_seg = NULL;
+		spdk_nvme_urma_unregister_memory(pool->region);
+		free(pool->buffer);
+		free(pool);
+		device->host_staging = NULL;
+		URMA_HOST_STAT_ADD(staging_unregisters, 1);
+	}
+	device->host_staging_configured = false;
+	pthread_mutex_unlock(&g_host_staging_mutex);
+	return true;
 }
 
 int
@@ -1802,6 +2057,11 @@ spdk_urma_device_close(struct spdk_urma_device *device)
 	}
 	pthread_mutex_unlock(&g_device_mutex);
 
+	if (!spdk_urma_host_staging_fini(device)) {
+		SPDK_ERRLOG("URMA device %s quarantined: staging still busy or ungrant failed\n",
+			    device->dev_name);
+		return;
+	}
 	for (uint32_t i = 0; i < device->jfr_count; i++) {
 		if (device->jfrs != NULL && device->jfrs[i] != NULL) {
 			urma_delete_jfr(device->jfrs[i]);

@@ -639,9 +639,220 @@ bond_overlap_test(uint8_t opcode, unsigned failure)
 	free(buffer);
 }
 
+/* Doc 77: amortize registration across 32 sequential 256KiB children on
+ * alternating lanes while preserving the application buffer's lifetime. */
+static void
+bond_staging_reuse_test(void)
+{
+	urma_context_t context = {};
+	struct spdk_urma_device device = {.context = &context};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_urma_qpair qs[2] = {};
+	struct spdk_urma_capsule_cmd_frame frame;
+	unsigned base_reg = registrations, base_unreg = unregistrations;
+	int fds[2][2];
+	uint8_t *buffer = aligned_alloc(4096, 262144);
+
+	assert(buffer);
+	assert(setenv("SPDK_URMA_HOST_STAGING_SLOTS", "4", 1) == 0);
+	assert(setenv("SPDK_URMA_HOST_STAGING_SLOT_BYTES", "262144", 1) == 0);
+	strcpy(device.dev_name, "bonding_dev_40");
+	reject_duplicate = true;
+	for (unsigned i = 0; i < 2; i++) {
+		assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds[i]) == 0);
+		qs[i].device = &device;
+		qs[i].fd = fds[i][0];
+		qs[i].num_entries = 32;
+		qs[i].capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
+		qs[i].qpair.ctrlr = &ctrlr;
+		qs[i].qpair.id = 2 + i;
+		qs[i].cid_bitmap = calloc(4, 1);
+		TAILQ_INIT(&qs[i].outstanding);
+	}
+	struct nvme_request req = {
+		.qpair_reserved = true, .cb_fn = request_done,
+		.payload_type = NVME_PAYLOAD_TYPE_CONTIG,
+	};
+	req.cmd.opc = SPDK_NVME_OPC_READ;
+	req.payload.contig_or_cb_arg = buffer;
+	req.payload.size = 262144;
+	for (unsigned i = 0; i < 32; i++) {
+		unsigned lane = i % 2;
+		assert(nvme_urma_qpair_submit_request(&qs[lane].qpair, &req) == 0);
+		assert(recv(fds[lane][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+		memset((void *)(uintptr_t)frame.capsule.data.address, i, 262144);
+		complete_request(&qs[lane], &req, false);
+		for (unsigned j = 0; j < 262144; j++) {
+			assert(buffer[j] == i);
+		}
+	}
+	if (registrations != base_reg + 1 || unregistrations != base_unreg) {
+		fprintf(stderr, "RED Doc77: 32 children caused %u registrations and %u "
+			"unregistrations; expected one SPDK-owned persistent pool\n",
+			registrations - base_reg, unregistrations - base_unreg);
+		abort();
+	}
+	/* WRITE copies before submit; failed/aborted READs must not copy back. */
+	struct spdk_urma_host_memory_stats memory_stats;
+	spdk_urma_get_host_memory_stats(&memory_stats);
+	assert(memory_stats.staging_hits == 32 && memory_stats.staging_registers == 1);
+	assert(memory_stats.staging_unregisters == 0 && memory_stats.staging_releases == 32);
+	memset(buffer, 0x73, 262144);
+	req.cmd.opc = SPDK_NVME_OPC_WRITE;
+	assert(nvme_urma_qpair_submit_request(&qs[0].qpair, &req) == 0);
+	assert(recv(fds[0][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(frame.capsule.data.address != (uint64_t)buffer);
+	assert(frame.capsule.data.flags == 0);
+	assert(memcmp((void *)(uintptr_t)frame.capsule.data.address, buffer, 262144) == 0);
+	complete_request(&qs[0], &req, false);
+	struct nvme_request pending[5];
+	uint8_t *buffers = aligned_alloc(4096, 5 * 262144);
+	assert(buffers);
+	memset(buffers, 0, 5 * 262144);
+	for (unsigned i = 0; i < 5; i++) {
+		pending[i] = req;
+		pending[i].cmd.opc = SPDK_NVME_OPC_READ;
+		pending[i].payload.contig_or_cb_arg = buffers + i * 262144;
+		assert(nvme_urma_qpair_submit_request(&qs[0].qpair, &pending[i]) == 0);
+		assert(recv(fds[0][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+		assert((frame.capsule.data.flags == 0) == (i < 4));
+		memset((void *)(uintptr_t)frame.capsule.data.address, i + 1, 262144);
+	}
+	assert(registrations == base_reg + 2); /* Only the fifth request falls back. */
+#ifdef SPDK_URMA_HOST_STAGING_DEFAULT_SLOTS
+	assert(!spdk_urma_host_staging_fini(&device));
+#endif
+	complete_request(&qs[0], &pending[4], false);
+	complete_request(&qs[0], &pending[3], false);
+	complete_request(&qs[0], &pending[2], false);
+	complete_request(&qs[0], &pending[1], true);
+	nvme_urma_qpair_abort_reqs(&qs[0].qpair, 1);
+	for (unsigned i = 0; i < 5; i++) {
+		for (unsigned j = 0; j < 262144; j++) {
+			assert(buffers[i * 262144 + j] == (i < 2 ? 0 : i + 1));
+		}
+	}
+	assert(unregistrations == base_unreg + 1);
+	struct nvme_request subrange = req;
+	subrange.cmd.opc = SPDK_NVME_OPC_READ;
+	subrange.payload.contig_or_cb_arg = buffers;
+	subrange.payload.offset = 64;
+	subrange.payload.size = 8192;
+	assert(nvme_urma_qpair_submit_request(&qs[0].qpair, &subrange) == 0);
+	assert(recv(fds[0][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	memset((void *)(uintptr_t)frame.capsule.data.address, 0x9c, 8192);
+	complete_request(&qs[0], &subrange, false);
+	assert(buffers[63] == 0 && buffers[64 + 8192] == 0);
+	for (unsigned i = 64; i < 64 + 8192; i++) {
+		assert(buffers[i] == 0x9c);
+	}
+	subrange.cmd.opc = SPDK_NVME_OPC_WRITE;
+	assert(nvme_urma_qpair_submit_request(&qs[0].qpair, &subrange) == 0);
+	assert(recv(fds[0][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(memcmp((void *)(uintptr_t)frame.capsule.data.address, buffers + 64, 8192) == 0);
+	complete_request(&qs[0], &subrange, false);
+	/* Oversized payloads retain the transient path without enlarging the pool. */
+	req.payload.contig_or_cb_arg = buffers;
+	req.payload.size = 524288;
+	assert(nvme_urma_qpair_submit_request(&qs[0].qpair, &req) == 0);
+	assert(recv(fds[0][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(frame.capsule.data.flags & SPDK_URMA_DATA_TRANSIENT);
+	complete_request(&qs[0], &req, false);
+	/* Explicit registration still has priority and never gets copied. */
+	struct spdk_nvme_urma_memory_region *external;
+	assert(spdk_nvme_urma_register_memory(&context, buffer, 262144,
+			SPDK_NVME_URMA_MEM_HOST, &external) == 0);
+	assert(spdk_nvme_urma_region_registry_add(&context, buffer, 262144, external) == 0);
+	req.payload.contig_or_cb_arg = buffer;
+	req.payload.size = 262144;
+	assert(nvme_urma_qpair_submit_request(&qs[0].qpair, &req) == 0);
+	assert(recv(fds[0][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(frame.capsule.data.address == (uint64_t)buffer && frame.capsule.data.flags == 0);
+	complete_request(&qs[0], &req, false);
+	spdk_nvme_urma_unregister_memory(external);
+	assert(shutdown(fds[1][0], SHUT_WR) == 0);
+	assert(nvme_urma_qpair_submit_request(&qs[1].qpair, &req) != 0);
+	assert(TAILQ_EMPTY(&qs[1].outstanding));
+	unsigned before_fini = unregistrations;
+#ifdef SPDK_URMA_HOST_STAGING_DEFAULT_SLOTS
+	assert(spdk_urma_host_staging_fini(&device));
+#endif
+	for (unsigned i = 0; i < 2; i++) {
+		cleanup(&qs[i]);
+		close(fds[i][0]);
+		close(fds[i][1]);
+	}
+	assert(unregistrations == before_fini + 1 && duplicate_rejections == 0);
+	reject_duplicate = false;
+	free(buffers);
+	free(buffer);
+	assert(setenv("SPDK_URMA_HOST_STAGING_SLOTS", "0", 1) == 0);
+	puts("PASS bond staging: 32 children/one grant, write/read copies, "
+	     "pool-full/large fallback, error/abort/send cleanup, "
+	     "busy drain and explicit pool priority");
+}
+
+static void
+bond_staging_init_failure_test(bool export_error)
+{
+	urma_context_t context = {};
+	struct spdk_urma_device device = {.context = &context};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	int fds[2];
+	struct spdk_urma_capsule_cmd_frame frame;
+	uint8_t *buffer = aligned_alloc(4096, 4096);
+	unsigned before_reg = registrations, before_unreg = unregistrations;
+
+	assert(buffer);
+	assert(setenv("SPDK_URMA_HOST_STAGING_SLOTS", "4", 1) == 0);
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	strcpy(device.dev_name, "bonding_dev_40");
+	struct nvme_urma_qpair q = {
+		.device = &device, .fd = fds[0], .num_entries = 32,
+		.capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP,
+	};
+	q.qpair.ctrlr = &ctrlr;
+	q.qpair.id = 2;
+	q.cid_bitmap = calloc(4, 1);
+	TAILQ_INIT(&q.outstanding);
+	struct nvme_request req = {
+		.qpair_reserved = true, .cb_fn = request_done,
+		.payload_type = NVME_PAYLOAD_TYPE_CONTIG,
+	};
+	req.cmd.opc = SPDK_NVME_OPC_READ;
+	req.payload.contig_or_cb_arg = buffer;
+	req.payload.size = 512;
+	fail_export = export_error;
+	fail_bounce_alloc = !export_error;
+	int rc = nvme_urma_qpair_submit_request(&q.qpair, &req);
+	fail_export = fail_bounce_alloc = false;
+	if (export_error) {
+		assert(rc == -EIO && TAILQ_EMPTY(&q.outstanding));
+		assert(registrations == before_reg + 2 && unregistrations == before_unreg + 1);
+		/* The unusable registered pool stays owned until checked teardown. */
+		assert(nvme_urma_qpair_submit_request(&q.qpair, &req) == 0);
+	} else {
+		assert(rc == 0);
+	}
+	assert(recv(fds[1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(frame.capsule.data.address == (uint64_t)buffer);
+	assert(frame.capsule.data.flags & SPDK_URMA_DATA_TRANSIENT);
+	complete_request(&q, &req, false);
+	assert(spdk_urma_host_staging_fini(&device));
+	cleanup(&q);
+	assert(registrations - before_reg == unregistrations - before_unreg);
+	free(buffer);
+	close(fds[0]);
+	close(fds[1]);
+	assert(setenv("SPDK_URMA_HOST_STAGING_SLOTS", "0", 1) == 0);
+}
+
 int
 main(void)
 {
+	bond_staging_reuse_test();
+	bond_staging_init_failure_test(false);
+	bond_staging_init_failure_test(true);
 	bond_data_lifetime_test();
 	for (unsigned failure = 0; failure < 7; failure++) {
 		bond_overlap_test(SPDK_NVME_OPC_READ, failure);
