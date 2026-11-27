@@ -723,8 +723,8 @@ nvmf_urma_rsp_tx_pool_init(struct nvmf_urma_qpair *uqpair)
 	if (uqpair->capsule_tx_count == 0) {
 		return -EINVAL;
 	}
-	uqpair->capsule_tx_slots = calloc(uqpair->capsule_tx_count,
-					  sizeof(*uqpair->capsule_tx_slots));
+	uqpair->capsule_tx_slots = spdk_urma_alloc_capsule_slots(uqpair->capsule_tx_count,
+							 sizeof(*uqpair->capsule_tx_slots));
 	if (uqpair->capsule_tx_slots == NULL) {
 		return -ENOMEM;
 	}
@@ -804,7 +804,7 @@ nvmf_urma_capsule_rx_post(struct nvmf_urma_qpair *uqpair, uint32_t count)
 		return -EINVAL;
 	}
 	uqpair->capsule_rx_count = count;
-	uqpair->capsule_rx_slots = calloc(count, sizeof(*uqpair->capsule_rx_slots));
+	uqpair->capsule_rx_slots = spdk_urma_alloc_capsule_slots(count, sizeof(*uqpair->capsule_rx_slots));
 	if (uqpair->capsule_rx_slots == NULL) {
 		uqpair->capsule_rx_count = 0;
 		return -ENOMEM;
@@ -855,9 +855,9 @@ nvmf_urma_capsule_resources_init(struct nvmf_urma_qpair *uqpair)
 {
 	int rc;
 
-	/* Keep the original ordering: allocate/register the TX pool before any
-	 * receive WR is posted, so a partial-init failure cannot leave a posted
-	 * WR naming memory that teardown is about to release. */
+	/* HELLO may already have posted RX. Initialize TX before the idempotent
+	 * RX fallback here; failures must still follow qpair drain because any
+	 * previously posted receives retain their slot/qpair lifetime references. */
 	rc = nvmf_urma_rsp_tx_pool_init(uqpair);
 	if (rc != 0) {
 		return rc;
@@ -1017,7 +1017,9 @@ nvmf_urma_handshake_apply(struct nvmf_urma_qpair *uqpair)
 	local->transport_mode = device->opts.transport_mode;
 	local->tp_type = device->opts.tp_type;
 	local->max_queue_depth = max_queue_depth;
-	local->max_io_size = uqpair->transport->transport.opts.max_io_size;
+	/* Advertise the limit already bounded by the actual iobuf slot and peer.
+	 * The configured max_io_size may deliberately be larger than a slot. */
+	local->max_io_size = uqpair->max_io_size;
 	local->capsule_transport = uqpair->capsule_transport;
 	rc = spdk_urma_export_rjettys(device, uqpair->jettys, local, &uqpair->hs_local_data);
 	if (rc != 0) {
@@ -1427,12 +1429,33 @@ nvmf_urma_import_cache_fini(struct nvmf_urma_transport *transport)
 	}
 }
 
+static uint32_t
+nvmf_urma_iobuf_max_io_size(uint32_t requested, const struct spdk_iobuf_opts *iobuf)
+{
+	uint32_t slot = spdk_max(iobuf->small_bufsize, iobuf->large_bufsize);
+	uint32_t limit = spdk_min(requested, slot);
+
+	/* The data path uses one local SGE. Pool slot sizes are independently
+	 * configured and need not be powers of two (the default large is 132K).
+	 * Round down so every advertised command fits one actual slot. */
+	return limit < 8192 ? 0 : 1u << spdk_u32log2(limit);
+}
+
 static struct spdk_nvmf_transport *
 nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 {
-	struct nvmf_urma_transport *transport = calloc(1, sizeof(*transport));
+	struct nvmf_urma_transport *transport;
 	struct nvmf_urma_json_opts json_opts = {};
+	struct spdk_iobuf_opts iobuf = {};
+	uint32_t max_io_size;
 
+	spdk_iobuf_get_opts(&iobuf, sizeof(iobuf));
+	max_io_size = nvmf_urma_iobuf_max_io_size(opts->max_io_size, &iobuf);
+	if (max_io_size == 0) {
+		SPDK_ERRLOG("URMA requires max_io_size and an iobuf slot of at least 8192 bytes\n");
+		return NULL;
+	}
+	transport = calloc(1, sizeof(*transport));
 	if (transport == NULL) {
 		return NULL;
 	}
@@ -1540,7 +1563,10 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	free(json_opts.trans_mode);
 	free(json_opts.capsule_transport);
 	free(json_opts.tp_type);
-	transport->urma_opts.max_io_size = opts->max_io_size;
+	transport->urma_opts.max_io_size = max_io_size;
+	SPDK_NOTICELOG("URMA iobuf: small=%u large=%u requested_max_io_size=%u "
+		       "effective_max_io_size=%u (single buffer)\n",
+		       iobuf.small_bufsize, iobuf.large_bufsize, opts->max_io_size, max_io_size);
 	if (spdk_urma_device_open(&transport->urma_opts, &transport->device) != 0) {
 		/* Modified By Yida(v6): 具体失败阶段由 device_open 内部日志给出，这里带设备名兜底 */
 		SPDK_ERRLOG("urma transport create: device open failed for '%s'\n",
@@ -1580,6 +1606,7 @@ static void
 nvmf_urma_dump_opts(struct spdk_nvmf_transport *base, struct spdk_json_write_ctx *w)
 {
 	struct nvmf_urma_transport *transport = SPDK_CONTAINEROF(base, struct nvmf_urma_transport, transport);
+	struct spdk_iobuf_opts iobuf = {};
 	const char *mode = transport->urma_opts.transport_mode == URMA_TM_RC ? "RC" :
 			   transport->urma_opts.transport_mode == URMA_TM_UM ? "UM" : "RM";
 
@@ -1601,6 +1628,10 @@ nvmf_urma_dump_opts(struct spdk_nvmf_transport *base, struct spdk_json_write_ctx
 	spdk_json_write_named_bool(w, "bonding_balance", transport->urma_opts.bonding_balance);
 	spdk_json_write_named_bool(w, "bonding_multipath", transport->urma_opts.bonding_multipath);
 	spdk_json_write_named_bool(w, "numa_affinity", transport->urma_opts.numa_affinity);
+	spdk_json_write_named_uint32(w, "effective_max_io_size", transport->urma_opts.max_io_size);
+	spdk_iobuf_get_opts(&iobuf, sizeof(iobuf));
+	spdk_json_write_named_uint32(w, "iobuf_small_bufsize", iobuf.small_bufsize);
+	spdk_json_write_named_uint32(w, "iobuf_large_bufsize", iobuf.large_bufsize);
 }
 
 static void
@@ -1821,6 +1852,32 @@ nvmf_urma_qpair_drained(struct nvmf_urma_qpair *uqpair)
 	       spdk_urma_lifetime_refs(&uqpair->lifetime) == 0;
 }
 
+static bool
+nvmf_urma_unimport_transient(struct nvmf_urma_req *ureq)
+{
+	struct nvmf_urma_qpair *uqpair = nvmf_urma_qpair(ureq->req.qpair);
+
+	if ((ureq->remote_data.flags & SPDK_URMA_DATA_TRANSIENT) == 0 ||
+	    ureq->remote_seg == NULL || ureq->remote_seg_cached) {
+		return true;
+	}
+	if (urma_unimport_seg(ureq->remote_seg) != URMA_SUCCESS) {
+		/* Preserve provider-owned context bytes and retry on the qpair's
+		 * owner thread. This also keeps a closing qpair from being freed. */
+		if (ureq->state != NVMF_URMA_REQ_WAIT_TX) {
+			SPDK_ERRLOG("URMA transient segment unimport failed; retrying: "
+				    "qid=%u cid=%u\n", uqpair->qpair.qid, ureq->cmd.nvme_cmd.cid);
+			ureq->state = NVMF_URMA_REQ_WAIT_TX;
+			uqpair->pending_responses++;
+		}
+		return false;
+	}
+	free(ureq->remote_seg_handle);
+	ureq->remote_seg = NULL;
+	ureq->remote_seg_handle = NULL;
+	return true;
+}
+
 static int
 nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 {
@@ -1832,6 +1889,14 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 	};
 	int rc;
 	uint64_t t_rsp0 = spdk_get_ticks(); /* Modified By Yida(v3): W10 start */
+
+	/* All data WRs have completed before a response is sent. The initiator
+	 * may ungrant a transient segment as soon as it receives these bytes,
+	 * so retire our import first, including on error and TX-backpressure
+	 * paths. A retry observes NULL and cannot unimport it twice. */
+	if (!nvmf_urma_unimport_transient(ureq)) {
+		return 0;
+	}
 
 	/* SE_Review #2: 错误路径（数据搬运 post 失败、CR 错误）可能在
 	 * nvmf_urma_req_complete() 之前直接走响应，而 rsp 在收命令时被清零。
@@ -1920,6 +1985,11 @@ nvmf_urma_send_response(struct nvmf_urma_req *ureq)
 	} else {
 		uint8_t msg[sizeof(hdr) + sizeof(rsp)];
 
+		if (ureq->state == NVMF_URMA_REQ_WAIT_TX) {
+			assert(uqpair->pending_responses > 0);
+			uqpair->pending_responses--;
+			ureq->state = NVMF_URMA_REQ_EXECUTING;
+		}
 		memcpy(msg, &hdr, sizeof(hdr));
 		memcpy(msg + sizeof(hdr), &rsp, sizeof(rsp));
 		rc = nvmf_urma_write_full(uqpair->fd, msg, sizeof(msg));
@@ -2023,7 +2093,8 @@ nvmf_urma_post_data(struct nvmf_urma_req *ureq, bool push)
 	 * import 的 tseg，只有首次见到的 seg 才真正调 urma_import_seg。
 	 * initiator 整池注册时所有 I/O 共享同一 seg → 每个共享 context 仅 1 次 import。 */
 	ureq->remote_seg_cached = false;
-	if (nvmf_urma_import_cache_enabled()) {
+	if (nvmf_urma_import_cache_enabled() &&
+	    (ureq->remote_data.flags & SPDK_URMA_DATA_TRANSIENT) == 0) {
 		struct nvmf_urma_transport *transport = uqpair->transport;
 		struct nvmf_urma_import_entry *e;
 
@@ -2840,6 +2911,9 @@ nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 	const struct spdk_nvmf_request *req = &ureq->req;
 	uint64_t hz = stage->target_ticks_hz;
 
+	if (!nvmf_urma_unimport_transient(ureq)) {
+		return;
+	}
 	if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ && req->p99_trace_enabled) {
 		spdk_trace_record(TRACE_URMA_P99_END, 0, 0, 0,
 				  (uintptr_t)req, stage->trace_seq, stage->flags);
@@ -2918,6 +2992,10 @@ nvmf_urma_release_req(struct nvmf_urma_req *ureq)
 					       &uqpair->transport->transport);
 	}
 	ureq->req.iovcnt = 0;
+	if (ureq->state == NVMF_URMA_REQ_WAIT_TX) {
+		assert(uqpair->pending_responses > 0);
+		uqpair->pending_responses--;
+	}
 	ureq->state = NVMF_URMA_REQ_FREE;
 	TAILQ_REMOVE(&uqpair->working_reqs, ureq, link);
 	TAILQ_INSERT_TAIL(&uqpair->free_reqs, ureq, link);
@@ -3132,6 +3210,8 @@ nvmf_urma_drain_poll(void *arg)
 {
 	struct nvmf_urma_qpair *uqpair = arg;
 
+	/* The qpair may already be absent from its transport poll group. */
+	(void)nvmf_urma_retry_responses(uqpair);
 	(void)nvmf_urma_qpair_quiesce_receives(uqpair);
 	if (nvmf_urma_qpair_drained(uqpair)) {
 		nvmf_urma_qpair_drain_finish(uqpair);

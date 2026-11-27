@@ -25,7 +25,8 @@
 #define SPDK_URMA_RX_QUIESCE_BUDGET 4096
 
 #define SPDK_URMA_WIRE_MAGIC 0x41524d55u /* "URMA", little endian */
-#define SPDK_URMA_WIRE_VERSION 6
+/* v7 adds request-owned segment lifetime; v6 targets cache every import. */
+#define SPDK_URMA_WIRE_VERSION 7
 #define SPDK_URMA_MAX_RJETTY_SIZE (16 * 1024)
 #define SPDK_URMA_MAX_SEG_CTX_SIZE 4096
 #define SPDK_URMA_MAX_JETTY_PER_EP 32
@@ -93,8 +94,12 @@ struct spdk_urma_data_desc {
 	uint64_t address;
 	uint32_t length;
 	uint8_t chip_id;
-	uint8_t reserved[3];
+	/* A transient segment must be unimported before posting its response. */
+	uint8_t flags;
+	uint8_t reserved[2];
 };
+
+#define SPDK_URMA_DATA_TRANSIENT (1u << 0)
 
 struct spdk_urma_capsule_cmd {
 	struct spdk_nvme_cmd cmd;
@@ -254,6 +259,10 @@ int spdk_urma_device_poll_recv_jfc_locked(struct spdk_urma_device *device, uint3
 void spdk_urma_device_lock_recv_jfcs(struct spdk_urma_device *device);
 void spdk_urma_device_unlock_recv_jfcs(struct spdk_urma_device *device);
 uint8_t spdk_urma_memory_chip_id(const void *addr);
+/* Capsule slot arrays own complete host/grant pages. Register the logical
+ * count * slot_size bytes; free() only after unregister and WR/CR drain.
+ * Unlike DMA/iobuf allocations these are ordinary zeroed host allocations. */
+void *spdk_urma_alloc_capsule_slots(size_t count, size_t slot_size);
 urma_target_seg_t *spdk_urma_memory_region_get_tseg(
 	struct spdk_nvme_urma_memory_region *region);
 
@@ -266,6 +275,12 @@ int spdk_nvme_urma_region_registry_add(void *urma_context, void *addr, size_t le
 int spdk_urma_register_memory_pool(void *urma_context, void *addr, size_t length,
 			       enum spdk_nvme_urma_memory_type type,
 			       struct spdk_nvme_urma_memory_region **region);
+/* Request-owned HOST grants, shared across qpairs of the same context. A
+ * covering live grant is acquired by reference; partial overlap returns
+ * -EADDRINUSE without calling the provider. Release before the I/O callback.
+ * These grants are deliberately absent from the borrowed whole-pool registry. */
+int spdk_urma_acquire_host_memory(void *urma_context, void *addr, size_t length,
+				  struct spdk_nvme_urma_memory_region **region);
 void spdk_nvme_urma_region_registry_remove(struct spdk_nvme_urma_memory_region *region);
 struct spdk_nvme_urma_memory_region *
 spdk_nvme_urma_region_registry_find(void *urma_context, uint64_t addr, size_t length);

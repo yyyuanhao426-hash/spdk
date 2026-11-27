@@ -7,6 +7,42 @@
 
 #define SPDK_URMA_PROVIDER_COUNT (SPDK_NVME_URMA_MEM_XDS + 1)
 
+void *
+spdk_urma_alloc_capsule_slots(size_t count, size_t slot_size)
+{
+	long host_page = sysconf(_SC_PAGESIZE);
+	size_t alignment, bytes;
+	void *slots;
+	int rc;
+
+	/* Registration expands to 4K grant pages. A calloc array can share its
+	 * first/last page with another qpair's RX or TX array, causing overlapping
+	 * live grants on bonding contexts (Doc 65). Own complete pages at both
+	 * ends, including when the host uses pages larger than the grant granule. */
+	if (host_page <= 0 || count == 0 || slot_size == 0) {
+		errno = EINVAL;
+		return NULL;
+	}
+	alignment = spdk_max((size_t)host_page, (size_t)4096);
+	if ((alignment & (alignment - 1)) != 0 || count > SIZE_MAX / slot_size) {
+		errno = EOVERFLOW;
+		return NULL;
+	}
+	bytes = count * slot_size;
+	if (bytes > SIZE_MAX - (alignment - 1)) {
+		errno = EOVERFLOW;
+		return NULL;
+	}
+	bytes = SPDK_ALIGN_CEIL(bytes, alignment);
+	rc = posix_memalign(&slots, alignment, bytes);
+	if (rc != 0) {
+		errno = rc;
+		return NULL;
+	}
+	memset(slots, 0, bytes);
+	return slots;
+}
+
 struct spdk_nvme_urma_memory_region {
 	void *addr;
 	size_t length;
@@ -20,7 +56,11 @@ struct spdk_nvme_urma_memory_region {
 	int seg_ctx_error;
 	/* Set before publishing a whole-pool region; immutable thereafter. */
 	bool shared_pool;
-	uint32_t pool_refs;
+	uint32_t owner_refs;
+	/* Request-owned grants never outlive their final in-flight user. */
+	bool shared_io;
+	void *io_context;
+	TAILQ_ENTRY(spdk_nvme_urma_memory_region) io_link;
 };
 
 static pthread_mutex_t g_provider_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -204,6 +244,7 @@ spdk_urma_validate_cmd(const struct spdk_urma_msg_hdr *hdr, const struct spdk_ur
 {
 	if (hdr->magic != SPDK_URMA_WIRE_MAGIC || hdr->version != SPDK_URMA_WIRE_VERSION ||
 	    hdr->type != SPDK_URMA_MSG_CAPSULE_CMD ||
+	    (cmd->data.flags & ~SPDK_URMA_DATA_TRANSIENT) != 0 ||
 	    cmd->seg_ctx_length > SPDK_URMA_MAX_SEG_CTX_SIZE ||
 	    (cmd->seg_ctx_length != 0 && cmd->seg_ctx_length < sizeof(urma_seg_t)) ||
 	    (cmd->data.length == 0 && cmd->seg_ctx_length != 0) ||
@@ -640,10 +681,11 @@ struct nvme_urma_region_entry {
 static TAILQ_HEAD(, nvme_urma_region_entry) g_region_registry =
 	TAILQ_HEAD_INITIALIZER(g_region_registry);
 static pthread_mutex_t g_region_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
-/* Serialize whole-pool acquisition through the final provider ungrant.
- * Lock order is pool -> registry. Ordinary temporary registrations do not
- * acquire this mutex or gain shared ownership. */
-static pthread_mutex_t g_pool_registration_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Serialize shared acquisition through the final provider ungrant.
+ * Lock order is registration -> registry. Direct registrations remain private. */
+static pthread_mutex_t g_registration_mutex = PTHREAD_MUTEX_INITIALIZER;
+static TAILQ_HEAD(, spdk_nvme_urma_memory_region) g_io_regions =
+	TAILQ_HEAD_INITIALIZER(g_io_regions);
 
 int
 spdk_nvme_urma_region_registry_add(void *urma_context, void *addr, size_t length,
@@ -924,7 +966,7 @@ spdk_urma_register_memory_pool(void *urma_context, void *addr, size_t length,
 	    length > UINTPTR_MAX - start || (unsigned)type >= SPDK_URMA_PROVIDER_COUNT) {
 		return -EINVAL;
 	}
-	pthread_mutex_lock(&g_pool_registration_mutex);
+	pthread_mutex_lock(&g_registration_mutex);
 	pthread_mutex_lock(&g_region_registry_mutex);
 	TAILQ_FOREACH(entry, &g_region_registry, link) {
 		region = entry->region;
@@ -933,15 +975,15 @@ spdk_urma_register_memory_pool(void *urma_context, void *addr, size_t length,
 		 * Registry find() is a borrowed I/O lookup, not an ownership acquire. */
 		if (entry->context == urma_context && entry->start == start &&
 		    entry->end == start + length && region->shared_pool && region->type == type) {
-			if (region->pool_refs == UINT32_MAX) {
+			if (region->owner_refs == UINT32_MAX) {
 				rc = -EOVERFLOW;
 			} else {
-				region->pool_refs++;
+				region->owner_refs++;
 				*region_out = region;
 				rc = 0;
 			}
 			pthread_mutex_unlock(&g_region_registry_mutex);
-			pthread_mutex_unlock(&g_pool_registration_mutex);
+			pthread_mutex_unlock(&g_registration_mutex);
 			return rc;
 		}
 	}
@@ -950,7 +992,7 @@ spdk_urma_register_memory_pool(void *urma_context, void *addr, size_t length,
 	rc = spdk_nvme_urma_register_memory(urma_context, addr, length, type, &region);
 	if (rc == 0) {
 		region->shared_pool = true;
-		region->pool_refs = 1;
+		region->owner_refs = 1;
 		rc = spdk_nvme_urma_region_registry_add(urma_context, addr, length, region);
 		if (rc == 0) {
 			*region_out = region;
@@ -958,7 +1000,7 @@ spdk_urma_register_memory_pool(void *urma_context, void *addr, size_t length,
 			spdk_urma_memory_region_destroy(region);
 		}
 	}
-	pthread_mutex_unlock(&g_pool_registration_mutex);
+	pthread_mutex_unlock(&g_registration_mutex);
 	return rc;
 }
 
@@ -968,18 +1010,90 @@ spdk_nvme_urma_unregister_memory(struct spdk_nvme_urma_memory_region *region)
 	if (region == NULL) {
 		return;
 	}
-	if (!region->shared_pool) {
+	if (!region->shared_pool && !region->shared_io) {
 		spdk_urma_memory_region_destroy(region);
 		return;
 	}
-	pthread_mutex_lock(&g_pool_registration_mutex);
-	assert(region->pool_refs > 0);
-	if (--region->pool_refs == 0) {
+	pthread_mutex_lock(&g_registration_mutex);
+	assert(region->owner_refs > 0);
+	if (--region->owner_refs == 0) {
 		/* Keep the lock through ungrant: a concurrent acquire must not
 		 * register the same range while the previous grant is still live. */
+		if (region->shared_io) {
+			TAILQ_REMOVE(&g_io_regions, region, io_link);
+		}
 		spdk_urma_memory_region_destroy(region);
 	}
-	pthread_mutex_unlock(&g_pool_registration_mutex);
+	pthread_mutex_unlock(&g_registration_mutex);
+}
+
+int
+spdk_urma_acquire_host_memory(void *urma_context, void *addr, size_t length,
+				  struct spdk_nvme_urma_memory_region **region_out)
+{
+	struct spdk_nvme_urma_memory_region *region;
+	struct nvme_urma_region_entry *entry;
+	uintptr_t start = (uintptr_t)addr, base, end;
+	int rc;
+
+	if (region_out == NULL) {
+		return -EINVAL;
+	}
+	*region_out = NULL;
+	if (urma_context == NULL || addr == NULL || length == 0 ||
+	    length > UINTPTR_MAX - start || start + length > UINTPTR_MAX - 4095) {
+		return -EINVAL;
+	}
+	base = SPDK_ALIGN_FLOOR(start, (uintptr_t)4096);
+	end = SPDK_ALIGN_CEIL(start + length, (uintptr_t)4096);
+	pthread_mutex_lock(&g_registration_mutex);
+	/* The submit path already borrowed any logically covering application
+	 * pool. A request outside its logical range may still share a grant page
+	 * with that pool; stage it instead of registering the page a second time. */
+	pthread_mutex_lock(&g_region_registry_mutex);
+	TAILQ_FOREACH(entry, &g_region_registry, link) {
+		urma_seg_t *seg = &entry->region->target_seg->seg;
+
+		if (entry->context == urma_context && base < seg->ubva.va + seg->len &&
+		    seg->ubva.va < end) {
+			pthread_mutex_unlock(&g_region_registry_mutex);
+			pthread_mutex_unlock(&g_registration_mutex);
+			return -EADDRINUSE;
+		}
+	}
+	pthread_mutex_unlock(&g_region_registry_mutex);
+	TAILQ_FOREACH(region, &g_io_regions, io_link) {
+		uintptr_t old_base = (uintptr_t)region->addr;
+		uintptr_t old_end = old_base + region->length;
+
+		if (region->io_context != urma_context || end <= old_base || base >= old_end) {
+			continue;
+		}
+		if (base < old_base || end > old_end) {
+			/* A live grant cannot be extended in place. The caller can stage
+			 * this request on independent pages instead of re-granting them. */
+			rc = -EADDRINUSE;
+		} else if (region->owner_refs == UINT32_MAX) {
+			rc = -EOVERFLOW;
+		} else {
+			region->owner_refs++;
+			*region_out = region;
+			rc = 0;
+		}
+		pthread_mutex_unlock(&g_registration_mutex);
+		return rc;
+	}
+	rc = spdk_nvme_urma_register_memory(urma_context, (void *)base, end - base,
+			SPDK_NVME_URMA_MEM_HOST, &region);
+	if (rc == 0) {
+		region->shared_io = true;
+		region->io_context = urma_context;
+		region->owner_refs = 1;
+		TAILQ_INSERT_TAIL(&g_io_regions, region, io_link);
+		*region_out = region;
+	}
+	pthread_mutex_unlock(&g_registration_mutex);
+	return rc;
 }
 
 void *

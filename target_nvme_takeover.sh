@@ -26,6 +26,8 @@
 #   ./target_nvme_takeover.sh -d nvme3n1 -I 8192,8192,1024,4194304 -O 4194304
 #       # 4MB 大 I/O：重配 iobuf 池（large=1024×4MB）+ URMA transport max_io_size=4MB
 #       # 注意：initiator 侧也要 export SPDK_URMA_MAX_IO_SIZE=4194304，且 urma_perf -o ≤ 4MB
+#   ./target_nvme_takeover.sh -d nvme3n1 -I 16384,8192,1024,262144 -O 8388608
+#       # large slot 独立设为 256 KiB；URMA 按实际池容量协商单次上限，initiator 拆分大 I/O
 #
 # 选项：
 #   -d <盘名>    目标 NVMe 盘（如 nvme3n1）；可逗号分隔或重复 -d 接管多块盘；
@@ -37,9 +39,9 @@
 #   -I <四元组>  iobuf 池 "小池数量,小池buf,大池数量,大池buf"（字节），
 #                如 8192,8192,1024,4194304。裸机 allocate 模式可上调 2 MiB 页池，
 #                并以 --wait-for-rpc 启动后调 iobuf_set_options（仅 STARTUP 期可用）
-#   -O <字节>    URMA transport max_io_size（2 的幂且 ≥8KB）。注意：urma 数据路径
-#                要求 iovcnt==1，大 I/O 必须配合 -I 把 large_bufsize 配到 ≥ 此值
-#   -C <个数>    -O 生效时 URMA transport 每个 PG 的 large iobuf 缓存（默认 32）。
+#   -O <字节>    URMA transport 命令大小上限（2 的幂且 ≥8KB）。单 buffer 实际上限
+#                还受 -I 配置的 slot 容量限制，经 HELLO 告知 initiator；不决定 slot 大小
+#   -C <个数>    -I 或 -O 生效时每个 PG 的 large iobuf 缓存（默认 32）。
 #                语义是"钉住"地址：必须 ≥ 每 PG 峰值并发（≈ urma_perf 的 -T×-b ÷
 #                活跃连接数）。小于它，I/O 会从共享池轮换抓不同 buffer，target 侧
 #                注册缓存（只进不出，128 个）命中率崩塌 → 每 miss 同步阻塞一次
@@ -82,7 +84,7 @@ HUGE_PAGES=2048
 DISKS=""             # 逗号分隔累积（支持多次 -d），后面拆成数组
 RAID0_STRIP=-1       # -1 = 不建 raid0；>=0 = 建 raid0（0 = 用 raid 模块默认 strip）
 IOBUF_SPEC=""        # "小池数量,小池buf,大池数量,大池buf"
-IOBUF_PG_CACHE=32    # -O 生效时 URMA transport 每 PG 的 large 缓存（-C 可调）
+IOBUF_PG_CACHE=32    # -I 或 -O 生效时每 PG 的 large 缓存（-C 可调）
 MAX_IO_SIZE=0        # URMA transport max_io_size（字节）
 DUMP_SEC=""
 CAPSULE_TRANSPORT="tcp"
@@ -554,20 +556,24 @@ if [ -n "$IOBUF_SPEC" ]; then
     info "iobuf 池内存 ≈ $((_pool_bytes / 1048576)) MiB（hugepages 目标上调为 $HUGE_PAGES 页 ≈ $((HUGE_PAGES / 512)) GiB）"
 fi
 
-# -O 校验：2 的幂且 ≥8KB（与 transport 层一致）；且必须 ≤ large_bufsize
-# —— urma 数据路径要求 iovcnt==1（urma.c nvmf_urma_post_data），I/O 大于 large_bufsize
-#    会被拆成多个 iobuf buffer，直接 -ENOTSUP 失败，所以这里提前把配置卡死
-URMA_TRANSPORT_ARGS=(-t URMA --capsule-transport "$CAPSULE_TRANSPORT")
-if [ "$MAX_IO_SIZE" -gt 0 ]; then
-    [ $((MAX_IO_SIZE & (MAX_IO_SIZE - 1))) -eq 0 ] && [ "$MAX_IO_SIZE" -ge 8192 ] \
-        || abort "-O max_io_size 必须是 2 的幂且 ≥8KB"
-    if [ -n "$IOBUF_SPEC" ] && [ "$IB_LARGE_SIZE" -lt "$MAX_IO_SIZE" ]; then
-        abort "-O $MAX_IO_SIZE > -I 的 large_bufsize $IB_LARGE_SIZE：urma 要求数据单 buffer（iovcnt==1），请把 -I 第 4 个字段配到 ≥ $MAX_IO_SIZE"
+# Slot 大小由 iobuf_set_options/-I 决定；-O 只是命令上限。URMA 自身按真实池容量
+# 限制 HELLO，不要求启动脚本把这两个参数绑成相同值。
+build_urma_transport_args() {
+    [[ "$MAX_IO_SIZE" =~ ^(0|[1-9][0-9]{0,9})$ ]] &&
+        (( MAX_IO_SIZE <= 2147483648 )) || abort "-O 必须为 0 或 8192..2147483648 的 2 次幂"
+    [[ "$IOBUF_PG_CACHE" =~ ^(0|[1-9][0-9]{0,6})$ ]] &&
+        (( IOBUF_PG_CACHE <= 1048576 )) || abort "-C 必须为 0..1048576"
+    URMA_TRANSPORT_ARGS=(-t URMA --capsule-transport "$CAPSULE_TRANSPORT")
+    if (( MAX_IO_SIZE > 0 )); then
+        (( (MAX_IO_SIZE & (MAX_IO_SIZE - 1)) == 0 && MAX_IO_SIZE >= 8192 )) ||
+            abort "-O max_io_size 必须是 2 的幂且 ≥8KB"
+        URMA_TRANSPORT_ARGS+=(-i "$MAX_IO_SIZE")
     fi
-    if [ -z "$IOBUF_SPEC" ] && [ "$MAX_IO_SIZE" -gt 135168 ]; then
-        abort "-O $MAX_IO_SIZE 但未配 -I：默认 large_bufsize 只有 135168，>135168 的 I/O 会因 iovcnt!=1 失败。请加 -I，例如 -I 8192,8192,1024,$MAX_IO_SIZE"
+    if [[ -n "$IOBUF_SPEC" ]] || (( MAX_IO_SIZE > 0 )); then
+        URMA_TRANSPORT_ARGS+=(--iobuf-large-cache-size "$IOBUF_PG_CACHE" --iobuf-small-cache-size 1024)
     fi
-fi
+}
+build_urma_transport_args
 
 # SPDK 源码根：-w 优先；否则从脚本所在目录、当前目录分别向上找 build/bin/nvmf_tgt
 if [ -z "$SPDK_DIR" ]; then
@@ -718,7 +724,7 @@ else
         run_rpc bdev_nvme_attach_controller -b "${CTRLRS[$_idx]}" -t PCIe -a "${BDFS[$_idx]}"
     done
 fi
-if [ "$MAX_IO_SIZE" -gt 0 ]; then
+if [ -n "$IOBUF_SPEC" ] || [ "$MAX_IO_SIZE" -gt 0 ]; then
     # transport 的 iobuf 缓存默认"自动吃大池的一半再按已有 PG 数均分"（transport.c:640），
     # 第一个 PG 独吞 pool/2，叠加每核 bdev(16)+accel(16) 个 large 预占后，
     # add_ns 建通道时池子必被抽干（0/16 失败）。显式压小：每 PG 默认 32 个 large，
@@ -740,8 +746,6 @@ if [ "$MAX_IO_SIZE" -gt 0 ]; then
     if [ "$IB_SMALL_COUNT" -gt 0 ] && [ "$IB_SMALL_COUNT" -le "$_small_eager" ]; then
         warn "small 池同理：核数=$_ncore × 1280（bdev 128+accel 128+PG 1024）= $_small_eager ≥ 池 $IB_SMALL_COUNT → 调大 -I 第 1 个字段（如 16384）"
     fi
-    URMA_TRANSPORT_ARGS+=(-i "$MAX_IO_SIZE" \
-        --iobuf-large-cache-size "$IOBUF_PG_CACHE" --iobuf-small-cache-size 1024)
 fi
 run_rpc nvmf_create_transport "${URMA_TRANSPORT_ARGS[@]}"
 run_rpc nvmf_create_subsystem "$NQN" -a -s "$SUBSYS_SN"
@@ -783,7 +787,8 @@ echo "  subsystem  : $NQN"
 echo "  listener   : $LISTEN_IP:$LISTEN_PORT (URMA)"
 echo "  capsule    : $CAPSULE_TRANSPORT"
 [ -n "$IOBUF_SPEC" ] && echo "  iobuf      : small ${IB_SMALL_COUNT}x${IB_SMALL_SIZE}B / large ${IB_LARGE_COUNT}x${IB_LARGE_SIZE}B"
-[ "$MAX_IO_SIZE" -gt 0 ] && echo "  max_io_size: $MAX_IO_SIZE B（transport，PG large 缓存 $IOBUF_PG_CACHE/PG）"
+[ "$MAX_IO_SIZE" -gt 0 ] && echo "  max_io_size 上限: $MAX_IO_SIZE B（实际协商值见 nvmf_get_transports 的 effective_max_io_size）"
+[ -n "$IOBUF_SPEC" ] && echo "  iobuf large slot: $IB_LARGE_SIZE B × $IB_LARGE_COUNT；PG large 缓存 $IOBUF_PG_CACHE/PG"
 echo "  nvmf_tgt   : PID $TGT_PID，日志 $TGT_LOG$( [ -n "$DUMP_SEC" ] && echo "；target 打点每 ${DUMP_SEC}s 输出一次（==== URMA target timing breakdown ====）")"
 echo "  停止       : kill \$(cat $TGT_PIDFILE)"
 echo
