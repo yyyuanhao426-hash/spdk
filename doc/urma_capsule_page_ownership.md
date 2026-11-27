@@ -1,6 +1,7 @@
 # Bonding capsule 池的页隔离修复
 
-2026-11-26，`urma_enable_v3`。对应 Doc 65 / Doc 66 的 target 注册
+2026-11-26 实现于 `urma_enable_v3`，2026-11-27 同步到 `urma_enable_v2`；
+两条分支共用本文的 URMA 修复，readcache 层仅在 v3。对应 Doc 65 / Doc 66 的 target 注册
 `Address range overlap -> register_failed -> rx_init` 指纹。
 
 ## 结论与范围

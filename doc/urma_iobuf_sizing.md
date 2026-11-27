@@ -1,6 +1,7 @@
 # URMA iobuf slot 与命令上限独立配置
 
-2026-11-26，`urma_enable_v3`。
+2026-11-26 实现于 `urma_enable_v3`；2026-11-27 同步到 `urma_enable_v2`。
+两条分支共用此 iobuf/URMA 能力，readcache 层仅在 v3。
 
 ## 配置语义
 
