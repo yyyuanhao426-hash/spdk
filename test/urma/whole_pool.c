@@ -195,6 +195,7 @@ struct thread_args {
 	struct spdk_nvme_urma_memory_region *region;
 	pthread_barrier_t *barrier;
 	bool release;
+	bool io;
 	int rc;
 };
 
@@ -205,6 +206,9 @@ thread_operation(void *arg)
 	pthread_barrier_wait(args->barrier);
 	if (args->release) {
 		spdk_nvme_urma_unregister_memory(args->region);
+	} else if (args->io) {
+		args->rc = spdk_urma_acquire_host_memory(args->qpair->device->context,
+						      POOL_ADDR, 4096, &args->region);
 	} else {
 		args->rc = register_pool(args->qpair, POOL_ADDR, POOL_SIZE, &args->region);
 	}
@@ -335,6 +339,101 @@ check_failures(void)
 }
 
 static void
+check_io_ownership(void)
+{
+	struct pool_fixture a, b;
+	struct spdk_nvme_urma_memory_region *first, *second, *other;
+	void *subpage = (char *)POOL_ADDR + 64;
+	unsigned before_reg = registrations, before_unreg = unregistrations;
+
+	fixture_init(&a);
+	fixture_init(&b);
+	assert(spdk_urma_acquire_host_memory(&a.context, subpage, 512, &first) == 0);
+	assert(spdk_nvme_urma_memory_region_get_addr(first) == POOL_ADDR);
+	assert(spdk_nvme_urma_memory_region_get_length(first) == 4096);
+	assert(!spdk_nvme_urma_region_registry_find(&a.context, (uint64_t)subpage, 512));
+	assert(spdk_urma_acquire_host_memory(&a.context, (char *)POOL_ADDR + 1024,
+					  2048, &second) == 0);
+	assert(first == second && registrations == before_reg + 1);
+	assert(spdk_urma_acquire_host_memory(&a.context, POOL_ADDR, 8192, &other) == -EADDRINUSE);
+	assert(other == NULL && registrations == before_reg + 1);
+	assert(spdk_urma_acquire_host_memory(&b.context, subpage, 512, &other) == 0);
+	assert(other != first);
+	spdk_nvme_urma_unregister_memory(first);
+	assert(unregistrations == before_unreg);
+	spdk_nvme_urma_unregister_memory(second);
+	spdk_nvme_urma_unregister_memory(other);
+	assert(registrations == before_reg + 2 && unregistrations == before_unreg + 2);
+	/* All references are gone: an expanded grant at the same address is safe. */
+	assert(spdk_urma_acquire_host_memory(&a.context, POOL_ADDR, 8192, &first) == 0);
+	spdk_nvme_urma_unregister_memory(first);
+	fail_registration = true;
+	assert(spdk_urma_acquire_host_memory(&a.context, subpage, 512, &first) == -ENOENT);
+	assert(first == NULL);
+	fail_registration = false;
+	fail_calloc_on = 1;
+	assert(spdk_urma_acquire_host_memory(&a.context, subpage, 512, &first) == -ENOMEM);
+	assert(first == NULL && fail_calloc_on == 0);
+	assert(spdk_urma_acquire_host_memory(&a.context, subpage, 512, &first) == 0);
+	spdk_nvme_urma_unregister_memory(first);
+	assert(spdk_urma_acquire_host_memory(NULL, subpage, 512, &first) == -EINVAL);
+	assert(spdk_urma_acquire_host_memory(&a.context, NULL, 512, &first) == -EINVAL);
+	assert(spdk_urma_acquire_host_memory(&a.context, subpage, 0, &first) == -EINVAL);
+	assert(spdk_urma_acquire_host_memory(&a.context, subpage, 512, NULL) == -EINVAL);
+	assert(spdk_urma_acquire_host_memory(&a.context, (void *)(UINTPTR_MAX - 1),
+					  4096, &first) == -EINVAL);
+	assert(spdk_urma_acquire_host_memory(&a.context, (void *)(UINTPTR_MAX - 4095),
+					  1, &first) == -EINVAL);
+	/* A different allocation can share a pool's padded boundary page even
+	 * though its payload is outside the pool's logical registry range. */
+	assert(register_pool(&a.qpairs[0], subpage, 512, &first) == 0);
+	assert(!spdk_nvme_urma_region_registry_find(&a.context,
+				(uint64_t)POOL_ADDR + 1024, 512));
+	assert(spdk_urma_acquire_host_memory(&a.context, (char *)POOL_ADDR + 1024,
+					  512, &second) == -EADDRINUSE);
+	assert(second == NULL);
+	spdk_nvme_urma_unregister_memory(first);
+	puts("PASS request HOST grants: page coverage, overlap, context isolation, "
+	     "rollback and overflow");
+}
+
+static void
+check_io_concurrent(void)
+{
+	struct pool_fixture fixture;
+	struct thread_args args[ENDPOINTS] = {};
+	unsigned before_reg = registrations, before_unreg = unregistrations;
+
+	fixture_init(&fixture);
+	for (unsigned i = 0; i < ENDPOINTS; i++) {
+		args[i].qpair = &fixture.qpairs[i];
+		args[i].io = true;
+	}
+	run_threads(args, ENDPOINTS);
+	for (unsigned i = 0; i < ENDPOINTS; i++) {
+		assert(args[i].rc == 0 && args[i].region == args[0].region);
+		args[i].release = true;
+	}
+	assert(registrations == before_reg + 1);
+	run_threads(args, ENDPOINTS);
+	assert(unregistrations == before_unreg + 1);
+	for (unsigned i = 0; i < 128; i++) {
+		struct thread_args race[2] = {{.release = true}, {
+			.qpair = &fixture.qpairs[1], .io = true,
+		}};
+
+		assert(spdk_urma_acquire_host_memory(&fixture.context, POOL_ADDR,
+						  4096, &race[0].region) == 0);
+		run_threads(race, 2);
+		assert(race[1].rc == 0 && race[1].region != NULL);
+		spdk_nvme_urma_unregister_memory(race[1].region);
+	}
+	assert(registrations == unregistrations && duplicate_grants == 0);
+	puts("PASS request HOST grants: concurrent acquire/release and "
+	     "128 last-release/reacquire races");
+}
+
+static void
 check_memory_type(void)
 {
 	struct pool_fixture fixture;
@@ -370,6 +469,8 @@ main(void)
 	check_concurrent();
 	check_isolation();
 	check_failures();
+	check_io_ownership();
+	check_io_concurrent();
 	check_memory_type();
 	/* The only rejected grant was the intentional HOST/CUDA type-isolation control. */
 	assert(registrations == unregistrations && duplicate_grants == 1);

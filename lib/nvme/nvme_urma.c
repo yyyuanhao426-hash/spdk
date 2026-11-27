@@ -257,6 +257,8 @@ struct nvme_urma_cmd_tx_slot {
 struct nvme_urma_req {
 	struct nvme_request *req;
 	struct spdk_nvme_urma_memory_region *region;
+	/* Only partially overlapping, unregistered HOST payloads need staging. */
+	void *bounce_buffer;
 	/* Modified By Yida: cache entry when region is cached (NULL if not cached) */
 	struct nvme_urma_reg_entry *cache_entry; /* NULL if not cached */
 	/* Modified By Yida(v7): region 来自整池注册表采纳——release 不得 unregister */
@@ -999,6 +1001,46 @@ nvme_urma_req_memory_type(const struct nvme_request *req)
 }
 
 static int
+nvme_urma_acquire_request_memory(struct nvme_urma_qpair *uqpair,
+				 struct nvme_urma_req *ureq, void **addr)
+{
+	struct nvme_request *req = ureq->req;
+	int rc;
+
+	rc = spdk_urma_acquire_host_memory(uqpair->device->context, *addr,
+					 req->payload.size, &ureq->region);
+	if (rc != -EADDRINUSE) {
+		return rc;
+	}
+	/* A partial overlap cannot grow a live grant. Own complete pages for
+	 * this request, using the same allocator as the private capsule arrays.
+	 * Normal disjoint or covered payloads retain the direct data path. */
+	ureq->bounce_buffer = spdk_urma_alloc_capsule_slots(1, req->payload.size);
+	if (ureq->bounce_buffer == NULL) {
+		return -ENOMEM;
+	}
+	if (spdk_nvme_opc_get_data_transfer(req->cmd.opc) & SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
+		memcpy(ureq->bounce_buffer, *addr, req->payload.size);
+	}
+	*addr = ureq->bounce_buffer;
+	return spdk_urma_acquire_host_memory(uqpair->device->context, *addr,
+					   req->payload.size, &ureq->region);
+}
+
+static void
+nvme_urma_release_request_memory(struct nvme_urma_qpair *uqpair,
+				 struct nvme_urma_req *ureq, const char *reason)
+{
+	if (ureq->cache_entry != NULL) {
+		nvme_urma_reg_cache_release(ureq->cache_entry);
+	} else if (!ureq->region_external) {
+		nvme_urma_admin_region_diag(uqpair, ureq, "admin_region_release", reason);
+		spdk_nvme_urma_unregister_memory(ureq->region);
+	}
+	free(ureq->bounce_buffer);
+}
+
+static int
 nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
 {
 	struct nvme_urma_qpair *uqpair = nvme_urma_qpair(qpair);
@@ -1059,17 +1101,16 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 			/* Modified By Yida: check registration cache before doing a full register */
 			uint64_t t_reg0 = spdk_get_ticks();
 			struct nvme_urma_reg_entry *entry = NULL;
-			/* Connect/user-copy Admin buffers may be freed before qpair teardown.
-			 * Keeping a 1KB cache entry while its 4KB grant remains live makes a
-			 * later 4KB Identify at the same VA miss this cache and re-grant the
-			 * same range. Bond pctxs reuse a TID and reject that duplicate grant.
-			 * Fabrics Connect uses the same temporary buffer on I/O qpairs too;
-			 * caching it can block a later 512B probe READ or another controller.
-			 * Keep bond Admin/Connect registrations request-owned; completion,
-			 * submit failure and abort already unregister uncached regions before
-			 * invoking callbacks that can free/reuse the DMA buffer. External
-			 * registry regions above retain their application-owned lifetime. */
-			bool cache_registration = !nvme_urma_request_has_transient_payload(uqpair, req);
+			enum spdk_nvme_urma_memory_type memory_type;
+
+			memory_type = nvme_urma_req_memory_type(req);
+			bool shared_host = strncmp(uqpair->device->dev_name, "bonding", 7) == 0 &&
+					   memory_type == SPDK_NVME_URMA_MEM_HOST;
+			/* Ordinary application buffers are only guaranteed to live until
+			 * completion. Never keep their bonding grants in a qpair cache:
+			 * another lane can immediately reuse the same allocator address. */
+			bool cache_registration = !(shared_host ||
+					nvme_urma_request_has_transient_payload(uqpair, req));
 
 			if (cache_registration) {
 				entry = nvme_urma_reg_cache_lookup(uqpair, addr, req->payload.size);
@@ -1081,8 +1122,13 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 				__atomic_add_fetch(&g_timing.cache_hit_count, 1, __ATOMIC_RELAXED);
 			} else {
 				submit_stage = "memory_register";
-				rc = spdk_nvme_urma_register_memory(uqpair->device->context, addr,
-						req->payload.size, nvme_urma_req_memory_type(req), &ureq->region);
+				if (shared_host) {
+					rc = nvme_urma_acquire_request_memory(uqpair, ureq, &addr);
+				} else {
+					rc = spdk_nvme_urma_register_memory(
+						     uqpair->device->context, addr, req->payload.size,
+						     memory_type, &ureq->region);
+				}
 				if (rc != 0) {
 					goto send_error;
 				}
@@ -1098,6 +1144,9 @@ nvme_urma_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_reques
 			}
 		}
 		nvme_urma_admin_region_diag(uqpair, ureq, "admin_region_ready", "submit");
+		if (!ureq->region_external && ureq->cache_entry == NULL) {
+			capsule.data.flags |= SPDK_URMA_DATA_TRANSIENT;
+		}
 		capsule.data.seg = spdk_urma_memory_region_get_tseg(ureq->region)->seg;
 		if (strncmp(uqpair->device->dev_name, "bonding", 7) == 0) {
 			size_t length = sizeof(capsule.seg_ctx);
@@ -1191,13 +1240,7 @@ send_error:
 	if (rc != 0) {
 		/* Modified By Yida: on send failure, release cache refcount if cached.
 		 * Modified By Yida(v7): 整池采纳的 region_external 不 unregister。 */
-		if (ureq->cache_entry != NULL) {
-			nvme_urma_reg_cache_release(ureq->cache_entry);
-		} else if (!ureq->region_external) {
-			nvme_urma_admin_region_diag(uqpair, ureq, "admin_region_release",
-						    "submit_error");
-			spdk_nvme_urma_unregister_memory(ureq->region);
-		}
+		nvme_urma_release_request_memory(uqpair, ureq, "submit_error");
 		/* Modified By Yida (v3): 归还 cid 位 */
 		nvme_urma_cid_free(uqpair, req->cmd.cid);
 		free(ureq);
@@ -1241,13 +1284,15 @@ nvme_urma_complete_response(struct nvme_urma_qpair *uqpair,
 	}
 	nvme_urma_cid_free(uqpair, ureq->req->cmd.cid);
 	t_rel0 = spdk_get_ticks();
-	if (ureq->cache_entry != NULL) {
-		nvme_urma_reg_cache_release(ureq->cache_entry);
-	} else if (!ureq->region_external) {
-		nvme_urma_admin_region_diag(uqpair, ureq, "admin_region_release",
-					    "completion");
-		spdk_nvme_urma_unregister_memory(ureq->region);
+	if (ureq->bounce_buffer != NULL && !spdk_nvme_cpl_is_error(&rsp->cpl) &&
+	    (spdk_nvme_opc_get_data_transfer(ureq->req->cmd.opc) &
+	     SPDK_NVME_DATA_CONTROLLER_TO_HOST)) {
+		void *dest = (void *)((uintptr_t)ureq->req->payload.contig_or_cb_arg +
+				     ureq->req->payload.offset);
+
+		memcpy(dest, ureq->bounce_buffer, ureq->req->payload.size);
 	}
+	nvme_urma_release_request_memory(uqpair, ureq, "completion");
 	t_rel1 = spdk_get_ticks();
 	__atomic_add_fetch(&g_timing.release_ticks, t_rel1 - t_rel0, __ATOMIC_RELAXED);
 	__atomic_add_fetch(&g_timing.release_count, 1, __ATOMIC_RELAXED);
@@ -1849,13 +1894,7 @@ nvme_urma_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
 		nvme_urma_cid_free(uqpair, ureq->req->cmd.cid);
 		/* Modified By Yida: release cache refcount, unregister only uncached.
 		 * Modified By Yida(v7): 整池采纳的 region_external 不 unregister。 */
-		if (ureq->cache_entry != NULL) {
-			nvme_urma_reg_cache_release(ureq->cache_entry);
-		} else if (!ureq->region_external) {
-			nvme_urma_admin_region_diag(uqpair, ureq, "admin_region_release",
-						    "abort");
-			spdk_nvme_urma_unregister_memory(ureq->region);
-		}
+		nvme_urma_release_request_memory(uqpair, ureq, "abort");
 		nvme_complete_request(ureq->req->cb_fn, ureq->req->cb_arg, qpair, ureq->req, &cpl);
 		free(ureq);
 	}

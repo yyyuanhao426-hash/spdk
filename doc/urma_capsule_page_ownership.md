@@ -101,3 +101,84 @@ client attach/qpair/whole-pool 成功数和应用内容校验。保留原 QPS/�
 仍失败时记录具体 allocation/grant 范围与 context，区分其他 buffer 所有权问题和
 provider 内部冲突。即使多轮全绿，也只能作为该版本场景验收，不能证明 libummu
 内部竞态已经修复。当前没有执行远端访问、设备切换、部署或实机性能实验。
+
+## Doc 74 续：普通数据 buffer 跨 qpair 的注册生命周期
+
+2026-11-26，b1t1/basic 的另一条失败路径为 initiator
+`memory_register -> bondp_create_pseg -> ummu_table_param_check`。
+Doc 74 中 qid 2 写成功、qid 3 随后注册 256 KiB buffer 失败，与此缺口吻合；
+原日志没有首次成功 grant 的地址，不能据此证明实机的唯一根因，更不能直接
+定性为“注销后库内部竞态”。原有页隔离修复针对 capsule 数组，未覆盖此路径。
+
+普通 READ/WRITE 原来将注册保存在 qpair 私有缓存。完成只减缓存引用，保留
+grant 到连接清理。因此一个 lane 完成后，即使已经没有在途请求，另一个 lane
+仍可能对同地址重新注册。仅把缓存搬到 context 层并长期保留，也无法解决应用
+在回调后释放、重分配甚至取消映射该地址的生命周期问题。
+
+本次对未被显式 whole-pool 注册覆盖的 **bonding HOST payload** 改为：
+
+- 按 context 和实际 4 KiB grant 范围共享请求引用，不进入 qpair 的长期缓存。
+  完全相同或被已有 grant 覆盖的请求只取得引用；查找、首次注册与最后一次
+  ungrant 在同一锁内串行，避免 acquire 与最后释放之间重新撞 grant。
+- 这些临时 grant 不加入应用整池的借用注册表，避免其他 I/O 无引用采纳后
+  遇到最后一个请求将其释放。完成、提交失败、断连中止均在应用回调前归还引用。
+- 不能覆盖的部分重叠范围不再尝试重复 grant，改用请求独占完整页的 host
+  staging buffer。写在提交前复制；读只在成功完成时复制回原 payload/offset；
+  错误完成与 abort 不复制。整池逻辑范围外、但仍落在整池 grant 边界页中的
+  请求也走 staging。所有路径均先归还注册，再 free staging。
+- 原 whole-pool 路径继续按应用拥有的生命周期借用；raw 和 accelerator 内存
+  路径维持既有策略。本次不宣称解决非 HOST 缓存或 libummu 内部实现问题。
+
+### 对端 import 与协议
+
+新增 `SPDK_URMA_DATA_TRANSIENT` 标记：请求拥有的 segment（也包括原有未缓存的
+临时注册）要求 target 跳过长期 import 缓存。数据 WR 完成后，target 必须先
+unimport，再发送响应；initiator 收到响应后才可能释放最后一个本地 grant。
+否则 target 会积累临时 import，并可能在 initiator 注销之后继续持有旧段。
+
+unimport 失败时保留句柄和 provider context 字节，将请求放入响应重试队列，
+不发响应、不提前释放。关闭连接时同样重试；独立 drain poller 负责继续驱动
+已离开 transport poll group 的 qpair。provider 永久拒绝解除时，qpair 保持隔离
+等待，不能声称已经安全释放。正常整池段仍沿用 import 缓存。
+
+内部 wire version 从 **6 升到 7**，数据描述大小保持不变，使用一个原 reserved
+字节携带标记。旧 target 不理解这个生命周期，故 HELLO/命令不接受混用版本。
+需要将 **Mooncake 链接的 initiator SPDK 和 nvmf_tgt 一起重编并更新 runtime**；
+只替换 target 或只替换 client 不构成完整修复。无需给 basic 新加 whole-pool
+配置来获得正确性。
+
+### 回归与验收边界
+
+以下均为本地模拟 provider / socketpair，执行真实 transport 提交和完成函数、
+真实公共注册代码，不访问集群硬件：
+
+```bash
+# 相同回归在修复前 transport 上失败：qid=3 第二次 WRITE rc=-22
+python3 test/urma/admin_submit_build.py \
+  --umdk /home/senorita/GDR/GDR_Related/UMDK_netlab --transport-ref 07af5b7b8
+
+# 当前提交、共享注册、数据复制和两端生命周期回归
+python3 test/urma/admin_submit_build.py \
+  --umdk /home/senorita/GDR/GDR_Related/UMDK_netlab --sanitize
+python3 test/urma/whole_pool_build.py \
+  --umdk /home/senorita/GDR/GDR_Related/UMDK_netlab --sanitize
+python3 test/urma/handshake_build.py \
+  --umdk /home/senorita/GDR/GDR_Related/UMDK_netlab --sanitize
+```
+
+覆盖顺序跨 lane 复用 256 KiB 地址、两个在途请求覆盖共享、最后 abort 释放、
+相同页不同逻辑长度、跨 context 隔离、并发 acquire/release、128 次最后释放与
+重新获取竞争；部分重叠读写的内容与边界、错误/abort 不回写，以及分配、注册、
+导出、发送失败清理。target 覆盖已有缓存也不采纳临时段、解除失败重试、SEND
+前 unimport、TCP 响应前解除、TX 满时重试及关闭过程保留资源。旧协议与未知
+flags 拒绝；modern/legacy SDK 三份 transport 源码编译、原 capsule 池回归通过。
+
+ASan/UBSan/LeakSanitizer 在获授权的沙箱外本地运行，以避开 socketpair/LSan
+沙箱限制。它们不能替代实际 ARM UMDK、镜像链接和设备验收。
+
+性能上，未整池注册的 basic 在最后一个在途引用完成后会真正 unregister，下一
+次请求需要重新注册；部分重叠会增加复制，跨 context 注册也使用进程级共享锁。
+这修正生命周期，不承诺 basic 吞吐与原长期缓存相同。高吞吐仍优先使用显式
+应用整池注册；该路径不增加逐 I/O 注册/复制。本次未部署或测量实机性能。
+验收应使用同一新版 runtime，在原 b1t1 bonding 配置下先通过 prepare-store
+和读回，再跑 recall/rank，并核对 grant/register_failed 与内容正确性。

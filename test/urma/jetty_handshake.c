@@ -50,6 +50,7 @@ struct nvme_urma_qpair {
 	int fd;
 };
 static bool bonding;
+static uint32_t target_max_io = 8388608;
 static urma_transport_mode_t mode;
 static int exports, releases, imports, binds, fail_export = -1;
 static unsigned export_length;
@@ -181,7 +182,7 @@ target_init(struct nvmf_urma_qpair *q, struct endpoint *e, struct nvmf_urma_tran
 	memset(t, 0, sizeof(*t));
 	t->transport.opts.max_queue_depth = 32;
 	t->transport.opts.max_io_size = 8388608;
-	t->urma_opts.max_io_size = 8388608;
+	t->urma_opts.max_io_size = target_max_io;
 	q->device = &e->d;
 	q->transport = t;
 	q->jettys = e->jp;
@@ -233,6 +234,7 @@ roundtrip(bool bond, urma_transport_mode_t m, unsigned count)
 			}
 		} while (rc == -EAGAIN);
 		assert(rc == 0 && imports == (int)count && exports == releases);
+		assert(q.max_io_size == target_max_io);
 		assert(binds == (mode == URMA_TM_RC ? (int)count : 0));
 		/* HELLO_RSP is the per-qpair RX-ready barrier: exactly one post,
 		 * after negotiation and before any HELLO_RSP byte is written. */
@@ -253,6 +255,7 @@ roundtrip(bool bond, urma_transport_mode_t m, unsigned count)
 				    .num_entries = 31,
 				    .fd = fds[0]};
 	assert(nvme_urma_exchange_hello(&q) == 0);
+	assert(q.max_io_size == target_max_io);
 	assert(imports == (int)count && exports == releases);
 	assert(binds == (mode == URMA_TM_RC ? (int)count : 0));
 	close(fds[0]);
@@ -503,7 +506,16 @@ int
 main(void)
 {
 	alarm(15);
+	target_max_io = 262144;
+	roundtrip(false, URMA_TM_RM, 1);
+	target_max_io = 524288;
+	roundtrip(false, URMA_TM_RM, 1);
+	target_max_io = 8388608;
 #ifdef SPDK_CONFIG_URMA_RJETTY
+	target_max_io = 262144;
+	roundtrip(true, URMA_TM_RM, 3);
+	roundtrip(true, URMA_TM_RC, 3);
+	target_max_io = 8388608;
 	for (unsigned n = 1; n <= 3; n += 2) {
 		roundtrip(true, URMA_TM_RM, n);
 		roundtrip(true, URMA_TM_RC, n);

@@ -12,7 +12,15 @@ static int registration_errno;
 static bool fail_registration, fail_export;
 static unsigned registrations, unregistrations, duplicate_rejections, callbacks;
 static bool reject_duplicate;
+static bool fail_bounce_alloc;
 static urma_target_seg_t *active_segments[256];
+
+int __real_posix_memalign(void **ptr, size_t alignment, size_t size);
+int
+__wrap_posix_memalign(void **ptr, size_t alignment, size_t size)
+{
+	return fail_bounce_alloc ? ENOMEM : __real_posix_memalign(ptr, alignment, size);
+}
 
 void
 spdk_log(enum spdk_log_level level, const char *file, int line, const char *func,
@@ -80,8 +88,8 @@ urma_register_seg(urma_context_t *ctx, urma_seg_cfg_t *cfg)
 	}
 	for (unsigned i = 0; reject_duplicate && i < SPDK_COUNTOF(active_segments); i++) {
 		urma_target_seg_t *old = active_segments[i];
-		if (old && old->urma_ctx == ctx && old->seg.ubva.va == cfg->va &&
-		    old->seg.len == cfg->len) {
+		if (old && old->urma_ctx == ctx && old->seg.ubva.va < cfg->va + cfg->len &&
+		    cfg->va < old->seg.ubva.va + old->seg.len) {
 			duplicate_rejections++;
 			errno = EINVAL;
 			return NULL;
@@ -200,6 +208,7 @@ identify_test(bool bond)
 	assert(frame.capsule.cmd.opc == SPDK_NVME_OPC_IDENTIFY);
 	assert(frame.capsule.data.length == 4096);
 	assert((frame.capsule.seg_ctx_length > sizeof(urma_seg_t)) == bond);
+	assert(((frame.capsule.data.flags & SPDK_URMA_DATA_TRANSIENT) != 0) == bond);
 	assert(registrations == before + 1 && q.qpair.queue_depth == 1);
 	struct nvme_request second = request;
 	assert(nvme_urma_qpair_submit_request(&q.qpair, &second) == 0);
@@ -348,6 +357,7 @@ bond_admin_lifecycle_test(void)
 	assert(nvme_urma_qpair_submit_request(&q.qpair, &identify) == 0);
 	assert(registrations == external_reg);
 	assert(recv(fds[1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert((frame.capsule.data.flags & SPDK_URMA_DATA_TRANSIENT) == 0);
 	complete_request(&q, &identify, false);
 	assert(unregistrations == external_unreg);
 	assert(callback_unregistrations == external_unreg);
@@ -437,19 +447,19 @@ bond_io_connect_lifetime_test(bool cross_qpair)
 		assert(unregistrations == base_unreg + 2 && callback_unreg == base_unreg + 2);
 		assert(!nvme_urma_reg_cache_lookup(&admin, buffer, 1024));
 	} else {
-		/* Only transient Connect changed. Keep the ordinary READ grant cached. */
-		struct nvme_urma_reg_entry *entry = nvme_urma_reg_cache_lookup(&io, buffer, 512);
-		assert(entry && entry->refcount == 0);
-		assert(unregistrations == base_unreg + 1);
+		/* Ordinary HOST payloads now have request lifetime as well. */
+		assert(!nvme_urma_reg_cache_lookup(&io, buffer, 512));
+		assert(unregistrations == base_unreg + 2);
 		assert(nvme_urma_qpair_submit_request(&io.qpair, &next) == 0);
-		assert(registrations == base_reg + 2);
+		assert(registrations == base_reg + 3);
 		assert(recv(io_fds[1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
 		complete_request(&io, &next, false);
-		assert(entry->refcount == 0 && unregistrations == base_unreg + 1);
+		assert(unregistrations == base_unreg + 3);
 	}
 	cleanup(&io);
 	cleanup(&admin);
-	assert(registrations == base_reg + 2 && unregistrations == base_unreg + 2);
+	assert(registrations == base_reg + (cross_qpair ? 2 : 3));
+	assert(registrations - base_reg == unregistrations - base_unreg);
 	reject_duplicate = false;
 	free(buffer);
 	close(io_fds[0]);
@@ -457,13 +467,188 @@ bond_io_connect_lifetime_test(bool cross_qpair)
 	close(admin_fds[0]);
 	close(admin_fds[1]);
 	puts(cross_qpair ? "PASS bond I/O Connect -> another Admin Connect: shared-context VA reuse"
-			 : "PASS bond I/O Connect -> 512B READ: temporary grant released; READ "
-			   "cache retained");
+			 : "PASS bond I/O Connect -> 512B READ: both grants released "
+			   "before callbacks");
+}
+
+/* Doc 74: basic reuses a 256KiB buffer on another lane after a completed PUT. */
+static void
+bond_data_lifetime_test(void)
+{
+	urma_context_t context = {};
+	struct spdk_urma_device device = {.context = &context};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_urma_qpair qs[2] = {};
+	struct spdk_urma_capsule_cmd_frame frame;
+	int fds[2][2];
+	unsigned base_reg = registrations, base_unreg = unregistrations;
+	void *buffer = aligned_alloc(4096, 262144);
+
+	assert(buffer);
+	strcpy(device.dev_name, "bonding_dev_40");
+	reject_duplicate = true;
+	for (unsigned i = 0; i < 2; i++) {
+		assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds[i]) == 0);
+		qs[i].device = &device;
+		qs[i].fd = fds[i][0];
+		qs[i].num_entries = 32;
+		qs[i].capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
+		qs[i].qpair.ctrlr = &ctrlr;
+		qs[i].qpair.id = 2 + i;
+		qs[i].cid_bitmap = calloc(4, 1);
+		TAILQ_INIT(&qs[i].outstanding);
+	}
+	struct nvme_request req = {
+		.qpair_reserved = true,
+		.cb_fn = request_done,
+		.payload_type = NVME_PAYLOAD_TYPE_CONTIG,
+	};
+	req.cmd.opc = SPDK_NVME_OPC_WRITE;
+	req.payload.contig_or_cb_arg = buffer;
+	req.payload.size = 262144;
+	assert(nvme_urma_qpair_submit_request(&qs[0].qpair, &req) == 0);
+	assert(recv(fds[0][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	complete_request(&qs[0], &req, false);
+	int rc = nvme_urma_qpair_submit_request(&qs[1].qpair, &req);
+	if (rc != 0) {
+		fprintf(stderr, "RED Doc74: completed qid=2 WRITE retains grant; "
+			"qid=3 WRITE same 256KiB buffer rc=%d\n", rc);
+		abort();
+	}
+	assert(recv(fds[1][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(frame.capsule.data.flags & SPDK_URMA_DATA_TRANSIENT);
+	complete_request(&qs[1], &req, false);
+	assert(registrations == base_reg + 2 && unregistrations == base_unreg + 2);
+
+	/* Two in-flight users must share ownership, including different logical
+	 * lengths that round to the same 4KiB grant and a contained subrange. */
+	struct nvme_request next = req;
+	next.payload.offset = 64;
+	next.payload.size = 512;
+	assert(nvme_urma_qpair_submit_request(&qs[0].qpair, &req) == 0);
+	assert(recv(fds[0][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(nvme_urma_qpair_submit_request(&qs[1].qpair, &next) == 0);
+	assert(recv(fds[1][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	assert(registrations == base_reg + 3);
+	complete_request(&qs[0], &req, false);
+	assert(unregistrations == base_unreg + 2);
+	nvme_urma_qpair_abort_reqs(&qs[1].qpair, 1);
+	assert(unregistrations == base_unreg + 3);
+	assert(duplicate_rejections == 0);
+	for (unsigned i = 0; i < 2; i++) {
+		cleanup(&qs[i]);
+		close(fds[i][0]);
+		close(fds[i][1]);
+	}
+	reject_duplicate = false;
+	free(buffer);
+	puts("PASS bond data: cross-qpair sequential VA reuse, covered concurrent IO, "
+	     "final abort release");
+}
+
+/* Hold a small grant while a larger, partially overlapping request arrives. */
+static void
+bond_overlap_test(uint8_t opcode, unsigned failure)
+{
+	urma_context_t context = {};
+	struct spdk_urma_device device = {.context = &context};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_urma_qpair qs[2] = {};
+	struct spdk_urma_capsule_cmd_frame frame;
+	int fds[2][2];
+	unsigned before_reg = registrations, before_unreg = unregistrations;
+	uint8_t *buffer = aligned_alloc(4096, 16384);
+
+	assert(buffer);
+	memset(buffer, 0x19, 16384);
+	strcpy(device.dev_name, "bonding_dev_40");
+	reject_duplicate = true;
+	for (unsigned i = 0; i < 2; i++) {
+		assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds[i]) == 0);
+		qs[i].device = &device;
+		qs[i].fd = fds[i][0];
+		qs[i].num_entries = 32;
+		qs[i].capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
+		qs[i].qpair.ctrlr = &ctrlr;
+		qs[i].qpair.id = 2 + i;
+		qs[i].cid_bitmap = calloc(4, 1);
+		TAILQ_INIT(&qs[i].outstanding);
+	}
+	struct nvme_request first = {.qpair_reserved = true, .cb_fn = request_done,
+		.payload_type = NVME_PAYLOAD_TYPE_CONTIG};
+	first.cmd.opc = SPDK_NVME_OPC_WRITE;
+	first.payload.contig_or_cb_arg = buffer;
+	first.payload.size = 512;
+	assert(nvme_urma_qpair_submit_request(&qs[0].qpair, &first) == 0);
+	assert(recv(fds[0][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+	struct nvme_request next = first;
+	next.cmd.opc = opcode;
+	next.payload.offset = 64;
+	next.payload.size = 8192;
+	if (failure == 3) {
+		fail_export = true;
+	} else if (failure == 4) {
+		assert(shutdown(fds[1][0], SHUT_WR) == 0);
+	} else if (failure == 5) {
+		fail_bounce_alloc = true;
+	} else if (failure == 6) {
+		fail_registration = true;
+		registration_errno = ENOENT;
+	}
+	int rc = nvme_urma_qpair_submit_request(&qs[1].qpair, &next);
+	fail_export = fail_bounce_alloc = fail_registration = false;
+	registration_errno = 0;
+	if (failure >= 3) {
+		assert(rc != 0 && qs[1].qpair.queue_depth == 0);
+		assert(qs[1].cid_bitmap[0] == 0 && TAILQ_EMPTY(&qs[1].outstanding));
+		char byte;
+		assert(recv(fds[1][1], &byte, 1, MSG_DONTWAIT) <= 0);
+	} else {
+		assert(rc == 0);
+		assert(recv(fds[1][1], &frame, sizeof(frame), MSG_DONTWAIT) > 0);
+		assert(frame.capsule.data.address != (uint64_t)(buffer + 64));
+		assert(frame.capsule.data.length == 8192);
+		void *staged = (void *)(uintptr_t)frame.capsule.data.address;
+		assert((uintptr_t)staged % 4096 == 0);
+		if (opcode == SPDK_NVME_OPC_WRITE) {
+			assert(memcmp(staged, buffer + 64, 8192) == 0);
+		}
+		memset(staged, 0x7b, 8192); /* Emulate a controller-to-host DMA. */
+		if (failure == 2) {
+			nvme_urma_qpair_abort_reqs(&qs[1].qpair, 1);
+		} else {
+			complete_request(&qs[1], &next, failure == 1);
+		}
+		for (unsigned i = 64; i < 64 + 8192; i++) {
+			uint8_t expected = (opcode == SPDK_NVME_OPC_READ && failure == 0) ? 0x7b : 0x19;
+			assert(buffer[i] == expected);
+		}
+		assert(buffer[63] == 0x19 && buffer[64 + 8192] == 0x19);
+	}
+	/* No temporary grant survives a rejected, completed or aborted request. */
+	assert(registrations - before_reg == unregistrations - before_unreg + 1);
+	complete_request(&qs[0], &first, false);
+	for (unsigned i = 0; i < 2; i++) {
+		cleanup(&qs[i]);
+		close(fds[i][0]);
+		close(fds[i][1]);
+	}
+	assert(registrations - before_reg == unregistrations - before_unreg);
+	assert(duplicate_rejections == 0);
+	reject_duplicate = false;
+	free(buffer);
 }
 
 int
 main(void)
 {
+	bond_data_lifetime_test();
+	for (unsigned failure = 0; failure < 7; failure++) {
+		bond_overlap_test(SPDK_NVME_OPC_READ, failure);
+		bond_overlap_test(SPDK_NVME_OPC_WRITE, failure);
+	}
+	puts("PASS bond overlapping data: write staging, read copyback, "
+	     "error/abort/export/send/allocation/provider cleanup");
 	bond_io_connect_lifetime_test(false);
 	bond_io_connect_lifetime_test(true);
 	bond_admin_lifecycle_test();

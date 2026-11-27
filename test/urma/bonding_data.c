@@ -7,7 +7,9 @@
 #include "spdk/thread.h"
 #include "spdk_internal/urma_lifetime.h"
 
-static unsigned registrations, context_exports, context_releases, imports;
+static unsigned registrations, context_exports, context_releases, imports, unimports;
+static bool fail_unimport, check_unimport_before_send;
+static unsigned expected_unimports, send_posts;
 static char diagnostics[16384];
 static int repost_result;
 static unsigned disconnect_count, response_releases;
@@ -124,6 +126,9 @@ urma_import_seg(urma_context_t *c, urma_seg_t *s, urma_token_t *t, uint64_t va,
 urma_status_t
 urma_unimport_seg(urma_target_seg_t *s)
 {
+	if (fail_unimport) {
+		return URMA_FAIL;
+	}
 	struct mock_import *m = (void *)s;
 	if (m->extended) {
 		const uint8_t *p = (const uint8_t *)(m->retained + 1);
@@ -131,6 +136,7 @@ urma_unimport_seg(urma_target_seg_t *s)
 			assert(p[i] == m->marker);
 	}
 	free(m);
+	unimports++;
 	return URMA_SUCCESS;
 }
 urma_status_t
@@ -139,6 +145,10 @@ urma_post_jetty_send_wr(urma_jetty_t *j, urma_jfs_wr_t *w, urma_jfs_wr_t **bad)
 	if (post_error)
 		return URMA_FAIL;
 	if (w->opcode == URMA_OPC_SEND) {
+		if (check_unimport_before_send) {
+			assert(unimports == expected_unimports);
+		}
+		send_posts++;
 		const urma_sge_t *s = w->send.src.sge;
 		last_length = s->len;
 		last_send_addr = s->addr;
@@ -291,7 +301,11 @@ nvmf_urma_handle_capsule(struct nvmf_urma_qpair *q, const struct spdk_urma_msg_h
 }
 static void nvmf_urma_disconnect_qpair(struct nvmf_urma_qpair *q) { disconnect_count++; }
 static int nvmf_urma_send_response(struct nvmf_urma_req *r);
+static bool nvmf_urma_unimport_transient(struct nvmf_urma_req *r);
 static void nvmf_urma_release_req(struct nvmf_urma_req *r) {
+	if (!nvmf_urma_unimport_transient(r)) {
+		return;
+	}
 	response_releases++;
 	if (r->state == NVMF_URMA_REQ_WAIT_TX) {
 		struct nvmf_urma_qpair *q = r->req.qpair;
@@ -450,6 +464,16 @@ target_data_test(void)
 	assert(nvmf_urma_post_data(&req, false) == 0 && imports == first + 3);
 	request_done(&req);
 	use_cache = true;
+	/* A transient request must bypass even an already populated cache entry.
+	 * Repeating identical descriptors must create/release request imports. */
+	unsigned transient_imports = imports, transient_unimports = unimports;
+	req.remote_data.flags = SPDK_URMA_DATA_TRANSIENT;
+	for (unsigned i = 0; i < 2; i++) {
+		assert(nvmf_urma_post_data(&req, false) == 0 && !req.remote_seg_cached);
+		request_done(&req);
+	}
+	assert(imports == transient_imports + 2 && unimports == transient_unimports + 2);
+	req.remote_data.flags = 0;
 	void *retained;
 	urma_target_seg_t *target;
 	struct spdk_urma_data_desc bad = req.remote_data;
@@ -488,6 +512,14 @@ decode_test(void)
 	f.capsule.seg_ctx_length = sizeof(urma_seg_t) + 64;
 	memset(f.capsule.seg_ctx, 0x7a, f.capsule.seg_ctx_length);
 	f.hdr.length = SPDK_URMA_CMD_BASE_SIZE + f.capsule.seg_ctx_length;
+	assert(spdk_urma_validate_cmd(&f.hdr, &f.capsule) == 0);
+	f.hdr.version = 6;
+	assert(spdk_urma_validate_cmd(&f.hdr, &f.capsule) == -EPROTO);
+	f.hdr.version = SPDK_URMA_WIRE_VERSION;
+	f.capsule.data.flags = 0x80;
+	assert(spdk_urma_validate_cmd(&f.hdr, &f.capsule) == -EPROTO);
+	f.capsule.data.flags = SPDK_URMA_DATA_TRANSIENT;
+	assert(spdk_urma_validate_cmd(&f.hdr, &f.capsule) == 0);
 	size_t size = sizeof(f.hdr) + f.hdr.length;
 	struct nvmf_urma_qpair q = {0};
 	spdk_urma_lifetime_init(&q.lifetime);
@@ -720,6 +752,23 @@ init_response_request(struct nvmf_urma_req *request, struct nvmf_urma_qpair *q, 
 }
 
 static void
+attach_transient_import(struct nvmf_urma_req *request, struct spdk_urma_device *device)
+{
+	urma_token_t token = {};
+	urma_import_seg_flag_t flags = {};
+	uint8_t *blob = calloc(1, sizeof(urma_seg_t) + 64);
+	urma_seg_t *seg = (void *)blob;
+
+	assert(blob);
+	seg->attr.value = 0x80000000u;
+	memset(seg + 1, export_marker, 64);
+	request->remote_data.flags = SPDK_URMA_DATA_TRANSIENT;
+	request->remote_seg_handle = blob;
+	request->remote_seg = urma_import_seg(device->context, seg, &token, 0, flags);
+	assert(request->remote_seg);
+}
+
+static void
 response_test(void)
 {
 	urma_context_t context = {0};
@@ -742,9 +791,22 @@ response_test(void)
 	strict_registered_send = true;
 	diagnostics[0] = 0;
 	unsigned released = response_releases;
+	attach_transient_import(&request, &device);
+	unsigned before_send = send_posts;
+	unsigned before_unimport = unimports;
+	fail_unimport = true;
+	assert(nvmf_urma_send_response(&request) == 0);
+	assert(request.remote_seg != NULL && response_releases == released);
+	assert(send_posts == before_send && unimports == before_unimport);
+	assert(request.state == NVMF_URMA_REQ_WAIT_TX && q.pending_responses == 1);
+	fail_unimport = false;
+	check_unimport_before_send = true;
+	expected_unimports = before_unimport + 1;
 	int rc = nvmf_urma_send_response(&request);
+	check_unimport_before_send = false;
 	if (rc != 0) fprintf(stderr, "%s", diagnostics);
 	assert(rc == 0 && !last_inline);
+	assert(request.remote_seg == NULL && request.remote_seg_handle == NULL);
 	assert(response_releases == released + 1);
 	uint64_t first_ctx = last_user_ctx, first_addr = last_send_addr;
 	assert(((struct spdk_urma_capsule_rsp_frame *)first_addr)->capsule.cpl.cid == 17);
@@ -757,7 +819,10 @@ response_test(void)
 	assert(first_ctx != second_ctx && first_addr != last_send_addr);
 	assert(spdk_urma_lifetime_refs(&q.lifetime) == 2 && !nvmf_urma_qpair_drained(&q));
 	init_response_request(&waiting, &q, 19);
+	attach_transient_import(&waiting, &device);
+	before_unimport = unimports;
 	assert(nvmf_urma_send_response(&waiting) == 0);
+	assert(waiting.remote_seg == NULL && unimports == before_unimport + 1);
 	assert(q.pending_responses == 1 && response_releases == released + 2);
 	assert(nvmf_urma_retry_responses(&q) == 0 && q.pending_responses == 1);
 
@@ -792,7 +857,13 @@ response_test(void)
 	uint64_t final_ctx = last_user_ctx;
 	init_response_request(&waiting, &q, 22);
 	assert(nvmf_urma_send_response(&waiting) == 0 && q.pending_responses == 1);
+	attach_transient_import(&waiting, &device);
 	spdk_urma_lifetime_close(&q.lifetime);
+	fail_unimport = true;
+	assert(nvmf_urma_retry_responses(&q) == 0);
+	assert(waiting.remote_seg != NULL && q.pending_responses == 1);
+	assert(!nvmf_urma_qpair_drained(&q));
+	fail_unimport = false;
 	assert(nvmf_urma_retry_responses(&q) == 1 && q.pending_responses == 0);
 	assert(TAILQ_EMPTY(&q.working_reqs) && !nvmf_urma_qpair_drained(&q));
 	cr.status = URMA_CR_WR_FLUSH_ERR;
@@ -832,8 +903,16 @@ response_test(void)
 	q.fd = fds[0];
 	q.capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP;
 	init_response_request(&request, &q, 24);
+	attach_transient_import(&request, &device);
+	fail_unimport = true;
 	assert(nvmf_urma_send_response(&request) == 0);
 	struct spdk_urma_capsule_rsp_frame frame;
+	assert(recv(fds[1], &frame, sizeof(frame), MSG_DONTWAIT) == -1 && errno == EAGAIN);
+	assert(q.pending_responses == 1 && request.remote_seg != NULL);
+	fail_unimport = false;
+	before_unimport = unimports;
+	assert(nvmf_urma_retry_responses(&q) == 1 && q.pending_responses == 0);
+	assert(request.remote_seg == NULL && unimports == before_unimport + 1);
 	assert(recv(fds[1], &frame, sizeof(frame), MSG_WAITALL) == sizeof(frame));
 	assert(frame.hdr.magic == SPDK_URMA_WIRE_MAGIC && frame.hdr.qid == 3);
 	assert(frame.capsule.cpl.cid == 24 && spdk_urma_lifetime_refs(&q.lifetime) == 0);

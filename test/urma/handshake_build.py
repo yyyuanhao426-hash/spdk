@@ -168,7 +168,7 @@ def main():
                     "nvmf_urma_handle_completion_inner", "nvmf_urma_handle_completion",
                     "nvmf_urma_completion_msg_fn", "nvmf_urma_process_completion",
                     "nvmf_urma_write_full", "nvmf_urma_rsp_tx_pool_init",
-                    "nvmf_urma_rsp_tx_acquire", "nvmf_urma_send_response",
+                    "nvmf_urma_rsp_tx_acquire", "nvmf_urma_unimport_transient", "nvmf_urma_send_response",
                     "nvmf_urma_retry_responses", "nvmf_urma_qpair_drained",
                     "nvmf_urma_capsule_rx_post", "nvmf_urma_capsule_resources_init",
                     "nvmf_urma_capsule_resources_fini"))
