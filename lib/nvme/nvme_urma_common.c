@@ -1488,6 +1488,33 @@ spdk_urma_device_next_jfr(struct spdk_urma_device *device)
 }
 
 int
+spdk_urma_device_poll_send_jfc_timed(struct spdk_urma_device *device, uint32_t index,
+		int max_cr, urma_cr_t *cr, struct spdk_urma_jfc_poll_timing *timing)
+{
+	int rc;
+
+	memset(timing, 0, sizeof(*timing));
+	if (index >= device->send_jfc_count) {
+		return 0;
+	}
+	if (pthread_mutex_trylock(&device->send_jfc_poll_locks[index]) != 0) {
+		timing->busy = true;
+		return 0;
+	}
+	if (device->send_jfc_poll_history != NULL) {
+		timing->previous_end_tick = device->send_jfc_poll_history[index].end_tick;
+	}
+	timing->start_tick = spdk_get_ticks();
+	rc = urma_poll_jfc(device->send_jfcs[index], max_cr, cr);
+	timing->end_tick = spdk_get_ticks();
+	if (device->send_jfc_poll_history != NULL) {
+		device->send_jfc_poll_history[index].end_tick = timing->end_tick;
+	}
+	pthread_mutex_unlock(&device->send_jfc_poll_locks[index]);
+	return rc;
+}
+
+int
 spdk_urma_device_poll_send_jfc(struct spdk_urma_device *device, uint32_t index,
 			       int max_cr, urma_cr_t *cr)
 {
@@ -1882,13 +1909,16 @@ spdk_urma_device_open(const struct spdk_urma_transport_opts *opts,
 		device->recv_jfc_count = 1;
 	}
 	device->send_jfcs = calloc(device->send_jfc_count, sizeof(*device->send_jfcs));
+	device->send_jfc_poll_history = calloc(device->send_jfc_count,
+					     sizeof(*device->send_jfc_poll_history));
 	device->recv_jfcs = calloc(device->recv_jfc_count, sizeof(*device->recv_jfcs));
 	device->jfrs = calloc(device->recv_jfc_count, sizeof(*device->jfrs));
 	device->send_jfc_poll_locks = calloc(device->send_jfc_count,
 						 sizeof(*device->send_jfc_poll_locks));
 	device->recv_jfc_poll_locks = calloc(device->recv_jfc_count,
 						 sizeof(*device->recv_jfc_poll_locks));
-	if (device->send_jfcs == NULL || device->recv_jfcs == NULL || device->jfrs == NULL ||
+	if (device->send_jfcs == NULL || device->send_jfc_poll_history == NULL ||
+	    device->recv_jfcs == NULL || device->jfrs == NULL ||
 	    device->send_jfc_poll_locks == NULL || device->recv_jfc_poll_locks == NULL) {
 		SPDK_ERRLOG("urma device open '%s': allocate shared JFC/JFR tables failed\n",
 			    selected->name);
@@ -2086,6 +2116,7 @@ spdk_urma_device_close(struct spdk_urma_device *device)
 	free(device->jfrs);
 	free(device->recv_jfcs);
 	free(device->send_jfcs);
+	free(device->send_jfc_poll_history);
 	free(device->send_jfc_poll_locks);
 	free(device->recv_jfc_poll_locks);
 	if (device->memory_domain != NULL) {

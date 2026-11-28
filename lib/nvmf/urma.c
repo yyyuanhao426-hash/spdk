@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include "spdk_internal/urma_push_profile.h"
 
 /* Modified By Yida: Target-side memory registration cache */
 #define NVMF_URMA_REG_CACHE_SIZE 128
@@ -208,6 +209,7 @@ nvmf_urma_timing_dump(void)
 	printf("  TOTAL (parse->rsp):  %lu ticks, n=%lu, avg=%lu us, total=%lu ms\n",
 	       tot, tot_n, tot_n ? tot / tot_n * 1000000ULL / hz : 0,
 	       tot * 1000 / hz);
+	urma_push_profile_dump(stdout);
 	if (tot > 0) {
 		printf("  breakdown: parse=%.1f%% buf=%.1f%% import=%.1f%% reg=%.1f%% post=%.1f%% jfc=%.1f%% exec=%.1f%% push=%.1f%% rsp=%.1f%% release=%.1f%%\n",
 		       100.0 * capsule / tot, 100.0 * buffer / tot, 100.0 * imp / tot,
@@ -1591,8 +1593,9 @@ nvmf_urma_create(struct spdk_nvmf_transport_opts *opts)
 	 * SPDK_URMA_TARGET_DUMP_SEC=10 ./build/bin/nvmf_tgt ... */
 	const char *dump_sec = getenv("SPDK_URMA_TARGET_DUMP_SEC");
 
-	if (dump_sec != NULL) {
-		uint64_t period_us = (uint64_t)atoi(dump_sec) * 1000000ULL;
+	if (dump_sec != NULL || urma_push_profile_enabled()) {
+		uint64_t period_us = dump_sec != NULL ? (uint64_t)atoi(dump_sec) * 1000000ULL :
+				     10 * 1000000ULL;
 
 		if (period_us > 0) {
 			transport->dump_poller = SPDK_POLLER_REGISTER(nvmf_urma_timing_dump_poller,
@@ -2559,8 +2562,53 @@ nvmf_urma_process_cmd_receive(struct nvmf_urma_cmd_rx_slot *slot,
 				       t_parse0, t_parse0);
 }
 
+static void
+nvmf_urma_record_push(struct nvmf_urma_req *ureq,
+		const struct spdk_urma_completion_timing *timing, uint64_t owner_tick,
+		uint64_t done_tick)
+{
+	struct nvmf_urma_qpair *q = nvmf_urma_qpair(ureq->req.qpair);
+
+	if (!urma_push_profile_enabled()) {
+		return;
+	}
+	struct urma_push_record record = {
+		.post_tick = ureq->post_tick, .owner_tick = owner_tick, .done_tick = done_tick,
+		.qpair = (uintptr_t)q, .device = (uintptr_t)q->device,
+		.qid = q->qpair.qid, .cid = ureq->cmd.nvme_cmd.cid,
+		.opcode = ureq->cmd.nvme_cmd.opc, .length = ureq->req.length,
+		.trace_seq = ureq->stage_trace.trace_seq,
+		.owner_thread = spdk_get_thread() ? spdk_thread_get_id(spdk_get_thread()) : 0,
+		.owner_core = spdk_env_get_current_core(),
+		.owner_pg = q->group ? q->group->worker_index : UINT32_MAX,
+		.poll_core = UINT32_MAX, .poll_pg = UINT32_MAX, .jfc_index = UINT32_MAX,
+	};
+
+	if (timing != NULL) {
+		record.forwarded = timing->forwarded;
+	}
+	if (timing != NULL && timing->poll.end_tick != 0) {
+		record.poll_tick = timing->poll.end_tick;
+		record.poll_start_tick = timing->poll.start_tick;
+		record.previous_poll_end_tick = timing->poll.previous_end_tick;
+		record.poll_thread = timing->poll_thread;
+		record.poll_core = timing->poll_core;
+		record.poll_pg = timing->poll_pg;
+		record.jfc_index = timing->jfc_index;
+		record.batch_count = timing->batch_count;
+	}
+	if (record.opcode == SPDK_NVME_OPC_READ) {
+		record.lba = (uint64_t)ureq->cmd.nvme_cmd.cdw10 |
+			     (uint64_t)ureq->cmd.nvme_cmd.cdw11 << 32;
+	}
+	snprintf(record.peer, sizeof(record.peer), "%.*s",
+		 (int)sizeof(record.peer) - 1, q->peer_addr);
+	urma_push_profile_record(&record);
+}
+
 static int
-nvmf_urma_handle_completion_inner(const urma_cr_t *completion)
+nvmf_urma_handle_completion_inner(const urma_cr_t *completion,
+		const struct spdk_urma_completion_timing *timing, uint64_t owner_tick)
 {
 	struct nvmf_urma_cqe_ctx *ctx;
 	struct nvmf_urma_qpair *uqpair;
@@ -2681,6 +2729,7 @@ nvmf_urma_handle_completion_inner(const urma_cr_t *completion)
 		uint64_t now = spdk_get_ticks();
 
 		NVMF_URMA_TGT_STAGE(push, now - ureq->post_tick);
+		nvmf_urma_record_push(ureq, timing, owner_tick, now);
 		if (ureq->stage_trace.flags & SPDK_URMA_STAGE_TRACE_REQUESTED) {
 			ureq->stage_trace.data_cpl_tick = now;
 			ureq->stage_trace.flags |= SPDK_URMA_STAGE_TRACE_COMPLETE;
@@ -2693,8 +2742,10 @@ nvmf_urma_handle_completion_inner(const urma_cr_t *completion)
 }
 
 static int
-nvmf_urma_handle_completion(const urma_cr_t *completion)
+nvmf_urma_handle_completion_timed(const urma_cr_t *completion,
+		const struct spdk_urma_completion_timing *timing)
 {
+	uint64_t owner_tick = urma_push_profile_enabled() ? spdk_get_ticks() : 0;
 	struct nvmf_urma_cqe_ctx *ctx;
 	struct nvmf_urma_qpair *uqpair;
 	int rc;
@@ -2717,13 +2768,20 @@ nvmf_urma_handle_completion(const urma_cr_t *completion)
 	} else {
 		return -EPROTO;
 	}
-	rc = nvmf_urma_handle_completion_inner(completion);
+	rc = nvmf_urma_handle_completion_inner(completion, timing, owner_tick);
 	spdk_urma_lifetime_put(&uqpair->lifetime);
 	return rc;
 }
 
+static int
+nvmf_urma_handle_completion(const urma_cr_t *completion)
+{
+	return nvmf_urma_handle_completion_timed(completion, NULL);
+}
+
 struct nvmf_urma_completion_msg {
 	urma_cr_t completion;
+	struct spdk_urma_completion_timing timing;
 };
 
 static void
@@ -2732,7 +2790,7 @@ nvmf_urma_completion_msg_fn(void *ctx)
 	struct nvmf_urma_completion_msg *msg = ctx;
 	const urma_cr_t *completion = &msg->completion;
 
-	(void)nvmf_urma_handle_completion(completion);
+	(void)nvmf_urma_handle_completion_timed(completion, &msg->timing);
 	free(msg);
 }
 
@@ -2763,7 +2821,8 @@ nvmf_urma_prepare_recv_cr(urma_cr_t *completion, void *ctx_arg)
 }
 
 static int
-nvmf_urma_process_completion(const urma_cr_t *completion)
+nvmf_urma_process_completion_timed(const urma_cr_t *completion,
+		const struct spdk_urma_completion_timing *timing)
 {
 	struct nvmf_urma_cqe_ctx *ctx;
 	struct nvmf_urma_qpair *uqpair = NULL;
@@ -2788,7 +2847,7 @@ nvmf_urma_process_completion(const urma_cr_t *completion)
 		uqpair = nvmf_urma_qpair(ureq->req.qpair);
 	}
 	if (uqpair == NULL || uqpair->thread == NULL || uqpair->thread == spdk_get_thread()) {
-		return nvmf_urma_handle_completion(completion);
+		return nvmf_urma_handle_completion_timed(completion, timing);
 	}
 	msg = malloc(sizeof(*msg));
 	if (msg == NULL) {
@@ -2796,6 +2855,8 @@ nvmf_urma_process_completion(const urma_cr_t *completion)
 		return -ENOMEM;
 	}
 	msg->completion = *completion;
+	msg->timing = timing != NULL ? *timing : (struct spdk_urma_completion_timing){};
+	msg->timing.forwarded = true;
 	if (spdk_thread_send_msg(uqpair->thread, nvmf_urma_completion_msg_fn, msg) != 0) {
 		free(msg);
 		/* The WR reference deliberately remains held.  The owner thread is no
@@ -2807,6 +2868,12 @@ nvmf_urma_process_completion(const urma_cr_t *completion)
 		return -EIO;
 	}
 	return 0;
+}
+
+static int
+nvmf_urma_process_completion(const urma_cr_t *completion)
+{
+	return nvmf_urma_process_completion_timed(completion, NULL);
 }
 
 static int
@@ -2824,14 +2891,49 @@ nvmf_urma_poll_group_poll(struct spdk_nvmf_transport_poll_group *base)
 	/* SE_Review #1/#5: 批内出错不再立即 return——剩余已取出的 CR 照常处理，
 	 * 错误记到最后返回，避免连带丢弃其他 qpair 的成功完成。 */
 	for (uint32_t j = group->worker_index; j < transport->device->send_jfc_count && hard_err == 0; j += stride) {
-		int count = spdk_urma_device_poll_send_jfc(transport->device, j,
-				SPDK_COUNTOF(completions), completions);
+		struct spdk_urma_completion_timing timing = {};
+		bool profiled = urma_push_profile_enabled();
+		bool slow_poll = false;
+		int count;
+
+		if (profiled) {
+			count = spdk_urma_device_poll_send_jfc_timed(transport->device, j,
+					SPDK_COUNTOF(completions), completions, &timing.poll);
+			slow_poll = urma_push_profile_poll(
+				    timing.poll.start_tick, timing.poll.end_tick,
+				    timing.poll.previous_end_tick, timing.poll.busy, count,
+				    (uint32_t)((uintptr_t)transport->device >> 7) ^ j);
+		} else {
+			count = spdk_urma_device_poll_send_jfc(transport->device, j,
+					SPDK_COUNTOF(completions), completions);
+		}
 		if (count < 0) {
 			hard_err = hard_err != 0 ? hard_err : -EIO;
 			break;
 		}
+		if (profiled && (count > 0 || slow_poll)) {
+			timing.jfc_index = j;
+			timing.batch_count = count;
+			timing.poll_pg = group->worker_index;
+			timing.poll_core = spdk_env_get_current_core();
+			timing.poll_thread = spdk_get_thread() ?
+					     spdk_thread_get_id(spdk_get_thread()) : 0;
+			if (slow_poll) {
+				struct urma_push_poll_record poll = {
+					.start = timing.poll.start_tick,
+					.end = timing.poll.end_tick,
+					.previous = timing.poll.previous_end_tick,
+					.device = (uintptr_t)transport->device, .jfc = j,
+					.pg = timing.poll_pg, .core = timing.poll_core,
+					.thread = timing.poll_thread, .count = count,
+				};
+
+				urma_push_profile_poll_record(&poll);
+			}
+		}
 		for (int i = 0; i < count; i++) {
-			int rc = nvmf_urma_process_completion(&completions[i]);
+			int rc = nvmf_urma_process_completion_timed(&completions[i],
+							 profiled ? &timing : NULL);
 			if (rc < 0) {
 				hard_err = hard_err != 0 ? hard_err : rc;
 				continue;
