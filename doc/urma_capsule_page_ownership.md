@@ -253,3 +253,90 @@ HELLO/target 数据路径和 iobuf 回归保留。
 关闭/开启做 A/B，核对真实 data_len=256 KiB、pool hit、provider 调用差分、
 首请求/稳态分别统计，再验证内容与长期并发。Doc 76 的大并发 CONNECT/health
 gate 问题未由本轮本地测试定案。
+
+## Target push JFC 分段打点（2026-11-28）
+
+target 的旧 `push JFC wait (C2H)` 保持原定义：数据 post 返回后的 T0，到 owner
+处理 PUSHING CR 时的 T1。新增 Tpoll 和 Towner，全部使用同一 target 的
+`spdk_get_ticks()` 时钟，不跨主机比较，也不增加 wire 字段或协议版本。
+
+| 时间点 | 采样位置 |
+|---|---|
+| T0 / `t0` | 原 `post_tick`，`urma_post_jetty_send_wr()` 返回后 |
+| Tpoll / `tpoll` | `urma_poll_jfc()` 返回后，释放共享 send JFC 锁之前 |
+| Towner / `towner` | owner 的完成处理入口；跨线程时随完成消息携带 Tpoll 的值拷贝 |
+| T1 / `t1` | 原 PUSHING 计时终点；在新增记录缓存和响应发送之前 |
+
+同一批 CR 共用实际的 poll 返回时间，每个 child 使用自己的 T0、Towner、T1。
+记录发生在 owner 线程，不让其他 poller 改写可被复用的 request。原 WR/CR
+lifetime 引用、错误分发、关闭 drain 和 NVMe 响应逻辑保持。
+
+新代码默认开启打点；已有 dump 周期沿用 `SPDK_URMA_TARGET_DUMP_SEC`，没有设置
+时默认每 10 秒输出到 stdout。`target_nvme_takeover.sh` 将 stdout/stderr 重定向
+到 `NOF_TARGET_LOGFILE`（默认 `/tmp/nvmf_tgt.log`），因此不依赖 NOTICE 日志级别。
+显式 `SPDK_URMA_TARGET_DUMP_SEC=0` 关闭周期输出，连接轮次结束和 transport 销毁
+时仍可输出。控制参数：
+
+- `SPDK_URMA_TARGET_PUSH_PROFILE=0`：关闭新增计时采集和 push profile 输出，便于
+  观察打点开销；不改变旧 push JFC 聚合项。
+- `SPDK_URMA_TARGET_PUSH_TRACE_US=1000`：默认仅保留总 push wait 至少 1 ms 的
+  child 明细；0 保留所有 child 的候选明细，仍受固定容量限制。
+
+热路径不新增 printf，使用固定容量记录。每次 dump 最多 64 条 push 明细和
+64 条慢 poll 明细；覆盖掉的条数在 `overwritten` 中报告，不把这些明细当作
+无条件全量分布。汇总累计所有可测的成功 PUSHING 完成，不受慢请求阈值过滤。
+记录缓存有短锁，空 poll 的统计使用原子计数；输出在复制快照、释放记录锁后
+执行。计时、锁、缓存和周期写日志本身仍可能影响系统，应与关闭打点对照。
+
+可从 target 日志中读取：
+
+```bash
+rg 'URMA_PUSH_PROFILE|URMA_PUSH_DETAIL|URMA_JFC_POLL' /tmp/nvmf_tgt.log
+```
+
+- `URMA_PUSH_PROFILE`：进程累计的有效拆分数及三段均值（ns），另列 untracked、
+  early_poll 和 invalid。它独立于旧的“新连接重置”计数，须按同窗差分，不直接
+  与不同 epoch 的旧聚合计数混算。
+- `URMA_PUSH_DETAIL`：peer、qpair/device 地址标识、qid/cid、opcode、READ LBA、
+  bytes、可用时的客户端 trace_seq、JFC index、batch 大小、是否跨线程，以及
+  poller/owner 的 PG、线程 ID、核号、四个原始 tick 和三段 µs。没有客户端 stage
+  trace 时，目标侧自己的 `seq` 仍可区分记录。未知 PG 使用 UINT32_MAX。
+- `URMA_JFC_POLL`：包括空 poll 的调用数、trylock busy、错误、调用耗时和轮询
+  空档的累计均值/最大值。空档定义为同一物理 JFC 的“上次有打点的 poll 返回
+  →本次 poll 开始”，不包括本次 provider 调用耗时；首次 poll 的空档未知。
+- `URMA_JFC_POLL_DETAIL`：调用耗时或轮询空档至少 1 ms 的采样，包括取出零条
+  CR 的 poll。携带原始起止 tick、device/JFC、PG/线程/核号和 CR 数，可与某个
+  child 的 T0..Tpoll 时间范围对齐，避免只看最后一次取到 CR 的 poll 而漏掉
+  中途停顿。最大值和被覆盖的采样不能单独证明某条 I/O 的等待根因。
+
+例如以下只是受控时钟测试的分解示例，不是新的实机测量：
+
+```text
+post_to_poll_us=2000 poll_to_owner_us=2000 owner_to_done_us=200
+```
+
+三段合计 4200 µs；原始 tick 满足恒等式，分别截断为整数 µs 时可能差 1–2 µs。
+第一段仍混合硬件/provider、队列和未及时轮询；第二段包含
+批内前序 CR 处理、完成分发、跨线程消息排队和调度，不是纯消息队列时间；
+第三段包括原完成处理及位于 T1 前的诊断输出。SSD/bdev 在 T0 之前，NVMe 响应
+发送和新增记录缓存工作在 T1 之后。不能把第一段直接称作传输时间。
+
+另一线程可能在 post 返回前就取到 CR，出现 Tpoll < T0；缺少 timed poll 来源
+（如绕过 timed poll 的直接调用/flush）、时钟顺序异常等也不能做无符号减法。此类记录输出
+`split_valid=0` 和原始 tick，三段数值不参与均值；不能将其显示的零值当作
+实际零延迟。`forwarded=0` 的第二段也可能非零，因为批内处理和调度仍会延迟。
+
+本地回归：
+
+```bash
+python3 test/urma/push_profile_build.py \
+  --umdk /home/senorita/GDR/GDR_Related/UMDK_netlab --sanitize
+python3 test/urma/handshake_build.py \
+  --umdk /home/senorita/GDR/GDR_Related/UMDK_netlab --sanitize
+```
+
+前者执行真实公共 timed poll，检查 provider 返回 tick 确实在锁内采样、连续
+poll 空档、busy、4.2 ms 精确拆分、异常/缺失时间、输出容量和禁用行为。后者
+通过真实 target 完成分发函数检查同线程和延迟跨线程的时间戳拷贝、child 身份、
+三段恒等式及引用释放，并编译 modern/legacy 两端完整源码。它们使用本地模拟
+provider/socketpair，不是实机 4.2 ms 根因结论。

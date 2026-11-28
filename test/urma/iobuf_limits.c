@@ -7,6 +7,8 @@
 #define URMA_STAGE_SIDE 2
 #include "spdk_internal/urma_stage_buffer.h"
 
+#include "spdk_internal/urma_push_profile.h"
+
 /* REAL_TYPES */
 
 static struct spdk_iobuf_opts pool;

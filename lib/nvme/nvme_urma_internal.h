@@ -170,6 +170,23 @@ struct spdk_urma_transport_opts {
 struct spdk_urma_host_staging_pool;
 struct spdk_urma_host_staging_slot;
 
+struct spdk_urma_jfc_poll_timing {
+	uint64_t start_tick, end_tick, previous_end_tick;
+	bool busy;
+};
+
+struct spdk_urma_jfc_poll_history {
+	uint64_t end_tick;
+	uint8_t reserved[120]; /* Avoid false sharing between independent pollers. */
+};
+
+struct spdk_urma_completion_timing {
+	struct spdk_urma_jfc_poll_timing poll;
+	uint64_t poll_thread;
+	uint32_t poll_core, poll_pg, jfc_index, batch_count;
+	bool forwarded;
+};
+
 #define SPDK_URMA_HOST_STAGING_DEFAULT_SLOTS 128
 #define SPDK_URMA_HOST_STAGING_DEFAULT_BYTES (256 * 1024)
 
@@ -199,6 +216,7 @@ struct spdk_urma_device {
 	uint32_t next_send_jfc;
 	uint32_t next_jfr;
 	pthread_mutex_t *send_jfc_poll_locks;
+	struct spdk_urma_jfc_poll_history *send_jfc_poll_history;
 	pthread_mutex_t *recv_jfc_poll_locks;
 	uint32_t send_jfc_poll_lock_count;
 	uint32_t recv_jfc_poll_lock_count;
@@ -280,6 +298,10 @@ uint32_t spdk_urma_device_next_send_jfc(struct spdk_urma_device *device);
 uint32_t spdk_urma_device_next_jfr(struct spdk_urma_device *device);
 int spdk_urma_device_poll_send_jfc(struct spdk_urma_device *device, uint32_t index,
 				   int max_cr, urma_cr_t *cr);
+/* Capture the provider return tick before unlocking; previous_end_tick refers
+ * to the previous timed poll of this physical JFC, across all target PGs. */
+int spdk_urma_device_poll_send_jfc_timed(struct spdk_urma_device *device, uint32_t index,
+		int max_cr, urma_cr_t *cr, struct spdk_urma_jfc_poll_timing *timing);
 int spdk_urma_device_poll_recv_jfc(struct spdk_urma_device *device, uint32_t index,
 				   int max_cr, urma_cr_t *cr,
 				   spdk_urma_recv_cr_prepare_cb prepare_cb, void *prepare_ctx);

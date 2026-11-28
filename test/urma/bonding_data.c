@@ -6,8 +6,10 @@
 #include "spdk/nvmf_spec.h"
 #include "spdk/thread.h"
 #include "spdk_internal/urma_lifetime.h"
+#include "spdk_internal/urma_push_profile.h"
 
 static unsigned registrations, context_exports, context_releases, imports, unimports;
+static uint64_t fake_ticks;
 static bool fail_unimport, check_unimport_before_send;
 static unsigned expected_unimports, send_posts;
 static char diagnostics[16384];
@@ -19,6 +21,9 @@ static struct spdk_thread *current_thread;
 static spdk_msg_fn pending_msg;
 static void *pending_msg_arg;
 struct spdk_thread *spdk_get_thread(void) { return current_thread; }
+uint64_t spdk_thread_get_id(const struct spdk_thread *t) { return (uintptr_t)t; }
+uint32_t spdk_env_get_current_core(void) { return 7; }
+uint64_t spdk_get_ticks_hz(void) { return 1000000; }
 int spdk_thread_send_msg(const struct spdk_thread *t, spdk_msg_fn fn, void *arg) {
 	assert(pending_msg == NULL);
 	pending_msg = fn;
@@ -46,8 +51,7 @@ spdk_log(enum spdk_log_level l, const char *f, const int n, const char *fn, cons
 uint64_t
 spdk_get_ticks(void)
 {
-	static uint64_t ticks;
-	return ++ticks;
+	return ++fake_ticks;
 }
 uint8_t
 __wrap_spdk_urma_memory_chip_id(const void *p)
@@ -212,6 +216,7 @@ struct nvmf_urma_rsp_tx_slot {
 	struct spdk_urma_capsule_rsp_frame frame;
 };
 struct nvmf_urma_qpair {
+	struct { uint32_t worker_index; } *group;
 	struct spdk_thread *thread;
 	char peer_addr[64], service[16];
 	int fd;
@@ -321,7 +326,10 @@ static void nvmf_urma_release_req(struct nvmf_urma_req *r) {
 #define NVMF_URMA_RX_TRACE_SIZE 1
 static struct { uint64_t rsp_tick; } g_rx_trace[NVMF_URMA_RX_TRACE_SIZE];
 #define spdk_nvmf_request_exec(r) ((void)(r))
-struct nvmf_urma_completion_msg { urma_cr_t completion; };
+struct nvmf_urma_completion_msg {
+	urma_cr_t completion;
+	struct spdk_urma_completion_timing timing;
+};
 /* REAL_TARGET_DATA_FUNCTIONS */
 
 enum nvme_urma_cqe_type {
@@ -702,13 +710,13 @@ diagnostics_test(void)
 	urma_cr_t cr = {.status = URMA_CR_SUCCESS, .user_ctx = (uint64_t)&ctx};
 	disconnect_count = 0;
 	diagnostics[0] = 0;
-	assert(nvmf_urma_handle_completion_inner(&cr) == 1 && disconnect_count == 0);
+	assert(nvmf_urma_handle_completion_inner(&cr, NULL, 0) == 1 && disconnect_count == 0);
 	assert(!strstr(diagnostics, "tx_direction"));
 	cr.flag.bs.s_r = 1;
-	assert(nvmf_urma_handle_completion_inner(&cr) == 1 && disconnect_count == 1);
+	assert(nvmf_urma_handle_completion_inner(&cr, NULL, 0) == 1 && disconnect_count == 1);
 	assert(strstr(diagnostics, "role=target stage=tx_direction"));
 	cr.status = URMA_CR_WR_FLUSH_ERR;
-	assert(nvmf_urma_handle_completion_inner(&cr) == 0 && disconnect_count == 2);
+	assert(nvmf_urma_handle_completion_inner(&cr, NULL, 0) == 0 && disconnect_count == 2);
 	assert(strstr(diagnostics, "role=target stage=cr_error"));
 
 	struct nvme_urma_qpair owner = {0}, poller = {0};
@@ -920,6 +928,78 @@ response_test(void)
 	close(fds[1]);
 	puts("PASS real registered target responses, request reuse, out-of-order/cross-thread completions, pool backpressure, post/registration failure, close/flush, raw inline and TCP");
 }
+static void
+push_timing_test(void)
+{
+	struct spdk_urma_device device = {};
+	struct nvmf_urma_qpair q = {
+		.device = &device, .thread = (void *)(uintptr_t)2,
+		.capsule_transport = SPDK_URMA_CAPSULE_TRANSPORT_TCP,
+	};
+	struct nvmf_urma_req req;
+	struct spdk_urma_capsule_rsp_frame frame;
+	int fds[2];
+
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+	q.fd = fds[0];
+	q.qpair.qid = 4;
+	strcpy(q.peer_addr, "192.168.0.5");
+	TAILQ_INIT(&q.working_reqs);
+	spdk_urma_lifetime_init(&q.lifetime);
+	init_response_request(&req, &q, 37);
+	req.state = NVMF_URMA_REQ_PUSHING;
+	req.cqe = (struct nvmf_urma_cqe_ctx){NVMF_URMA_CQE_DATA, &req};
+	req.cmd.nvme_cmd.opc = SPDK_NVME_OPC_READ;
+	req.cmd.nvme_cmd.cdw10 = 1234;
+	req.req.length = 262144;
+	req.post_tick = 1000;
+	struct spdk_urma_completion_timing timing = {
+		.poll = {.start_tick = 1990, .end_tick = 2000, .previous_end_tick = 1980},
+		.poll_thread = 1, .poll_core = 3, .poll_pg = 0, .jfc_index = 1, .batch_count = 8,
+	};
+	urma_cr_t cr = {.status = URMA_CR_SUCCESS, .user_ctx = (uint64_t)&req.cqe};
+	current_thread = (void *)(uintptr_t)1;
+	assert(spdk_urma_lifetime_try_get(&q.lifetime));
+	assert(nvmf_urma_process_completion_timed(&cr, &timing) == 0 && pending_msg != NULL);
+	/* The poller's stack can be overwritten before the owner executes. */
+	timing.poll.end_tick = 999999;
+	fake_ticks = 6000;
+	current_thread = q.thread;
+	spdk_msg_fn fn = pending_msg;
+	pending_msg = NULL;
+	fn(pending_msg_arg);
+	assert(recv(fds[1], &frame, sizeof(frame), MSG_WAITALL) == sizeof(frame));
+	assert(frame.capsule.cpl.cid == 37 && spdk_urma_lifetime_refs(&q.lifetime) == 0);
+	uint64_t saved = g_urma_push_profile.saved;
+	assert(saved > 0);
+	struct urma_push_record r =
+		g_urma_push_profile.records[(saved - 1) % URMA_PUSH_PROFILE_RECORDS];
+	assert(r.split_valid && r.poll_tick == 2000 && r.owner_tick > 6000 && r.forwarded);
+	assert(r.post_tick == 1000 && r.done_tick >= r.owner_tick);
+	assert(r.poll_thread == 1 && r.owner_thread == 2 && r.jfc_index == 1 && r.batch_count == 8);
+	assert(r.qid == 4 && r.cid == 37 && r.lba == 1234 && r.length == 262144);
+	assert((r.poll_tick - r.post_tick) + (r.owner_tick - r.poll_tick) +
+	       (r.done_tick - r.owner_tick) == r.done_tick - r.post_tick);
+	init_response_request(&req, &q, 38);
+	req.state = NVMF_URMA_REQ_PUSHING;
+	req.cqe = (struct nvmf_urma_cqe_ctx){NVMF_URMA_CQE_DATA, &req};
+	req.cmd.nvme_cmd.opc = SPDK_NVME_OPC_READ;
+	req.post_tick = fake_ticks - 3000;
+	timing.poll.end_tick = fake_ticks - 1000;
+	assert(spdk_urma_lifetime_try_get(&q.lifetime));
+	assert(nvmf_urma_process_completion_timed(&cr, &timing) == 1 && pending_msg == NULL);
+	assert(recv(fds[1], &frame, sizeof(frame), MSG_WAITALL) == sizeof(frame));
+	saved = g_urma_push_profile.saved;
+	r = g_urma_push_profile.records[(saved - 1) % URMA_PUSH_PROFILE_RECORDS];
+	assert(!r.forwarded && r.split_valid && r.cid == 38);
+	assert(spdk_urma_lifetime_refs(&q.lifetime) == 0);
+	close(fds[0]);
+	close(fds[1]);
+	puts("PASS target push timing: direct and delayed cross-thread owner, "
+	     "copied poll metadata, child identity, exact split sum "
+	     "and unchanged completion lifetime");
+}
+
 int
 main(void)
 {
@@ -929,6 +1009,7 @@ main(void)
 	bond_command_test();
 	diagnostics_test();
 	response_test();
+	push_timing_test();
 	puts("PASS full segment export/import lifetime, whole-pool cache identity, real "
 	     "optical/electrical WRs, raw inline and non-inline SEND ownership");
 	return 0;
